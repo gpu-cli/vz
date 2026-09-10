@@ -77,6 +77,7 @@ impl runtime_v2::topology_service_server::TopologyService for TopologyServiceImp
                         workspace_key: request.workspace_key,
                     },
                     machine_timeout: Duration::from_millis(request.machine_timeout_millis),
+                    machine: request.machine,
                 })
                 .await
                 .map_err(status_from_machine_error)?;

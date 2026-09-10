@@ -128,6 +128,14 @@ impl RuntimeDaemon {
                 "Up requires bounded request and idempotency IDs without control characters",
             ));
         }
+        // Minting happens BEFORE admission so the fork is one of the exact
+        // `machine_ids` the admission records, and therefore one of the Machines
+        // this Up boots. It is idempotent by address: a replay of the same
+        // `--as` finds the fork already there and reconciles it rather than
+        // minting a second warm copy nobody asked for.
+        if let Some(fork) = request.fork.clone() {
+            self.mint_machine_fork(&fork, &request, &metadata)?;
+        }
         let mut runs = self
             .environment_up_runs
             .0
@@ -198,6 +206,112 @@ impl RuntimeDaemon {
             daemon.supervise_up(request, metadata, run).await;
         });
         Ok(receiver)
+    }
+
+    /// Mint one fork of a declared Machine inside the selected Environment.
+    ///
+    /// Read-only resolution first, then one exact store mutation. Nothing here
+    /// touches a disk: seeding happens once the fork's runtime store is pinned,
+    /// in `supervise_up`.
+    fn mint_machine_fork(
+        &self,
+        fork: &MachineForkRequest,
+        request: &EnvironmentUpRequest,
+        metadata: &RequestMetadata,
+    ) -> Result<(), MachineError> {
+        let (address, label) = fork
+            .resolve()
+            .map_err(|reason| failure(metadata, MachineErrorCode::ValidationError, reason))?;
+        let project = self
+            .with_state_store(|store| {
+                store.load_project_state_snapshot(request.definition.project_id.as_str())
+            })
+            .map_err(|error| error.to_machine_error(metadata))?
+            .ok_or_else(|| {
+                failure(
+                    metadata,
+                    MachineErrorCode::NotFound,
+                    "a fork needs an Environment to fork inside; run `vz up` once first",
+                )
+            })?;
+        let selection = project
+            .resolve_environment(&request.selection)
+            .map_err(|error| failure(metadata, MachineErrorCode::NotFound, error.to_string()))?;
+        let environment = project
+            .environments
+            .into_iter()
+            .find(|environment| environment.environment_id == selection.environment_id)
+            .ok_or_else(|| {
+                failure(
+                    metadata,
+                    MachineErrorCode::StateConflict,
+                    "selected Environment disappeared while resolving a fork",
+                )
+            })?;
+        // Name or immutable id, exactly as `vz exec --machine` accepts, and
+        // ambiguity fails closed listing the candidates rather than guessing.
+        let candidates: Vec<_> = environment
+            .machines
+            .iter()
+            .filter(|machine| {
+                machine.machine_id.as_str() == fork.fork_from || machine.name == fork.fork_from
+            })
+            .collect();
+        let parent = match candidates.as_slice() {
+            [parent] => *parent,
+            [] => {
+                return Err(failure(
+                    metadata,
+                    MachineErrorCode::NotFound,
+                    format!("no Machine named `{}` to fork from", fork.fork_from),
+                ));
+            }
+            _ => {
+                return Err(failure(
+                    metadata,
+                    MachineErrorCode::ValidationError,
+                    format!(
+                        "fork source `{}` is ambiguous (candidates: {})",
+                        fork.fork_from,
+                        candidates
+                            .iter()
+                            .take(32)
+                            .map(|machine| format!("{} ({})", machine.name, machine.machine_id))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
+        };
+        if parent.name != address.machine {
+            return Err(failure(
+                metadata,
+                MachineErrorCode::ValidationError,
+                format!(
+                    "`--as {}` does not name a fork of `{}`; expected `{}@{label}`",
+                    fork.fork_as, parent.name, parent.name
+                ),
+            ));
+        }
+        crate::machine_fork::require_forkable(parent)
+            .map_err(|error| failure(metadata, MachineErrorCode::UnsupportedOperation, error))?;
+        // Already minted by an earlier Up with this address: reconcile it rather
+        // than refusing, so `vz up --fork-from ... --as ...` is idempotent the
+        // way every other Up is.
+        if environment.machine_by_address(&address).is_some() {
+            return Ok(());
+        }
+        self.with_state_store(|store| {
+            store
+                .fork_machine_in_environment(
+                    environment.environment_id.as_str(),
+                    &parent.machine_id,
+                    &label,
+                    current_unix_secs(),
+                )
+                .map(|_| ())
+        })
+        .map_err(|error| error.to_machine_error(metadata))
     }
 
     fn authorize_up(
@@ -351,6 +465,23 @@ fn authorize_ownership(environment: &EnvironmentInstance) -> Result<(), StackErr
             OwnedResourceKind::Machine
             | OwnedResourceKind::Incarnation
             | OwnedResourceKind::Disk => true,
+            // A fork's record is not part of the DECLARED set compared below,
+            // for the reason it exists: the definition never names a fork, so a
+            // fork can never be one of the exact instances that set accounts
+            // for. It is admitted by kind and checked against its Machine by
+            // `EnvironmentInstance::validate`, which requires exactly one such
+            // record per forked Machine and none for a declared one.
+            //
+            // This is where "reconcile must not prune forks" is enforced for
+            // Up: without this arm the `_ => false` default below would make
+            // every Up of an Environment that has ever been forked refuse the
+            // whole Environment, which is a harsher failure than pruning and
+            // just as wrong.
+            OwnedResourceKind::MachineFork => environment.machines.iter().any(|machine| {
+                machine.fork.is_some()
+                    && record.resource_id == machine.machine_id.as_str()
+                    && record.machine_id.as_ref() == Some(&machine.machine_id)
+            }),
             OwnedResourceKind::Network
             | OwnedResourceKind::Endpoint
             | OwnedResourceKind::NetworkAttachment

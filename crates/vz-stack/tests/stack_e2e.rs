@@ -132,6 +132,7 @@ fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWork
             active_operation_id: None,
             bindings: vec![],
             machines: vec![MachineInstance {
+                fork: None,
                 docker_context: None,
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 machine_id: machine_id.clone(),
@@ -5753,6 +5754,7 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
             active_operation_id: None,
             bindings: vec![],
             machines: vec![MachineInstance {
+                fork: None,
                 docker_context: None,
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 machine_id: machine_id.clone(),

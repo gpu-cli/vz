@@ -84,6 +84,7 @@ fn install_planning_authority(store: &vz_stack::StateStore, stack_id: &str) {
             active_operation_id: None,
             bindings: vec![],
             machines: vec![MachineInstance {
+                fork: None,
                 docker_context: None,
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 machine_id: machine_id.clone(),

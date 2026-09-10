@@ -269,6 +269,7 @@ impl Fixture {
 
     fn input(&self) -> DeleteEnvironmentInput {
         DeleteEnvironmentInput {
+            machine: None,
             project_id: self.initial.definition.project_id.clone(),
             selection: EnvironmentSelectionContext {
                 explicit: Some(EnvironmentSelector::NameOrId("first".into())),

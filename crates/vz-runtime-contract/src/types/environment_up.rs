@@ -26,6 +26,54 @@ pub struct EnvironmentUpRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
     pub timeout_millis: u64,
+    /// Fork one existing Machine of the selected Environment instead of only
+    /// reconciling the definition.
+    ///
+    /// Authorizing, and therefore hashed: two Ups that differ only in which
+    /// Machine they fork are different mutations, and sharing an idempotency
+    /// key between them would let a replay return the wrong fork's receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<MachineForkRequest>,
+}
+
+/// `vz up --fork-from <machine> --as <machine>@<label>`.
+///
+/// Fork is a flag on Up rather than a sixth verb because the public lifecycle
+/// has exactly five, and the agent that drives this speaks the CLI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MachineForkRequest {
+    /// Name or immutable ID of the Machine to seed from.
+    pub fork_from: String,
+    /// The fork's full address, `<machine>@<label>`.
+    ///
+    /// Required rather than derived from the worktree, because the caller must
+    /// name what it will later target: an agent that cannot predict the address
+    /// cannot address it. The CLI supplies the default when the caller omits it.
+    pub fork_as: String,
+}
+
+impl MachineForkRequest {
+    /// The parsed address, and the label it carries.
+    ///
+    /// Refuses an address whose Machine half disagrees with `fork_from` when
+    /// `fork_from` is a name rather than an ID: `--fork-from backend --as
+    /// api@feat-x` names two different Machines and is a mistake worth catching
+    /// before anything is minted.
+    pub fn resolve(&self) -> Result<(super::MachineForkAddress, String), String> {
+        let address =
+            super::MachineForkAddress::parse(&self.fork_as).map_err(|error| error.to_string())?;
+        let label = address.label.clone().ok_or_else(|| {
+            format!(
+                "`{}` is not a fork address; expected `<machine>@<label>`",
+                self.fork_as
+            )
+        })?;
+        if self.fork_from.trim().is_empty() {
+            return Err("fork source Machine must not be empty".into());
+        }
+        Ok((address, label))
+    }
 }
 
 impl EnvironmentUpRequest {
@@ -40,11 +88,18 @@ impl EnvironmentUpRequest {
         if selection.explicit.is_some() {
             selection.process_environment_id = None;
         }
+        if let Some(fork) = &self.fork {
+            fork.resolve()?;
+        }
+        // `fork` is appended to the hashed tuple rather than inserted, so an Up
+        // that forks nothing hashes exactly as it did before forking existed and
+        // every persisted receipt stays replayable.
         let bytes = serde_json::to_vec(&(
             &self.definition,
             selection,
             &self.workspace_root,
             self.timeout_millis,
+            &self.fork,
         ))
         .map_err(|error| error.to_string())?;
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))

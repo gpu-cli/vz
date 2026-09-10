@@ -47,6 +47,7 @@ fn developer_linux(name: &str) -> MachineSpec {
 
 fn machine_instance(environment_id: &EnvironmentId, name: &str) -> MachineInstance {
     MachineInstance {
+        fork: None,
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         machine_id: MachineId::generate(),
         environment_id: environment_id.clone(),

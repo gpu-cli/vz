@@ -74,6 +74,7 @@ mod tests {
     fn up_environment_wire_roundtrips_nonempty_request_and_terminal_receipt() {
         use super::runtime_v2::*;
         let request = UpEnvironmentRequest {
+            fork: None,
             metadata: Some(RequestMetadata {
                 request_id: "req-up".into(),
                 idempotency_key: "key-up".into(),
@@ -990,6 +991,9 @@ mod tests {
                     ("profile", 14),
                     ("runtime_identity", 15),
                     ("docker_context", 16),
+                    // Lineage, appended: 1..16 are unmoved, so an older client
+                    // decodes a forked Machine as an ordinary one.
+                    ("fork", 17),
                 ],
             ),
             (
@@ -1247,6 +1251,21 @@ mod tests {
                     ("path_hint", 6),
                     ("timeout_millis", 7),
                     ("workspace_root", 8),
+                    // Fork rides beside the definition rather than inside it: a
+                    // fork is a runtime object and never appears in `vz.json`.
+                    // Tag 9 is a pure append, so an older daemon decodes an
+                    // ordinary Up unchanged.
+                    ("fork", 9),
+                ],
+            ),
+            ("MachineForkRequest", &[("fork_from", 1), ("fork_as", 2)]),
+            (
+                "MachineForkOrigin",
+                &[
+                    ("schema_version", 1),
+                    ("parent_machine_id", 2),
+                    ("parent_name", 3),
+                    ("label", 4),
                 ],
             ),
             (
@@ -1317,6 +1336,9 @@ mod tests {
                     ("process_environment_id", 4),
                     ("workspace_key", 5),
                     ("machine_timeout_millis", 6),
+                    // Naming one fork narrows the Delete; absent keeps the
+                    // whole-Environment meaning every existing caller has.
+                    ("machine", 7),
                 ],
             ),
             (
@@ -1644,6 +1666,7 @@ mod tests {
                     ("OWNED_RESOURCE_KIND_HOST_IMPORT", 14),
                     ("OWNED_RESOURCE_KIND_PORT_RANGE", 15),
                     ("OWNED_RESOURCE_KIND_VOLUME", 16),
+                    ("OWNED_RESOURCE_KIND_MACHINE_FORK", 17),
                 ],
             ),
             (
@@ -1786,6 +1809,7 @@ mod tests {
             slots: vec!["checkout".into()],
         };
         let machine = MachineInstance {
+            fork: None,
             docker_context: None,
             schema_version: 1,
             machine_id: "mac_api".into(),
@@ -2037,6 +2061,7 @@ mod tests {
         // Literal bytes independently bind generated field tags. This fixture
         // exercises wire presence, not semantic success/error coexistence.
         let request = DeleteEnvironmentRequest {
+            machine: None,
             metadata: Some(RequestMetadata::default()),
             project_id: "p".into(),
             environment: Some(String::new()),
@@ -2085,6 +2110,7 @@ mod tests {
             for process_environment_id in &values {
                 for workspace_key in &values {
                     let request = DeleteEnvironmentRequest {
+                        machine: None,
                         metadata: Some(RequestMetadata {
                             request_id: "req-delete".into(),
                             idempotency_key: "idem-delete".into(),

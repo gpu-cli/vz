@@ -4,9 +4,11 @@ use clap::Args;
 use serde::Serialize;
 use serde_json::json;
 use std::{collections::BTreeMap, env, fmt};
-use vz_cli::developer_environment_context::{VZ_ENVIRONMENT_ID, discover_git_workspace};
+use vz_cli::developer_environment_context::{
+    VZ_ENVIRONMENT_ID, discover_checked_out_branch, discover_git_workspace,
+};
 use vz_cli::project_definition::discover_project_definition;
-use vz_runtime_contract::{EnvironmentId, MachineError};
+use vz_runtime_contract::{EnvironmentId, MachineError, fork_label_from_branch};
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::{DaemonClientError, environment_stop_error_detail};
 
@@ -24,6 +26,16 @@ pub struct DevUpArgs {
     /// Exact mutation key for response-loss replay, paired with --request-id.
     #[arg(long, requires = "request_id")]
     pub idempotency_key: Option<String>,
+    /// Fork this Machine of the selected Environment instead of only reconciling.
+    ///
+    /// The fork is a new Machine in the SAME Environment, seeded from this one's
+    /// disk, so it starts warm: dependencies installed, services running, Docker
+    /// image store already populated.
+    #[arg(long, value_name = "MACHINE")]
+    pub fork_from: Option<String>,
+    /// Address for the fork, `<machine>@<label>`. Defaults to this worktree's branch.
+    #[arg(long = "as", value_name = "MACHINE@LABEL", requires = "fork_from")]
+    pub fork_as: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,6 +142,45 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
     // including explicit selection. Its random token is never a path-derived ID.
     let workspace = discover_git_workspace(&cwd)
         .map_err(|error| local_error("workspace_read_failed", error.to_string()))?;
+    // The fork address is resolved here rather than in the daemon because the
+    // default comes from the caller's worktree, which the daemon cannot see. The
+    // mapping from branch to label is a published rule (`fork_label_from_branch`)
+    // so an agent can compute the name it will target without asking.
+    let fork = args
+        .fork_from
+        .map(|fork_from| {
+            let fork_as = match args.fork_as {
+                Some(explicit) => explicit,
+                None => {
+                    let branch = discover_checked_out_branch(&cwd)
+                        .map_err(|error| local_error("workspace_read_failed", error.to_string()))?
+                        .ok_or_else(|| {
+                            local_error(
+                                "validation_error",
+                                "this worktree has no checked-out branch to name the fork after; pass --as <machine>@<label>".into(),
+                            )
+                        })?;
+                    let label = fork_label_from_branch(&branch).ok_or_else(|| {
+                        local_error(
+                            "validation_error",
+                            format!("branch `{branch}` has no usable fork label; pass --as <machine>@<label>"),
+                        )
+                    })?;
+                    format!("{fork_from}@{label}")
+                }
+            };
+            let request = runtime_v2::MachineForkRequest { fork_from, fork_as };
+            // Refuse a malformed address before starting the daemon: a fork the
+            // caller could not later address is worse than no fork.
+            vz_runtime_contract::MachineForkRequest {
+                fork_from: request.fork_from.clone(),
+                fork_as: request.fork_as.clone(),
+            }
+            .resolve()
+            .map_err(|reason| local_error("validation_error", reason))?;
+            Ok::<_, UpCommandError>(request)
+        })
+        .transpose()?;
     if json_output {
         println!(
             "{}",
@@ -168,6 +219,7 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
                     .to_string_lossy()
                     .into_owned(),
             ),
+            fork,
             timeout_millis: args.timeout.unwrap_or_else(|| {
                 if discovered
                     .definition

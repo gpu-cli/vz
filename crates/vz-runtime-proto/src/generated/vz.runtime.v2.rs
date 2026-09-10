@@ -369,6 +369,27 @@ pub struct MachineInstance {
     pub runtime_identity: ::core::option::Option<MachineRuntimeIdentity>,
     #[prost(message, optional, tag = "16")]
     pub docker_context: ::core::option::Option<MachineDockerContextDescriptor>,
+    /// Present exactly when this Machine was forked from another inside the same
+    /// Environment. A pure append: 1..16 are unmoved, so an older client decodes a
+    /// forked Machine as an ordinary one rather than failing on it.
+    #[prost(message, optional, tag = "17")]
+    pub fork: ::core::option::Option<MachineForkOrigin>,
+}
+/// Lineage of a forked Machine.
+///
+/// `parent_name` rides beside `parent_machine_id` so that the fork's own `name`
+/// is verifiable from this record alone: a fork is named exactly
+/// `<parent_name>@<label>`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineForkOrigin {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub parent_machine_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub parent_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub label: ::prost::alloc::string::String,
 }
 /// Persisted network identity and its declared L2/L3 shape.
 ///
@@ -870,6 +891,25 @@ pub struct UpEnvironmentRequest {
     /// Unlike path_hint this is authorizing and enters the Up request hash.
     #[prost(string, optional, tag = "8")]
     pub workspace_root: ::core::option::Option<::prost::alloc::string::String>,
+    /// Fork one existing Machine of the selected Environment instead of
+    /// reconciling the definition alone. A pure append.
+    #[prost(message, optional, tag = "9")]
+    pub fork: ::core::option::Option<MachineForkRequest>,
+}
+/// `vz up --fork-from <machine> --as <machine>@<label>`.
+///
+/// Fork is a flag on Up rather than a sixth verb because the public lifecycle has
+/// exactly five, and the agent that drives this speaks the CLI.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineForkRequest {
+    /// Name or immutable ID of the Machine to seed from, within the selected
+    /// Environment.
+    #[prost(string, tag = "1")]
+    pub fork_from: ::prost::alloc::string::String,
+    /// The fork's full address, `<machine>@<label>`. Required rather than derived
+    /// so the caller names what it will later target.
+    #[prost(string, tag = "2")]
+    pub fork_as: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EnvironmentUpAdmission {
@@ -979,6 +1019,11 @@ pub struct DeleteEnvironmentRequest {
     pub workspace_key: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(uint64, tag = "6")]
     pub machine_timeout_millis: u64,
+    /// `<machine>@<label>` selects one forked Machine to reclaim instead of the
+    /// whole Environment. Only a fork may be named: a declared Machine is part of
+    /// the definition and is removed by removing the Environment. A pure append.
+    #[prost(string, optional, tag = "7")]
+    pub machine: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeleteEnvironmentEvent {
@@ -3760,6 +3805,7 @@ pub enum OwnedResourceKind {
     HostImport = 14,
     PortRange = 15,
     Volume = 16,
+    MachineFork = 17,
 }
 impl OwnedResourceKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -3785,6 +3831,7 @@ impl OwnedResourceKind {
             Self::HostImport => "OWNED_RESOURCE_KIND_HOST_IMPORT",
             Self::PortRange => "OWNED_RESOURCE_KIND_PORT_RANGE",
             Self::Volume => "OWNED_RESOURCE_KIND_VOLUME",
+            Self::MachineFork => "OWNED_RESOURCE_KIND_MACHINE_FORK",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -3807,6 +3854,7 @@ impl OwnedResourceKind {
             "OWNED_RESOURCE_KIND_HOST_IMPORT" => Some(Self::HostImport),
             "OWNED_RESOURCE_KIND_PORT_RANGE" => Some(Self::PortRange),
             "OWNED_RESOURCE_KIND_VOLUME" => Some(Self::Volume),
+            "OWNED_RESOURCE_KIND_MACHINE_FORK" => Some(Self::MachineFork),
             _ => None,
         }
     }

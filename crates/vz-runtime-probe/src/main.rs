@@ -226,6 +226,7 @@ async fn run_up(options: &Options) -> Result<(), (String, String)> {
         .await
         .map_err(|error| ("daemon_unavailable".to_string(), error.to_string()))?;
     let request = runtime_v2::UpEnvironmentRequest {
+        fork: None,
         metadata: Some(metadata(&request_id, &idempotency_key)),
         definition: Some(vz_runtime_translate::project_definition_to_proto(
             &definition,

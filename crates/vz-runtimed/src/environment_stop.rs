@@ -621,6 +621,17 @@ fn validate_supported_topology(
                         && import.environment_id == record.environment_id
                         && Some(&import.machine_id) == record.machine_id.as_ref()
                 }),
+                // A fork survives Stop exactly as any Machine does: Stop
+                // releases runtime halves and preserves durable identity, and a
+                // fork's identity is durable. Checked against its Machine rather
+                // than admitted by kind, so a record naming a Machine that is
+                // not a fork is refused here rather than at Delete.
+                OwnedResourceKind::MachineFork => environment.machines.iter().any(|machine| {
+                    machine.fork.is_some()
+                        && machine.machine_id.to_string() == record.resource_id
+                        && machine.environment_id == record.environment_id
+                        && Some(&machine.machine_id) == record.machine_id.as_ref()
+                }),
                 OwnedResourceKind::Other(kind) => {
                     kind == "machine_runtime_store" || kind == "runtime_vm"
                 }

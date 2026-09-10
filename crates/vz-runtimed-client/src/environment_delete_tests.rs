@@ -298,6 +298,7 @@ fn first_terminal_frame_cannot_bypass_exact_outbound_timeout() {
 #[test]
 fn outbound_selection_normalization_keeps_name_or_id_and_original_workspace() {
     let mut request = runtime_v2::DeleteEnvironmentRequest {
+        machine: None,
         metadata: None,
         project_id: ProjectId::generate().to_string(),
         environment: Some("env_looks_like_id_but_is_a_name".into()),

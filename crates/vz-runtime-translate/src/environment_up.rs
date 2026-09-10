@@ -1,7 +1,7 @@
 use super::*;
 use vz_runtime_contract::{
     EnvironmentSelectionContext, EnvironmentSelector, EnvironmentUpAdmission,
-    EnvironmentUpCompletion, EnvironmentUpProgress, EnvironmentUpRequest,
+    EnvironmentUpCompletion, EnvironmentUpProgress, EnvironmentUpRequest, MachineForkRequest,
 };
 
 pub fn environment_up_request_from_proto(
@@ -34,6 +34,10 @@ pub fn environment_up_request_from_proto(
         path_hint: value.path_hint.clone(),
         workspace_root: value.workspace_root.clone(),
         timeout_millis: value.timeout_millis,
+        fork: value.fork.as_ref().map(|fork| MachineForkRequest {
+            fork_from: fork.fork_from.clone(),
+            fork_as: fork.fork_as.clone(),
+        }),
     };
     request.request_hash()?;
     Ok(request)

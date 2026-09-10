@@ -1195,6 +1195,7 @@ fn lifecycle_ownership_digest(
             OwnedResourceKind::Credential => "credential".to_string(),
             OwnedResourceKind::Fault => "fault".to_string(),
             OwnedResourceKind::Volume => "volume".to_string(),
+            OwnedResourceKind::MachineFork => "machine_fork".to_string(),
             OwnedResourceKind::LegacySandbox => "legacy_sandbox".to_string(),
             OwnedResourceKind::Other(value) => format!("other:{value}"),
         }
@@ -4348,7 +4349,7 @@ impl StateStore {
         Ok(())
     }
 
-    fn refresh_project_timestamps(&self, project_id: &str) -> Result<(), StackError> {
+    pub(super) fn refresh_project_timestamps(&self, project_id: &str) -> Result<(), StackError> {
         self.conn.execute(
             "UPDATE project_definitions
              SET created_at = COALESCE(

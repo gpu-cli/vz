@@ -196,6 +196,14 @@ impl RuntimeDaemon {
                 return Err(backend_error(error.to_string()));
             }
         };
+        // Seed every unseeded fork here: after the sibling stores are pinned, so
+        // a fork's own store exists and is fenced, and before the first boot, so
+        // no fork ever starts against an empty Docker disk and is handed its
+        // parent's underneath itself. The parent is quiesced immediately before
+        // each clone and never stopped -- see `crate::machine_fork` for why.
+        self.seed_environment_forks(&prepared, &environment, &existing)
+            .await
+            .map_err(|error| backend_error(error.to_string()))?;
         self.with_state_store(|store| {
             let current =
                 load_environment(store, &run.admission)?.ok_or_else(|| StackError::Machine {

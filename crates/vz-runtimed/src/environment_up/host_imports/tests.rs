@@ -61,6 +61,7 @@ fn machine_instance(
     environment_id: &EnvironmentId,
 ) -> MachineInstance {
     MachineInstance {
+        fork: None,
         schema_version: 1,
         machine_id: machine_id.clone(),
         environment_id: environment_id.clone(),

@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::json;
 use vz_cli::developer_environment_context::{VZ_ENVIRONMENT_ID, discover_existing_git_workspace};
 use vz_cli::project_definition::discover_project_definition;
-use vz_runtime_contract::{EnvironmentId, MachineError};
+use vz_runtime_contract::{EnvironmentId, MachineError, MachineForkAddress};
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::{DaemonClientError, environment_stop_error_detail};
 
@@ -29,6 +29,13 @@ pub struct DevDeleteArgs {
     /// Stable mutation key to resume after response loss. Pair with --request-id.
     #[arg(long, requires = "request_id")]
     pub idempotency_key: Option<String>,
+    /// Reclaim one forked Machine, `<machine>@<label>`, instead of the Environment.
+    ///
+    /// Only a fork may be named. A Machine the definition declares is part of
+    /// the Environment and is removed by removing it; subtracting one would
+    /// leave the Environment permanently unable to instantiate its own `vz.json`.
+    #[arg(long, value_name = "MACHINE@LABEL")]
+    pub machine: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,6 +127,25 @@ pub async fn cmd_dev_delete(
     }) {
         return Err(local_error("validation_error", "request/idempotency IDs must be nonempty, at most 256 bytes, and have no control characters or surrounding whitespace".into()));
     }
+    // Parsed before the daemon is contacted: `--machine backend` names a
+    // declared Machine, which this verb never removes on its own, and saying so
+    // locally is faster and clearer than a round trip.
+    let machine = args
+        .machine
+        .map(|selector| {
+            let address = MachineForkAddress::parse(&selector)
+                .map_err(|error| local_error("invalid_selector", error.to_string()))?;
+            if address.label.is_none() {
+                return Err(local_error(
+                    "invalid_selector",
+                    format!(
+                        "`{selector}` names a declared Machine; only a fork `<machine>@<label>` can be deleted on its own"
+                    ),
+                ));
+            }
+            Ok(address.to_selector())
+        })
+        .transpose()?;
     let cwd = env::current_dir()
         .map_err(|error| local_error("definition_read_failed", error.to_string()))?;
     let discovered = discover_project_definition(&cwd)
@@ -176,6 +202,7 @@ pub async fn cmd_dev_delete(
             process_environment_id,
             workspace_key,
             machine_timeout_millis: args.timeout * 1000,
+            machine,
         })
         .await
         .map_err(client_error)?;
@@ -257,14 +284,16 @@ mod tests {
     }
 
     #[test]
-    fn delete_parser_bounds_timeout_and_has_no_machine_or_force_selector() {
+    fn delete_parser_bounds_timeout_takes_a_fork_selector_and_has_no_force() {
         for timeout in ["0", "301", "18446744073709551615", "-1"] {
             assert!(DeleteParser::try_parse_from(["delete", "--timeout", timeout]).is_err());
         }
         for timeout in ["1", "300"] {
             assert!(DeleteParser::try_parse_from(["delete", "--timeout", timeout]).is_ok());
         }
-        assert!(DeleteParser::try_parse_from(["delete", "--machine", "dev"]).is_err());
+        // `--machine` selects one fork to reclaim; `--force` remains absent,
+        // because Delete proves its reclamation rather than asserting it.
+        assert!(DeleteParser::try_parse_from(["delete", "--machine", "backend@feat-x"]).is_ok());
         assert!(DeleteParser::try_parse_from(["delete", "--force"]).is_err());
     }
 

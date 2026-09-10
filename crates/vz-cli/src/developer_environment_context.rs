@@ -132,6 +132,29 @@ pub fn discover_existing_git_workspace(cwd: &Path) -> Result<Option<GitWorkspace
     }))
 }
 
+/// The checked-out branch of the worktree containing `cwd`, if it has one.
+///
+/// This is where a fork's default label comes from. A detached HEAD legitimately
+/// has no branch, and that is `Ok(None)` rather than an error: the caller then
+/// requires an explicit `--as`, which is the honest outcome, because there is no
+/// name for an agent to have predicted.
+pub fn discover_checked_out_branch(cwd: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .with_context(|| format!("failed to run git while inspecting {}", cwd.display()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let branch = String::from_utf8(output.stdout)
+        .context("git reported a non-UTF-8 branch name")?
+        .trim()
+        .to_string();
+    Ok((!branch.is_empty()).then_some(branch))
+}
+
 fn git_path(cwd: &Path, selector: &str) -> Result<PathBuf> {
     let output = Command::new("git")
         .arg("-C")

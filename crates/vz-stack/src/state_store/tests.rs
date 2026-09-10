@@ -333,6 +333,7 @@ fn topology_project_state(
                     slots: BTreeSet::from(["workspace".to_string()]),
                 }],
                 machines: vec![MachineInstance {
+                    fork: None,
                     docker_context: None,
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     machine_id: machine_id.clone(),
