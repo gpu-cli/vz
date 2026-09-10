@@ -27,7 +27,7 @@ use crate::machine_artifact_store::{
 };
 use crate::machine_runtime_registry::{
     MachineRuntimeAdmission, MachineRuntimeEntry, MachineRuntimeRegistry,
-    MachineRuntimeRegistryError,
+    MachineRuntimeRegistryError, MachineRuntimeStoreLease,
 };
 use crate::machine_target_resolver::{MachineTargetResolver, TargetResolutionError};
 
@@ -308,9 +308,12 @@ impl EnvironmentControllerLease {
                             })
                         })
                         .ok_or_else(|| conflict("admission Environment disappeared"))?;
-                    // Only our exact reservation and monotonic timestamp may change.
+                    // Only our exact reservation and monotonic timestamp may
+                    // change. The expected snapshot has to account for whichever
+                    // branch above actually minted, not just the fresh one, or a
+                    // fork's own reservation reads as somebody else's change.
                     let mut wanted = admitted.clone();
-                    if fresh && !wanted.ownership.contains(record) {
+                    if (fresh || mint_for_fork) && !wanted.ownership.contains(record) {
                         wanted.ownership.push(record.clone());
                         wanted.updated_at = wanted.updated_at.max(now);
                     }
@@ -336,32 +339,83 @@ impl EnvironmentControllerLease {
                 })?;
             }
         }
-        let mut stores = Vec::new();
-        for ((owner, pair), machine) in owners.iter().zip(&records).zip(&admitted.machines) {
-            let target = resolved
-                .as_ref()
-                .and_then(|targets| targets.machines.get(&machine.name));
-            let native = resolved
-                .as_ref()
-                .and_then(|targets| targets.native.get(&machine.name));
-            if fresh && target.is_none() && native.is_none() {
-                return Err(conflict("resolved sibling is missing").into());
-            }
-            stores.push(
-                registry.acquire_store(
-                    owner,
-                    &pair[0],
+        // A never-started fork is the one Machine here whose runtime store does
+        // not exist yet inside an Environment that is not fresh, so it is the
+        // one that must be CREATED rather than opened. Its configuration digest
+        // is its PARENT's, and not by convenience: the fork is seeded from that
+        // Machine's disk and carries the same target, profile, resources and
+        // artifact identities, which is exactly what the digest binds. Target
+        // resolution cannot supply it -- it reads the project definition, which
+        // never contains a fork, and it is skipped entirely when not fresh.
+        //
+        // Two passes rather than one, indexed so `stores` still lines up with
+        // `admitted.machines`: a fork's parent must be open before the fork can
+        // read its digest, and relying on the aggregate's Machine order to
+        // arrange that would be a silent assumption.
+        let new_fork = |machine: &vz_runtime_contract::MachineInstance| {
+            machine.fork.is_some()
+                && machine.incarnation.is_none()
+                && machine.runtime_identity.is_none()
+        };
+        let mut opened: Vec<Option<Arc<MachineRuntimeStoreLease>>> =
+            (0..admitted.machines.len()).map(|_| None).collect();
+        for pass_forks in [false, true] {
+            for (index, ((owner, pair), machine)) in owners
+                .iter()
+                .zip(&records)
+                .zip(&admitted.machines)
+                .enumerate()
+            {
+                if new_fork(machine) != pass_forks {
+                    continue;
+                }
+                let target = resolved
+                    .as_ref()
+                    .and_then(|targets| targets.machines.get(&machine.name));
+                let native = resolved
+                    .as_ref()
+                    .and_then(|targets| targets.native.get(&machine.name));
+                if fresh && target.is_none() && native.is_none() {
+                    return Err(conflict("resolved sibling is missing").into());
+                }
+                let inherited = if pass_forks {
+                    let origin = machine
+                        .fork
+                        .as_ref()
+                        .ok_or_else(|| conflict("fork lost its lineage during admission"))?;
+                    let parent = admitted
+                        .machines
+                        .iter()
+                        .position(|candidate| candidate.machine_id == origin.parent_machine_id)
+                        .and_then(|at| opened[at].as_ref())
+                        .ok_or_else(|| {
+                            conflict("a fork's parent has no open runtime store to inherit from")
+                        })?;
+                    Some(parent.configuration_digest().to_string())
+                } else {
+                    None
+                };
+                let digest = inherited.as_deref().or_else(|| {
                     target
                         .map(|target| target.configuration_digest())
-                        .or_else(|| native.map(|target| target.configuration_digest.as_str())),
-                    if fresh {
+                        .or_else(|| native.map(|target| target.configuration_digest.as_str()))
+                });
+                opened[index] = Some(registry.acquire_store(
+                    owner,
+                    &pair[0],
+                    digest,
+                    if fresh || pass_forks {
                         MachineRuntimeAdmission::CreateOrOpen
                     } else {
                         MachineRuntimeAdmission::ExistingOnly
                     },
-                )?,
-            );
+                )?);
+            }
         }
+        let stores = opened
+            .into_iter()
+            .map(|store| store.ok_or_else(|| conflict("a Machine was never admitted a store")))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut pins = Vec::new();
         let mut native_pins = Vec::new();
         for (store, machine) in stores.iter().zip(&admitted.machines) {
