@@ -1394,7 +1394,7 @@ impl Runtime {
                         ));
                     }
                     if seeded_by_fork {
-                        Self::replay_seeded_docker_journal(vm, device).await?;
+                        Self::prepare_seeded_docker_disk(vm, device).await?;
                     }
                     Self::verify_guest_docker_filesystem(vm, device).await?;
                 }
@@ -1482,8 +1482,8 @@ impl Runtime {
         Ok(())
     }
 
-    /// Replay a forked Docker disk's journal so it can be admitted on its own
-    /// terms, without relaxing what admission means.
+    /// Prepare a forked Docker disk: replay its journal, and drop the engine
+    /// identity it inherited from its parent.
     ///
     /// A fork's disk is `clonefile(2)`d from its parent's while the parent still
     /// has that ext4 mounted, so it arrives exactly as a power cut would leave
@@ -1497,12 +1497,22 @@ impl Runtime {
     /// is a world away from `e2fsck`, which is repair, remains forbidden, and
     /// would still be refused a moment later if this were not enough -- a disk
     /// with real damage fails admission exactly as it does today.
-    async fn replay_seeded_docker_journal(vm: &LinuxVm, device: &str) -> Result<(), OciError> {
+    ///
+    /// The same mount drops `engine/engine-id`. Docker mints that identifier
+    /// once and then keeps it in its data root, which is on this disk, so a fork
+    /// that inherits the disk inherits its parent's engine identity -- measured
+    /// on hardware, parent and fork both reported
+    /// `3320e7b2-6ee4-403f-949f-5d4ac285d3eb`. The module documentation claimed
+    /// this identifier was "re-minted from the new identity by the ordinary Up
+    /// path"; it is not, because it is guest state rather than host state.
+    /// Removing the file makes the engine mint a fresh one at start, which is
+    /// the same thing it does on a Machine that never had one.
+    async fn prepare_seeded_docker_disk(vm: &LinuxVm, device: &str) -> Result<(), OciError> {
         const MOUNTPOINT: &str = "/run/vz-oci/forked-journal-replay";
         let timeout = GuestDiskPhase::Probe.timeout();
         tracing::info!(
             device,
-            "replaying a forked Docker filesystem's journal before admission"
+            "replaying a forked Docker filesystem's journal and dropping its inherited engine identity"
         );
         let replay = vm
             .exec_collect(
@@ -1513,6 +1523,7 @@ impl Runtime {
                     format!(
                         "set -e; /bin/busybox mkdir -p {MOUNTPOINT}; \
                          /bin/busybox mount -t ext4 {device} {MOUNTPOINT}; \
+                         /bin/busybox rm -f {MOUNTPOINT}/engine/engine-id; \
                          /bin/busybox umount {MOUNTPOINT}"
                     ),
                 ],
@@ -1521,7 +1532,7 @@ impl Runtime {
             .await?;
         if replay.exit_code != 0 {
             return Err(OciError::InvalidConfig(format!(
-                "forked Docker filesystem journal replay failed for {device}: exit {}: {}{}",
+                "forked Docker disk preparation failed for {device}: exit {}: {}{}",
                 replay.exit_code, replay.stdout, replay.stderr
             )));
         }

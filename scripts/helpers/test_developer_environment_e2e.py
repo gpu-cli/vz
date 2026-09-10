@@ -3275,18 +3275,20 @@ class CriterionTwentyThreeTests(unittest.TestCase):
         self.assertIsNotNone(speed, scenario["assertions"])
         forked, cold = float(speed.group(1)), float(speed.group(2))
         self.assertGreater(cold, forked * checks.FORK_SPEEDUP_MIN)
-        volume = re.search(r"the volume lost (-?\d+) bytes across the fork, at most (\d+)", assertions)
-        self.assertIsNotNone(volume, scenario["assertions"])
-        lost, budget = int(volume.group(1)), int(volume.group(2))
-        self.assertLessEqual(lost, budget)
-        # The trap the criterion was rewritten for: a copy-on-write clone reports
-        # its parent's allocated size, so the volume is the only thing that can
-        # tell it from a deep copy.
+        # The clone is proved by SHARED PHYSICAL BLOCKS, not by a free-space
+        # delta. The delta's only window spans the fork's own VM boot, so on
+        # hardware it measured a 42 MB parent as costing 109 MB; it is recorded
+        # as context and asserts nothing.
+        shared = re.search(r"shares its parent's physical blocks \(both at device offset (\d+)\)", assertions)
+        self.assertIsNotNone(shared, scenario["assertions"])
+        self.assertIn("bytes across the fork window", assertions)
+        # And the trap that made a per-file measurement useless is still stated:
+        # a copy-on-write clone reports its parent's allocated size, so anything
+        # comparing st_blocks reads a perfect clone as a deep copy.
         allocations = re.findall(r"disk .*: (\d+) bytes logical, (\d+) allocated", assertions)
         self.assertEqual(len(allocations), 2, scenario["assertions"])
         (_pl, parent_allocated), (_fl, fork_allocated) = allocations
         self.assertGreaterEqual(int(fork_allocated), int(parent_allocated) * 0.9)
-        self.assertLess(lost, int(parent_allocated) // 2)
 
     def test_the_label_rule_is_the_one_the_runtime_contract_publishes(self):
         """Ported, not asked for: the check must be able to disagree with the runtime.
@@ -3454,9 +3456,17 @@ class CriterionTwentyThreeTests(unittest.TestCase):
 
     def test_a_sparse_stub_that_costs_nothing_because_it_holds_nothing_fails(self):
         """Free space alone would accept this, which is why the per-file
-        allocated size is asserted beside it."""
+        allocated size is asserted beside it.
+
+        It is now caught twice over: a stub holds its own (absent) blocks, so it
+        also fails the block-sharing assertion. That used to be asserted NOT to
+        fire here, because a free-space delta cannot tell a stub from a clone --
+        both cost nothing. Measuring the blocks themselves can, so the stub is
+        refused by the same assertion that refuses a deep copy, which is the
+        right answer for a fork that shares nothing with its parent.
+        """
         failures = self.broken("fork_sparse_stub", "reports its parent's allocated size")
-        self.assertFalse(any("copy-on-write, not a deep copy" in line for line in failures), failures)
+        self.assertTrue(any("physical blocks" in line for line in failures), failures)
 
     def test_a_deep_copy_fails_even_though_every_per_file_measurement_agrees(self):
         """The trap the criterion was rewritten for. Same path, same logical

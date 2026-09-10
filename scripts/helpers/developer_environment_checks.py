@@ -42,6 +42,7 @@ is not schema-valid). Every assertion is recorded from raw receipts.
 from __future__ import annotations
 
 import copy
+import fcntl
 import json
 import shutil
 import os
@@ -49,6 +50,7 @@ import re
 from pathlib import Path
 import socket
 import stat
+import struct
 import time
 import uuid
 
@@ -8494,6 +8496,31 @@ def fork_definition(release_dir: Path) -> dict:
     return definition
 
 
+def first_physical_extent(path: Path) -> int:
+    """Device offset of the first physical extent backing `path`.
+
+    The DIRECT observation of copy-on-write, where `volume_free_bytes` is an
+    indirect one: two files that share blocks report the same offset, and a file
+    holding its own copy of the bytes reports a different one. It is local and
+    exact, so unlike a free-space delta it is unaffected by anything else running
+    on the volume -- including the fork's own boot, which happens inside the only
+    window a free-space measurement of `vz up --fork-from` can have.
+
+    `F_LOG2PHYS_EXT` (65) fills `struct log2phys { u32 flags; off_t contigbytes;
+    off_t devoffset; }`. Measured 2026-09-10: a `cp -c` clone reports its
+    source's device offset and a streamed byte copy of the same file reports a
+    different one. Mirrors `vz_macos_provision::clone::first_physical_extent`,
+    which is the same call for the same reason on the product side.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        buffer = struct.pack("=Iqq", 0, 0, 0)
+        _flags, _contiguous, offset = struct.unpack("=Iqq", fcntl.fcntl(fd, 65, buffer))
+        return offset
+    finally:
+        os.close(fd)
+
+
 def volume_free_bytes(path: Path) -> int:
     """Free space on the volume holding `path`, in bytes.
 
@@ -8950,19 +8977,21 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
                 f"the fork's disk reports its parent's allocated size, which is why per-file size cannot be the "
                 f"measurement (fork {fork_allocated}, parent {parent_allocated}, floor "
                 f"{int(parent_allocated * FORK_CLONE_ALLOCATION_FRACTION)})")
-    budget = int(parent_allocated * FORK_FREE_SPACE_FRACTION)
-    if free_delta < 0:
-        # The volume GAINED space, so unrelated reclamation outweighed whatever
-        # the fork cost. That is still evidence against a deep copy -- one
-        # cannot cost less than nothing -- but it is not a measurement of the
-        # clone, and the difference is worth recording rather than smuggling
-        # into a pass.
-        check.ok(f"the volume GAINED {-free_delta} bytes across the fork: no deep copy could, but "
-                 f"this window was dominated by unrelated reclamation rather than by the clone")
-    check.check(free_delta <= budget,
-                f"the volume lost {free_delta} bytes across the fork, at most {budget} "
-                f"({FORK_FREE_SPACE_FRACTION:g} of the parent's {parent_allocated} allocated bytes): "
-                f"copy-on-write, not a deep copy")
+    # The criterion's claim is that a fork SHARES its parent's blocks, and that
+    # is now asserted directly rather than inferred from what the volume lost.
+    #
+    # A free-space delta cannot carry this assertion here. The only window it can
+    # have spans the whole `vz up --fork-from`, which boots a VM: measured on
+    # hardware, a 42 MB parent produced a 109 MB delta because the fork's own
+    # boot wrote into the same window. That says nothing about the clone. Two
+    # files either share physical blocks or they do not, and that is decidable
+    # exactly, so it is recorded as the finding and the delta is kept as context.
+    parent_extent, fork_extent = first_physical_extent(parent_disk), first_physical_extent(fork_disk)
+    check.check(parent_extent == fork_extent,
+                f"the fork's disk shares its parent's physical blocks (both at device offset "
+                f"{parent_extent}): copy-on-write, not a deep copy")
+    check.ok(f"the volume moved {free_delta} bytes across the fork window, which spans the fork's own boot "
+             f"and is therefore context rather than the measurement (parent allocated {parent_allocated})")
     # Now that the clone has been measured, the control is no longer needed.
     removed = ctx.run(check, "fk-c-delete", ["--json", "delete", "--environment", "default", "--timeout", "120"],
                       cwd=cold["project"], env=cold["env"], timeout=DELETE_TIMEOUT)

@@ -26,10 +26,18 @@
 //!   network its parent is on, so it lands on a different address of the same
 //!   subnet without a lease table, an allocator, or a collision to resolve.
 //! * **Docker.** The engine, containerd, BuildKit state and image store are
-//!   guest-side files, so they arrive with the cloned disk. The host half — relay
-//!   socket, context name, `engine_id` — is re-minted from the new identity by
-//!   the ordinary Up path, exactly as it is for any other new Machine, so a fork
-//!   never inherits its parent's context binding.
+//!   guest-side files, so they arrive with the cloned disk — which is the point,
+//!   and is what makes a fork warm. The host half — relay socket and context
+//!   name — is re-minted from the new identity by the ordinary Up path, exactly
+//!   as it is for any other new Machine, so a fork never inherits its parent's
+//!   context binding.
+//!
+//!   The engine's own identifier was listed here as host-half and re-minted. It
+//!   is neither: Docker mints it once and keeps it in its data root, which is on
+//!   the cloned disk, so a fork inherited its parent's. Measured on hardware
+//!   2026-09-10 — parent and fork both reported the same engine id. The forked
+//!   disk's first boot now removes it so the engine mints a fresh one, in the
+//!   same guest step that replays the disk's journal.
 //!
 //! ## What a fork deliberately does NOT mint
 //!
