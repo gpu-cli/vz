@@ -3288,7 +3288,24 @@ def check_workspace_projection_policy(ctx: CheckContext, top: str) -> SubCheck:
             check.not_implemented = ("declared projections and volumes are not applied by this runtime: " +
                                      message[:300])
             return check.finish()
-        check.check(False, f"store-ok: vz --json up exit {up.exit_code} (expected 0): {message[:200]}")
+        # What the Environment actually holds when the Up refuses. The refusal
+        # names an unresolved binding SLOT, and the only way to tell a slot that
+        # was never recorded from one recorded under another name is to read the
+        # persisted bindings back.
+        persisted_state = ctx.run(check, "store-ok-status", ["--json", "status"],
+                                  cwd=inside["project"], env=inside["env"], timeout=RECONCILE_STATUS_TIMEOUT)
+        try:
+            document = json.loads(persisted_state.stdout.decode("utf-8"))
+            environments = document.get("environments") or [document.get("environment") or {}]
+            observed = [{"state": environment.get("state"),
+                         "bindings": environment.get("bindings"),
+                         "machines": [(machine.get("name"), machine.get("workspace"))
+                                      for machine in environment.get("machines") or []]}
+                        for environment in environments]
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError):
+            observed = persisted_state.stdout[:400]
+        check.check(False, f"store-ok: vz --json up exit {up.exit_code} (expected 0): {message[:200]}; "
+                           f"persisted {observed!r:.600}")
         return check.finish()
     check.check(True, "the three-mode storage topology comes up (vz --json up exit 0)")
 
