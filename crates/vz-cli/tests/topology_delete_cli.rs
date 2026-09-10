@@ -239,8 +239,7 @@ fn delete_help_is_read_only_and_scopes_machine_selection_to_forks() {
 }
 
 #[test]
-fn delete_parser_rejects_declared_machine_force_legacy_selector_and_unpaired_ids_without_effects()
-{
+fn delete_parser_rejects_declared_machine_force_legacy_selector_and_unpaired_ids_without_effects() {
     let fixture = Fixture::new(true);
     for arguments in [
         vec!["delete", "old-sandbox-id"],
