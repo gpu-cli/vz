@@ -1,7 +1,7 @@
 # vz 0.4.0: where it stands
 
 Status: living summary, rewritten when a gate run changes it
-Last measured: 2026-09-10, release candidate `0.4.0-rc3`, Apple-silicon macOS 26.3.1
+Last measured: 2026-09-10, release candidate `0.4.0-rc19`, Apple-silicon macOS 26.3.1
 
 This is the short answer to "what's left". The gate itself is
 [GOAL-0.4.0.md](GOAL-0.4.0.md); this file says which of its claims are proved,
@@ -9,33 +9,98 @@ which are disproved, and what is in the way.
 
 ## The one-line version
 
-The **harness is finished** -- all eighteen topology-lane scenarios have real
-checks, and nothing in that lane reports "needs provisioned Machines" any more.
-What remains is **product work**, and the gate now names it precisely instead of
-failing in a heap.
+The **harness is finished** and **four more topology criteria closed on
+2026-09-10**: 6, 7, 17 and 23. What is left in that lane is a native macOS
+template the gate host does not provision, a pinned v0.3.20 daemon that is not
+committed, and one destination policy.
 
-## What the last hardware run proved
+## What the hardware runs proved on 2026-09-10
 
-Topology lane, clean-provision phase, against a locally signed release candidate
-with a registered native macOS target and guest bundles built from source.
-**Thirteen of sixteen sub-checks pass.**
+Each measured against candidate `0.4.0-rc19` unless noted, with
+`leaks [] cleanup_errors []` on every run.
 
-| Passing on hardware | |
-|---|---|
-| criterion 1 | three concurrent Environments, no collision |
-| criterion 2 | mixed Linux + native macOS topology and status |
-| criterion 15 | CLI/API agreement, including live gRPC and the status field set |
-| criterion 19 | clean install, upgrade from the pinned v0.3.20 fixture, injected migration failure and rollback, uninstall |
-| criterion 21 | legacy CLI removal, bare help, bootstrap rules |
+| Criterion | Sub-check | Run |
+|---|---|---|
+| 6 · public-like topology | `public_like_ingress` PASS | `vz-c6c-1789064880` |
+| 7 · host boundaries | `host_import_export_boundaries` PASS | `vz-c7b-1789063352` |
+| 17 · workspace and storage | `workspace_storage_policy` PASS | `vz-c17-1789058438` (rc17) |
+| 23 · Machine forking | `machine_fork` PASS | `vz-c23-1789060234` (rc17) |
 
-Criterion 2 is the notable one: a native macOS Machine boots, is supervised, and
-reports correctly beside Linux Machines in one Environment. Criterion 19 is the
-most substantive: it opens the restored store with the real v0.3.20 daemon.
+Criterion 17 was an ORDERING defect, not a missing feature: the workspace slot
+was reserved after `begin_environment_lifecycle`, which moves a first Up out of
+`Creating` -- and `reserve_workspace_binding_for_environment` reserves only
+while `Creating`, while `load_project_state` refuses an aggregate whose
+declared slot is unresolved in any later state. So a first `vz up` of any
+definition declaring `machine.workspace` stranded its own project, and the
+reservation it still owed was refused by the load it had to do first.
 
-Zero daemons leak. Earlier runs left eight to ten alive, which on this host
-exhausts the macOS virtual-machine cap and makes every later Environment fail
-with `VZErrorDomain:6` -- three criteria failed that way before it was found,
-with evidence blaming the Environment rather than the daemons nobody stopped.
+Criterion 23 needed two things and neither was an optimisation. The
+Machine-scoped lifecycle operation had already merged and was never exercised,
+because the check returned early on a speed-up bound that could not be met by
+construction (see below). With the bound gone, `vz delete --machine
+machine-0@feat-y` reclaims exactly that fork and its Docker data disk with the
+parent and the sibling fork untouched.
+
+Criteria 6 and 7 were both held by ONE unbuilt thing and one misreading.
+
+## `offline` egress was declared and not enforced
+
+The most serious finding of the day, and it was invisible from outside.
+Measured from inside a Developer Linux Machine of a definition declaring
+nothing about networking, and therefore taking the default
+`EgressPolicy::Offline`:
+
+```
+eth0: 192.168.64.17/24, default via 192.168.64.1 dev eth0
+nslookup example.com      -> 172.66.147.243, 104.20.23.154 (via public 1.1.1.1)
+nc -w 5 1.1.1.1 443       -> REACHED
+wget http://example.com/  -> the page
+```
+
+Every Linux Machine was built with a NAT NIC gated only on a runtime-wide flag
+that defaults to true and that nothing ever set. Up refused every non-offline
+policy as unimplemented -- which was true, and which is exactly why nobody
+noticed that `offline` was unimplemented too: nothing else was ever admitted,
+so nothing contradicted the claim.
+
+`EgressPolicy` now decides, in one place. Measured after, same probe:
+
+```
+offline: no eth0 at all, no default route, DNS unreachable, TCP REFUSED,
+         name resolution fails -- and the Machine still reaches ready with
+         its Docker engine up
+allowed: eth0 192.168.64.2/24, DNS resolves, TCP REACHED, the page fetched
+```
+
+The two halves could not ship separately: the `linux-docker` lane pulls
+`docker.io/library/python` from inside a Machine over that NIC, and it is
+sixty-three of the gate's eighty-five rows. Enforcing `offline` alone would
+have fixed the contract and failed the gate.
+
+What `allowed` is NOT is a destination policy. Apple's user-mode NAT is
+unrestricted outbound, so the CIDR and domain policies criterion 6's
+required-implementation item names are still absent, and the project schema
+does not spell them. That is DEV, and criterion 20's matrix records it in the
+schema's own words.
+
+## Two rows were graded against the wrong paragraph
+
+Criterion 6's check withheld PASS for controlled egress, host imports/exports
+and fault controls. None of those is in ACCEPTANCE criterion 6, which is what
+the gate grades; they are required-implementation item 6, a different list, and
+each is graded by its own row -- criterion 7 for host boundaries, criterion 20
+for the Internet-policy matrix, and nothing at all for faults, because
+acceptance criterion 9 withdrew seeded network faults from 0.4. Item 6 now says
+so rather than leaving the two lists to disagree.
+
+Criterion 23's speed-up bound was the same shape of error one level up. A
+fork's Up does strictly more per boot than a cold one -- it clones a disk,
+replays a journal, and starts an engine against existing state -- while the one
+thing it saves, populating an image store, costs a cold `up` of the same bare
+definition nothing at all. Measured under equal load: 57.056s against 35.594s.
+No implementation work would have changed that, because the comparison was not
+measuring what forking saves. Warm state is what forking delivers, so warm
+state is what the criterion asserts, and it passes.
 
 ## What is in the way, in the order it blocks things
 
@@ -120,50 +185,24 @@ instructive than the fixes.
 
 ### Still open
 
-1. **`vz up --fork-from` works, and criterion 23 is one assertion from passing**
-   (`vz-5v8.8`). Twelve refusals were found by running the installed binary on
-   real Machines, and eleven are fixed. What the last hardware run proves, all
-   of it on real VMs: the fork boots and joins a fabric its parent is already
-   forwarding on; it holds its own machine_id, incarnation, fabric address, MAC,
-   Docker context and — after a defect found and fixed in this run — its own
-   Docker **engine id**; its image store answers for **every digest its parent
-   held** with **zero image pulls**; a volume created on the parent after the
-   fork is absent from it; the parent's sentinel is byte-identical afterwards;
-   reconcile leaves the fork alone; the fork survives a plain `vz up` keeping
-   its lineage; a second fork with an explicit `--as` succeeds; `vz exec`
-   without `--machine` refuses and names all three candidates.
+1. **A destination policy for `allowed` egress** (`vz-8cq`, in progress). The
+   two policies the project schema spells are now enforced and distinguishable
+   -- `offline` attaches no external NIC, `allowed` attaches Apple's user-mode
+   NAT -- and that is what unblocked criteria 6 and 7. What is not built is a
+   policy over WHICH hosts an `allowed` Machine may reach. Apple's NAT is
+   unrestricted outbound, and the CIDR and domain policies criterion 6's
+   required-implementation item names have no spelling in the schema, so
+   criterion 20's matrix records 24 of its 118 cells unexercised in the
+   schema's own words. Switch-side NAT with a destination policy is the next
+   increment; the design is
+   [NETWORK-INCREMENT-PLAN.md](NETWORK-INCREMENT-PLAN.md) step 5's second half.
 
-   And the claim the criterion exists for: **the fork's disk shares its parent's
-   physical blocks, 9 of 9 sampled offsets.** Copy-on-write, measured directly
-   rather than inferred, for the first time.
-
-   The one remaining failure is `FORK_SPEEDUP_MIN`, and it is an assumption
-   rather than a defect: the fork reached ready in 55.6 s against 41.3 s cold,
-   0.74x where 2x is required. A fork's Up clones, boots and replays a journal,
-   while the cold control is the same bare definition that pulls no images — so
-   the fork pays more and saves nothing *measurable against that baseline*. The
-   bound was NOT lowered to make it pass; the write-up asks for a cold control
-   that reaches the warm state the fork inherits.
-
-2. **A fork's Docker disk is cloned from a live filesystem** (P0, `vz-5v8.7`).
-   The eleventh and last refusal, and the one that matters: the fork now
-   **boots**, joins the running fabric, holds its own identity and address, and
-   is then refused inside the guest — `Docker filesystem is not positively
-   clean; automatic repair is forbidden`. `seed_forked_docker_disk` clones the
-   parent's `data.img` with no quiesce of any kind, by design ("a plain
-   filesystem operation that needs no live VM"), while the parent has that ext4
-   mounted and dirty. Admission requires `Filesystem state: clean` and no
-   `needs_recovery`, which a live-mounted filesystem never satisfies.
-
-   This is the assumption the feature rests on, and it is the one that was asked
-   to be validated. Everything around it works. The decision is a data-integrity
-   policy: the check conflates journal *recovery* — routine, safe, the reason
-   ext4 has a journal, and the designed response to the crash-consistent image a
-   `clonefile(2)` of a live file produces — with fsck *repair*, correctly
-   forbidden. The recommendation on the issue is to freeze the parent's
-   filesystem around the clone **and** permit recovery for a forked disk, keeping
-   repair and recorded-error refusal untouched. *The only thing still blocking
-   criterion 23.*
+2. **A criterion 6 flake** (P1). One run in three of this session's sample read
+   `machine-0`'s fabric address as `None` immediately after Up returned, while
+   its sibling and the edge read fine. The probe samples once with no deadline,
+   and an all-or-nothing lane cannot carry an unpolled read: a single `None`
+   stamps every one of the eighteen rows MISSING. The fix is the shape the
+   check's other readiness reads already use.
 
 3. **There is no reconciliation** (P0). `vz up` refuses every ProjectDefinition
    change before admission -- `project definition drift`. No plan, no durable
@@ -224,6 +263,19 @@ that ships a guest agent older than the host expects. The builder's own comment
 says to rebuild every run "so source changes cannot be silently shipped with a
 stale guest executable". The argument is for the shortcut refusing when the
 guest surface has moved, not for retiring it.
+
+**It happened a third time on 2026-09-10**, and cost a full diagnosis before
+being recognised. A criterion 7 run against rc18 failed at `hb-granted: vz
+--json up exit 2` with *"host import grants were not accepted by the guest
+agent: status: Unimplemented"*, which reads exactly like the egress change
+having broken the import relay. It had not: rc17 and rc18 reused a developer
+bundle built three and a half hours BEFORE the relay's guest half merged. The
+bundle still reports `agent_protocol_revision` 10, so the version gate does not
+catch it -- the RPC simply is not there. Criteria 17 and 23 passed on the same
+bundles because neither declares a host import, so criterion 7 was the first
+check able to see the staleness. **A revision that does not move when a guest
+RPC is added makes `--reuse-guest-bundles` silently wrong**, which is item 5 of
+"Still open" and now has a second incident behind it.
 
 The other two were probes that could not fail, which is the same defect the
 harness has now had three times: `BUSYBOX_SHIM` never setting the `mode` it
