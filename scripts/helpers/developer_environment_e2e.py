@@ -57,6 +57,7 @@ CRITERION_7 = "gate.host.import_export_boundaries"
 CRITERION_10 = "gate.lifecycle.recovery_including_sleep_wake"
 CRITERION_17 = "gate.storage.workspace_projection_policy"
 CRITERION_19 = "gate.migration.install_upgrade_rollback_uninstall"
+CRITERION_12 = "gate.agent.deterministic_workers"
 CRITERION_18 = "gate.secrets.snapshots_scoped_redacted"
 CRITERION_20 = "gate.network.exhaustive_denial_matrix"
 CRITERION_22 = "gate.definition.reconciliation_fencing"
@@ -333,9 +334,11 @@ class Lane:
             state.create()
         recorder = Recorder(self.evidence_dir, self.ctx.run_id)
         ctx = self.check_context(state, recorder)
-        subchecks, crash, established, establish = {CRITERION_22: []}, None, None, None
+        subchecks, crash, established, establish = {CRITERION_12: [], CRITERION_22: []}, None, None, None
         try:
             established, establish = checks.establish_recovery_environments(ctx, RECOVERY_ISOLATES)
+            if established is not None:
+                subchecks[CRITERION_12].append(checks.check_deterministic_agent_workers(ctx, CRITERION_12, established))
             subchecks[CRITERION_22].extend(checks.check_definition_reconciliation_fencing(ctx, CRITERION_22, established))
         except Exception:  # noqa: BLE001 - recorded as a crash, never swallowed
             crash = traceback.format_exc()

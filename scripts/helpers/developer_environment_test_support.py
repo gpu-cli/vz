@@ -2282,3 +2282,408 @@ def build_secret_repo_root(root: Path, *, secret_status: str = "DEV", snapshot_s
     (root / "schemas/vz-project-definition-v1.schema.json").write_bytes(
         json.dumps(schema, indent=2, sort_keys=True).encode() + b"\n")
     return root
+
+
+# ---------------------------------------------------------------- criterion 12
+#
+# The stand-ins criterion 12's check needs, and the deliberately wrong ones that
+# make each of its assertions falsifiable offline.
+#
+# `vz --json exec` is the criterion's whole attribution surface: it opens a
+# request, reports the execution ready, streams the guest's bytes, and files a
+# terminal receipt, and every one of those records carries a scope naming the
+# project, Environment, Machine, request and idempotency key. The sh stand-in
+# above models none of that, so this wraps it: anything without `--request-id`
+# is handed straight to it, and an execution that carries one is run through it
+# and dressed in the record stream the installed CLI emits. Identities are
+# derived from the SAME persisted topology the sh stand-in's `status` reads, so
+# the check comparing a scope against `vz status` is comparing two spellings of
+# one state rather than two copies of one constant.
+#
+# The wrong modes each break exactly one claim:
+#   agent_scope_one_environment  every scope names one Environment, whatever ran
+#   agent_scope_machine    a scope's machine_id varies per request instead of
+#                          naming the Machine that ran it
+#   agent_scope_request    the request id is keyed by Machine, so the twin pair
+#                          becomes indistinguishable -- the exact defect the
+#                          twin round exists to catch
+#   agent_env_constant     the guest environment delivered into the Machine is
+#                          not this execution's
+#   agent_pty_constant     the same, but only over a terminal
+#   agent_cross_token      another execution's token appears in this one's stream
+#   agent_exit_status_zero every receipt reports 0 whatever the guest returned
+#   agent_cancel_unreported a cancelled execution is filed as a clean completion
+#   agent_cancel_machine_wide a deadline takes every execution on the Machine
+#   agent_receipt_dropped  one execution files no terminal receipt
+#   agent_receipt_missing  no execution files one (the not_implemented path)
+#   agent_writer_leaks     a read_only projection is materialised writable and
+#                          shared, so a forbidden write lands on the worktree
+#   agent_writer_private   a read_write projection is materialised as a private
+#                          copy, so an admitted write never reaches the worktree
+AGENT_EXEC_CLI = r'''#!/usr/bin/env python3
+"""Record-stream stand-in for `vz --json exec` (unit tests only)."""
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+
+MODE_FILE = __MODE_FILE__
+HERE = Path(__file__).resolve().parent
+BASE = HERE / "vz-base"
+CONSTANT_REQUEST = "req-constant-not-this-execution"
+CONSTANT_TOKEN = "tok-constant-not-this-execution"
+DEADLINE_POLL_SECONDS = 3.0
+
+
+def mode():
+    try:
+        return Path(MODE_FILE).read_text().strip()
+    except OSError:
+        return ""
+
+
+def delegate():
+    os.execv(str(BASE), [str(BASE)] + sys.argv[1:])
+
+
+def refuse(code, message, request, idem):
+    sys.stderr.write(json.dumps({"schema_version": 1, "record_type": "execution_error",
+                                 "error": {"code": code, "message": message, "request_id": request,
+                                           "idempotency_key": idem, "details": {}}}) + "\n")
+    raise SystemExit(2)
+
+
+def topology(state):
+    rows = {"machines": {}}
+    path = state / "topology.json"
+    if not path.is_file():
+        return None
+    for line in path.read_text().splitlines():
+        parts = line.split()
+        if parts[:1] == ["P"] and len(parts) == 2:
+            rows["project_id"] = parts[1]
+        elif parts[:1] == ["S"] and len(parts) == 2:
+            rows["suffix"] = parts[1]
+        elif parts[:1] == ["E"] and len(parts) == 2:
+            rows["state"] = parts[1]
+        elif parts[:1] == ["M"] and len(parts) >= 3:
+            rows["machines"][parts[1]] = {"profile": parts[2], "os": parts[3] if len(parts) > 3 else "linux"}
+    return rows
+
+
+def main():
+    argv = sys.argv[1:]
+    if "--request-id" not in argv or "exec" not in argv:
+        delegate()
+    switch = mode()
+    json_output = False
+    tty = False
+    environment = machine = request = idem = None
+    timeout = None
+    guest_env = {}
+    command = []
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == "--":
+            command = argv[index + 1:]
+            break
+        if item == "--json":
+            json_output = True
+        elif item in ("--tty", "-t"):
+            tty = True
+        elif item == "--env":
+            key, _, value = argv[index + 1].partition("=")
+            guest_env[key] = value
+            index += 1
+        elif item in ("--environment", "--machine", "--request-id", "--idempotency-key", "--timeout"):
+            value = argv[index + 1]
+            index += 1
+            if item == "--environment":
+                environment = value
+            elif item == "--machine":
+                machine = value
+            elif item == "--request-id":
+                request = value
+            elif item == "--idempotency-key":
+                idem = value
+            else:
+                timeout = int(value)
+        index += 1
+    if tty and (json_output or not sys.stdin.isatty()):
+        # Exactly the installed CLI's own refusal: --tty needs a local terminal
+        # and cannot be combined with --json.
+        refuse("validation_error", "--tty requires a local terminal and is incompatible with --json",
+               request or "", idem or "")
+    state = Path(os.environ["VZ_RUNTIME_DATA_DIR"])
+    rows = topology(state)
+    if rows is None:
+        refuse("daemon_unavailable", "no compatible runtime daemon is listening on the configured socket",
+               request, idem)
+    if machine not in rows["machines"]:
+        refuse("validation_error", "no Machine named %s in the selected Environment" % machine, request, idem)
+    suffix = rows.get("suffix", "0")
+    environment_id = "env_%s" % suffix
+    machine_id = "mch_%s_%s" % (suffix, machine)
+    scope_request = request
+    if switch == "agent_scope_one_environment":
+        environment_id = "env_one_for_every_environment"
+    if switch == "agent_scope_machine":
+        machine_id = "mch_%s_%s" % (suffix, hashlib.sha256((request or "").encode()).hexdigest()[:8])
+    if switch == "agent_scope_request":
+        # Keyed by Machine rather than by request: two concurrent executions on
+        # one Machine become one identity.
+        scope_request = "req-%s" % machine
+    scope = {"schema_version": 1, "execution_id": "exe-" + uuid.uuid4().hex,
+             "request_id": scope_request, "idempotency_key": idem,
+             "request_hash": hashlib.sha256(json.dumps(command).encode()).hexdigest(),
+             "project_id": rows.get("project_id", "prj_unknown"), "environment_id": environment_id,
+             "machine_id": machine_id, "environment_generation": 1,
+             "incarnation": {"incarnation_id": "inc_%s_%s" % (suffix, machine), "generation": 1},
+             "runtime_identity": {"backend": "macos_virtualization_linux"},
+             "definition_digest": "sha256:" + "0" * 64}
+    sequence = [0]
+
+    def emit(record):
+        if not json_output:
+            return
+        sequence[0] += 1
+        record.setdefault("schema_version", 1)
+        record["sequence"] = sequence[0]
+        sys.stdout.write(json.dumps(record) + "\n")
+        sys.stdout.flush()
+
+    emit({"record_type": "request_started", "operation": "exec_machine",
+          "request_id": scope_request, "idempotency_key": idem})
+    emit({"record_type": "execution_ready", "scope": scope})
+
+    child_env = dict(os.environ)
+    delivered = dict(guest_env)
+    if switch == "agent_env_constant" and not tty:
+        delivered = {"VZ_AGENT_REQUEST": CONSTANT_REQUEST, "VZ_AGENT_TOKEN": CONSTANT_TOKEN}
+    if switch == "agent_pty_constant" and tty:
+        delivered = {"VZ_AGENT_REQUEST": CONSTANT_REQUEST, "VZ_AGENT_TOKEN": CONSTANT_TOKEN}
+    child_env.update(delivered)
+
+    guest_root = state / "guest" / machine / "vz-storage"
+    projected = guest_root / "ro"
+    if switch == "agent_writer_leaks" and projected.exists() and not projected.is_symlink():
+        # A read_only projection materialised as a writable share of the source.
+        # The copy it replaces was made unwritable on purpose, so its own mode
+        # has to be lifted before it can be removed.
+        for path in sorted(projected.rglob("*"), reverse=True) + [projected]:
+            try:
+                path.chmod(0o700)
+            except OSError:
+                pass
+        shutil.rmtree(projected, ignore_errors=True)
+        if not projected.exists():
+            projected.symlink_to(Path(os.getcwd()) / "ro")
+    if switch == "agent_writer_private" and (guest_root / "rw").is_symlink():
+        # A read_write projection materialised as a private copy.
+        source = (guest_root / "rw").resolve()
+        (guest_root / "rw").unlink()
+        shutil.copytree(source, guest_root / "rw")
+
+    marker = state / ("agent-deadline-" + machine)
+    if switch == "agent_cancel_machine_wide" and timeout is not None:
+        marker.write_text("deadline\n")
+    started = time.time_ns()
+    inner = [str(BASE), "exec", "--environment", environment or "default", "--machine", machine, "--", *command]
+    cancelled = False
+    process = subprocess.Popen(inner, env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        exit_code = process.returncode
+    except subprocess.TimeoutExpired:
+        cancelled = True
+        try:
+            os.killpg(process.pid, 9)
+        except (ProcessLookupError, PermissionError):
+            process.kill()
+        stdout, stderr = process.communicate()
+        exit_code = None
+    if switch == "agent_cancel_machine_wide" and timeout is None:
+        deadline = time.monotonic() + DEADLINE_POLL_SECONDS
+        while time.monotonic() < deadline and not marker.is_file():
+            time.sleep(0.05)
+        if marker.is_file():
+            cancelled = True
+            exit_code = None
+    first = state / "agent-first-execution.json"
+    if switch == "agent_cross_token":
+        if first.is_file():
+            stderr += ("leaked %s\n" % json.loads(first.read_text())["token"]).encode()
+        else:
+            first.write_text(json.dumps({"token": guest_env.get("VZ_AGENT_TOKEN", "")}))
+    if switch == "agent_exit_status_zero":
+        exit_code = 0
+    state_name = "completed"
+    failure = None
+    if cancelled:
+        state_name = "quiesced"
+        failure = "execution deadline expired; the guest process group was reaped"
+        if switch == "agent_cancel_unreported":
+            state_name, failure, exit_code = "completed", None, 0
+    if json_output:
+        if stdout:
+            emit({"record_type": "execution_output", "scope": scope, "stream": "stdout",
+                  "base64": base64.b64encode(stdout).decode("ascii")})
+        if stderr:
+            emit({"record_type": "execution_output", "scope": scope, "stream": "stderr",
+                  "base64": base64.b64encode(stderr).decode("ascii")})
+    else:
+        sys.stdout.buffer.write(stdout)
+        sys.stdout.buffer.flush()
+        sys.stderr.buffer.write(stderr)
+    receipt = {"schema_version": 1, "scope": scope, "execution_id": scope["execution_id"],
+               "state": state_name, "exit_code": exit_code, "failure": failure,
+               "started_unix_ns": started, "ended_unix_ns": time.time_ns()}
+    drop = switch == "agent_receipt_missing" or (
+        switch == "agent_receipt_dropped" and (request or "").endswith("_writer_ro"))
+    if not drop:
+        emit({"record_type": "execution_receipt", "replayed": False, "receipt": receipt})
+    return 5 if exit_code is None else exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+# The tamper driver: it runs the real checked-in driver and then breaks exactly
+# one property of the transcript. Those properties are the driver's own -- which
+# steps ran, in what order, against which binding, whether a round's steps
+# overlapped -- so no CLI stand-in can falsify them, and an assertion nothing
+# can falsify is an assertion that is not being made.
+AGENT_TAMPER_DRIVER = r'''#!/usr/bin/env python3
+"""Run the real agent driver, then break one property of its transcript."""
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+MODE_FILE = __MODE_FILE__
+REAL = __REAL_DRIVER__
+
+
+def mode():
+    try:
+        return Path(MODE_FILE).read_text().strip()
+    except OSError:
+        return ""
+
+
+def main():
+    argv = sys.argv[1:]
+    completed = subprocess.run([sys.executable, "-B", REAL, *argv], check=False)
+    if completed.returncode != 0:
+        return completed.returncode
+    transcript_path = Path(argv[argv.index("--transcript") + 1])
+    transcript = json.loads(transcript_path.read_text())
+    switch = mode()
+    steps = transcript["steps"]
+    ran = [row for row in steps if not row.get("skipped")]
+    if switch == "agent_tamper_digest":
+        transcript["schedule_sha256"] = "0" * 64
+    elif switch == "agent_tamper_order":
+        transcript["steps"] = list(reversed(steps))
+    elif switch == "agent_tamper_argv":
+        row = ran[0]
+        row["argv"][row["argv"].index("--machine") + 1] = "machine-somewhere-else"
+    elif switch == "agent_tamper_cwd":
+        ran[0]["intent"]["cwd"] = "/not/this/worker/project"
+    elif switch == "agent_tamper_identity":
+        ran[1]["intent"]["request_id"] = ran[0]["intent"]["request_id"]
+        ran[1]["intent"]["idempotency_key"] = ran[0]["intent"]["idempotency_key"]
+        ran[1]["intent"]["token"] = ran[0]["intent"]["token"]
+    elif switch == "agent_tamper_execution_id":
+        first = None
+        for row in ran:
+            for record in row.get("records") or []:
+                receipt = record.get("receipt")
+                if not isinstance(receipt, dict):
+                    continue
+                if first is None:
+                    first = receipt.get("execution_id")
+                else:
+                    receipt["execution_id"] = first
+                    if isinstance(receipt.get("scope"), dict):
+                        receipt["scope"]["execution_id"] = first
+    elif switch == "agent_tamper_overlap":
+        # Rewrite one round's spans so its steps ran strictly one after another:
+        # a barrier that did not hold looks exactly like this.
+        moment = 1_000_000_000
+        for row in ran:
+            if row.get("round") != 0:
+                continue
+            row["started_unix_ns"], row["ended_unix_ns"] = moment, moment + 10
+            moment += 100
+    elif switch == "agent_tamper_terminal":
+        for row in ran:
+            if row.get("channel") == "pty":
+                row["terminal"] = False
+    transcript_path.write_text(json.dumps(transcript, indent=1, sort_keys=True) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def build_tamper_driver(destination: Path, *, mode_file: Path, real_driver: Path = None) -> Path:
+    """The tamper driver, pointed at the checked-in one it wraps."""
+    real_driver = real_driver or (REPO_ROOT / "tests/fixtures/vz-0.4/agent-driver/driver.py")
+    destination.write_text(AGENT_TAMPER_DRIVER
+                           .replace("__MODE_FILE__", json.dumps(str(mode_file)))
+                           .replace("__REAL_DRIVER__", json.dumps(str(real_driver))))
+    destination.chmod(0o755)
+    return destination
+
+
+def seal_fake_release(root: Path) -> Path:
+    """Re-derive the release manifest and checksums after an overlay."""
+    manifest = json.loads(read_regular(root / "release-manifest.json"))
+    for relative in ("bin/vz", "bin/vz-runtimed", "bin/vz-runtime-probe"):
+        manifest["components"][relative]["signed_sha256"] = digest_file(root / relative)
+    components = manifest["components"]
+    manifest["normalized_content_sha256"] = candidate.line_digest(
+        sorted([p, c["unsigned_sha256"]] for p, c in components.items()))
+    manifest["signed_content_sha256"] = candidate.line_digest(
+        sorted([p, c["signed_sha256"]] for p, c in components.items()))
+    manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode() + b"\n"
+    (root / "release-manifest.json").write_bytes(manifest_bytes)
+    (root / "release-manifest.sha256").write_bytes(
+        f"{sha256_bytes(manifest_bytes)}  release-manifest.json\n".encode())
+    (root / "checksums.sha256").unlink()
+    rows = [f"{digest_file(path)}  {path.relative_to(root).as_posix()}\n"
+            for path in sorted(p for p in root.rglob("*") if p.is_file())]
+    (root / "checksums.sha256").write_bytes("".join(rows).encode())
+    for path in root.rglob("*"):
+        path.chmod(stat.S_IMODE(path.lstat().st_mode) & ~0o222)
+    return root
+
+
+def build_agent_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path = None) -> Path:
+    """`build_fake_release`, with a `vz` that speaks the exec record stream.
+
+    The sh stand-in is kept, unchanged, as `bin/vz-base`: every verb but a
+    request-identified `exec` is handed straight to it, so the topology,
+    identities and storage model criterion 12 reads are the same ones every
+    other check reads.
+    """
+    build_fake_release(root, mode_file=mode_file, snapshot_file=snapshot_file)
+    fixtures.make_writable(root)
+    shutil.move(str(root / "bin/vz"), str(root / "bin/vz-base"))
+    (root / "bin/vz-base").chmod(0o755)
+    (root / "bin/vz").write_text(AGENT_EXEC_CLI.replace("__MODE_FILE__", json.dumps(str(mode_file))))
+    (root / "bin/vz").chmod(0o755)
+    return seal_fake_release(root)

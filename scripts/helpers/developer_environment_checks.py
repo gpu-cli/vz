@@ -7085,3 +7085,640 @@ def check_exhaustive_denial_matrix(ctx: CheckContext, top: str, established: dic
             except OSError as error:
                 check.fail(f"{name}: could not be deleted: {type(error).__name__}: {error}")
     return check.finish()
+
+
+# --------------------------------------------------------------- criterion 12
+#
+# `gate.agent.deterministic_workers`. The criterion's last sentence is the sharp
+# one: "every output, cancellation, PTY, exit status, event, and receipt maps to
+# the exact Environment, Machine, worker, and request". That is an attribution
+# claim, and attribution is only falsifiable where two artifacts could be
+# confused. So the schedule the checked-in driver runs deliberately contains a
+# pair of workers that differ in NOTHING a runtime could key on except the
+# request id -- one Environment, one Machine, identical command text, released
+# together from one barrier -- and the round after it cancels exactly one of
+# them.
+#
+# The driver and its schedule live in `tests/fixtures/vz-0.4/agent-driver` and
+# are named by the contract's `fixtures.required_dirs`. The driver records; this
+# check compares. Nothing below reads the driver's opinion of whether a step
+# succeeded: every assertion compares a value the RUNTIME reported against a
+# value this check derived from the topology (`vz status`, and the record the
+# establishing check wrote) or from the plan it wrote itself.
+#
+# Imported here rather than at the top of the module: five criteria are edited
+# in parallel in this file and a shared import block is where their merges
+# collide.
+import base64
+import binascii
+
+from vz04_common import document
+
+AGENT_FIXTURE_DIR = "tests/fixtures/vz-0.4/agent-driver"
+AGENT_DRIVER = AGENT_FIXTURE_DIR + "/driver.py"
+AGENT_SCHEDULE = AGENT_FIXTURE_DIR + "/schedule.json"
+AGENT_SCHEDULE_KIND = "vz-0.4-agent-schedule"
+AGENT_TRANSCRIPT_KIND = "vz-0.4-agent-transcript"
+AGENT_PYTHON = "/usr/bin/python3"
+# The Environment holding the workspace-projection workers and the twin pair.
+# Created by this check and, unlike the persisted-recovery isolates, removed by
+# it again: nothing post-wake is meant to find it.
+AGENT_WORKSPACE_ISOLATE = "agent-ws"
+# The Environment holding the cooperating Linux/native-macOS pair.
+AGENT_CROSSING_ISOLATE = "agent-x"
+AGENT_RW_SOURCE, AGENT_RO_SOURCE = "rw", "ro"
+AGENT_WRITE_NAME = "agent.txt"
+# The read_only worker writes over the host-seeded file rather than beside it:
+# a projection wrongly materialised as a writable share of the source is then
+# visible as changed bytes on the host and not only as an extra file.
+AGENT_SEED_NAME = "seed.txt"
+AGENT_DRIVER_TIMEOUT = 900
+AGENT_STEP_TIMEOUT = 120
+AGENT_EMITTED = re.compile(r"^AGENT (\S+) (\S+)\s*$")
+# The three isolated workers, the twin pair, the two workspace writers and the
+# cooperating pair, in the schedule's own spelling.
+AGENT_ISOLATED_BINDINGS = ("isolate-a", "isolate-b", "isolate-c")
+AGENT_COOPERATING_BINDINGS = ("coop-linux", "coop-macos")
+# Steps the schedule names, addressed by id where a clause is about that step in
+# particular rather than about every step.
+AGENT_CANCELLED_STEP = "s3_twin_a"
+AGENT_CANCEL_PEER_STEP = "s3_twin_b"
+AGENT_PTY_STEP = "s4_twin_a"
+AGENT_WRITE_OK_STEP = "s5_writer_rw"
+AGENT_WRITE_REFUSED_STEP = "s5_writer_ro"
+AGENT_SERVE_STEP = "s6_coop_serve"
+AGENT_FETCH_STEP = "s6_coop_fetch"
+AGENT_EXIT_STATUS_ROUND = "isolated_exit_status"
+AGENT_TWIN_ROUND = "twin_crosstalk"
+AGENT_EXIT_STATUSES = [0, 3, 7]
+
+
+def agent_workspace_definition(release_dir: Path) -> dict:
+    """One Environment, two Developer Linux Machines, two projection modes.
+
+    Criterion 12 asks that "workspace writer policy is enforced" for a worker,
+    which needs a Machine whose projection forbids the write and a sibling whose
+    projection permits it, so the refusal is measured against a write that was
+    admitted in the same Environment at the same moment rather than against
+    nothing at all.
+    """
+    definition = two_machine_definition(release_dir)
+    environment = definition["environment"]
+    for machine, mode, source, target in ((environment["machines"][0], "read_write", AGENT_RW_SOURCE, RW_TARGET),
+                                          (environment["machines"][1], "read_only", AGENT_RO_SOURCE, RO_TARGET)):
+        machine["workspace"] = {"binding": "source", "target_path": target, "mode": mode, "source_path": source}
+    return definition
+
+
+def agent_provision_seeded(ctx: CheckContext, check: SubCheck, name: str, definition: dict) -> dict:
+    """`provision`, plus the host-side worktree the declared projections name.
+
+    `provision` commits `vz.json` alone, and a definition declaring a workspace
+    source the worktree does not carry is refused before any Machine exists. The
+    sources are seeded first and committed with it.
+    """
+    data = json.dumps(definition, indent=2, sort_keys=True).encode() + b"\n"
+    iso = ctx.isolated(name, project_files={"vz.json": data}, provision=True)
+    env, project = iso["env"], iso["project"]
+    seed_worktree(project)
+    for argv in (["init", "--quiet", "--initial-branch", "main"], ["add", "-A"],
+                 ["-c", "user.name=vz gate", "-c", "user.email=gate@vz.invalid",
+                  "commit", "--quiet", "-m", "definition"]):
+        receipt = ctx.run_tool(check, name + "-git", [GIT, *argv], cwd=project, env=env)
+        check.check(receipt.exit_code == 0, f"{name}: git {argv[0]} exit {receipt.exit_code} (expected 0)")
+    if check.status != "PASS":
+        return {"env": env, "project": project, "status": None}
+    up = ctx.run(check, name + "-up", ["--json", "up"], cwd=project, env=env, timeout=UP_TIMEOUT)
+    if up.exit_code != 0:
+        detail = ""
+        try:
+            detail = json.loads(up.stderr.decode("utf-8")).get("error", {}).get("message", "")
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            detail = ""
+        if "adapters remain required" in detail:
+            return {"env": env, "project": project, "status": None, "unsupported": detail}
+        check.check(False, f"{name}: vz --json up exit {up.exit_code} (expected 0): {detail[:200]}")
+        return {"env": env, "project": project, "status": None}
+    check.check(True, f"{name}: vz --json up exit 0 (expected 0)")
+    return {"env": env, "project": project,
+            "status": read_status(ctx, check, name, project=project, env=env)}
+
+
+def agent_identities(payload: dict) -> dict:
+    """`{"environment_id": ..., "machines": {name: machine_id}}` from one status."""
+    environments = (payload or {}).get("environments") or []
+    if len(environments) != 1:
+        return {}
+    environment = environments[0]
+    return {"environment_id": environment.get("environment_id"),
+            "machines": {machine.get("name"): machine.get("machine_id")
+                         for machine in environment.get("machines") or []}}
+
+
+def agent_binding(instance: dict, identity: dict, machine: str, *, target_os: str = "linux",
+                  params: dict = None) -> dict:
+    """One plan binding, and the identity pair every artifact of it must carry."""
+    return {"cwd": str(instance["project"]), "environment": "default", "machine": machine,
+            "target_os": target_os, "env": dict(instance["env"]), "params": dict(params or {}),
+            "expected": {"environment_id": identity.get("environment_id"),
+                         "machine_id": (identity.get("machines") or {}).get(machine)}}
+
+
+def agent_guest_text(row: dict) -> str:
+    """The guest bytes the runtime attributed to this step, as text.
+
+    A PTY transcript comes back through a terminal line discipline, so the
+    carriage returns it inserts are removed; nothing else is normalised.
+    """
+    encoded = (row.get("guest") or {}).get("stdout") or ""
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError, binascii.Error):
+        return ""
+    return raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def agent_emitted(row: dict):
+    """The `(request, token)` pair the guest program itself printed, or None.
+
+    This is the end-to-end half of the attribution claim: the request id and the
+    token were delivered INTO the Machine as this execution's guest environment,
+    so the pair that comes back names whichever execution's environment the
+    runtime actually installed.
+    """
+    for line in agent_guest_text(row).splitlines():
+        match = AGENT_EMITTED.match(line)
+        if match:
+            return match.group(1), match.group(2)
+    return None
+
+
+def agent_records(row: dict, kind: str) -> list:
+    return [record for record in row.get("records") or [] if record.get("record_type") == kind]
+
+
+def agent_receipt(row: dict):
+    receipts = agent_records(row or {}, "execution_receipt")
+    return receipts[-1].get("receipt") if receipts else None
+
+
+def agent_scope(row: dict) -> dict:
+    return ((agent_receipt(row) or {}).get("scope") or {})
+
+
+def agent_scopes(row: dict) -> list:
+    """Every scope the runtime stamped on this step's records, in order."""
+    scopes = []
+    for record in row.get("records") or []:
+        scope = record.get("scope")
+        if isinstance(scope, dict):
+            scopes.append((record.get("record_type"), scope))
+        receipt = record.get("receipt")
+        if isinstance(receipt, dict) and isinstance(receipt.get("scope"), dict):
+            scopes.append((str(record.get("record_type")) + ".receipt", receipt["scope"]))
+    return scopes
+
+
+def agent_scope_mismatches(row: dict, expected: dict) -> list:
+    """Every `(record, field, expected, observed)` this step's records got wrong.
+
+    The four fields are the four the criterion names: the request, the
+    Environment, the Machine, and -- through the idempotency key its worker
+    chose -- the worker.
+    """
+    wrong = []
+    for kind, scope in agent_scopes(row):
+        for field in ("request_id", "idempotency_key", "environment_id", "machine_id"):
+            want, observed = expected.get(field), scope.get(field)
+            if observed != want:
+                wrong.append(f"{kind}.scope.{field} expected {want!r} observed {observed!r}")
+    return wrong
+
+
+def agent_raw_text(row: dict) -> str:
+    """Everything this step produced, records and streams alike, as one string."""
+    parts = [json.dumps(row.get("records") or [], sort_keys=True), agent_guest_text(row)]
+    for encoded in ((row.get("stderr_b64") or ""), (row.get("raw_b64") or "")):
+        try:
+            parts.append(base64.b64decode(encoded, validate=True).decode("utf-8", "replace"))
+        except (ValueError, TypeError, binascii.Error):
+            continue
+    return "\n".join(parts)
+
+
+def agent_foreign(row: dict, others: dict, allowed=()) -> list:
+    """Identities belonging to OTHER steps that appear in this step's artifacts.
+
+    `allowed` names the one legitimate crossing: the cooperating fetch is meant
+    to read the serving worker's token, because that is the declared
+    cross-target service path doing its job. Every other appearance of another
+    step's request id, idempotency key or token is cross-attribution.
+    """
+    text = agent_raw_text(row)
+    found = []
+    for step_id, identity in sorted(others.items()):
+        for field in ("request_id", "idempotency_key", "token"):
+            value = identity.get(field)
+            if value and value not in allowed and value in text:
+                found.append(f"{step_id}.{field} {value!r}")
+    return found
+
+
+def agent_overlapped(rows: list) -> bool:
+    """Whether every step in a round was in flight at one moment.
+
+    The barrier's whole purpose: `max(start) < min(end)` holds only if the last
+    step started before the first one finished, which is what makes a concurrent
+    round concurrent rather than usually-concurrent.
+    """
+    starts = [row.get("started_unix_ns") for row in rows]
+    ends = [row.get("ended_unix_ns") for row in rows]
+    if not all(isinstance(value, int) for value in starts + ends):
+        return False
+    return max(starts) < min(ends)
+
+
+def check_deterministic_agent_workers(ctx: CheckContext, top: str, established: dict) -> SubCheck:
+    """Criterion 12: a checked-in deterministic driver, and exact attribution.
+
+    Three isolated workers run against the three persisted-recovery
+    Environments; two cooperating workers run against a Linux Machine and a
+    native macOS Machine in one Environment over its declared cross-target
+    service path; a twin pair runs against ONE Machine in one Environment with
+    identical command text, so only the request id tells its two workers apart;
+    and two workspace writers run concurrently, one holding a read_write
+    projection and one a read_only projection.
+
+    Every assertion compares a value. The Environment and Machine identities
+    come from `vz status` and from the record the establishing check wrote
+    before this one ran; the request identities come from the plan this check
+    wrote; the driver contributes artifacts and no verdict at all.
+    """
+    check = SubCheck(top, "deterministic_agent_workers")
+    driver = ctx.repo_root / AGENT_DRIVER
+    schedule_path = ctx.repo_root / AGENT_SCHEDULE
+    if not check.check(driver.is_file() and not driver.is_symlink(),
+                       f"the checked-in agent driver is present at {AGENT_DRIVER}"):
+        return check.finish()
+    if not check.check(schedule_path.is_file() and not schedule_path.is_symlink(),
+                       f"the checked-in agent schedule is present at {AGENT_SCHEDULE}"):
+        return check.finish()
+    try:
+        schedule = load_json(schedule_path)
+    except (OSError, ValueError) as error:
+        check.fail(f"{AGENT_SCHEDULE} is not readable JSON: {error}")
+        return check.finish()
+    check.check(schedule.get("kind") == AGENT_SCHEDULE_KIND,
+                f"the schedule declares kind {AGENT_SCHEDULE_KIND!r} (observed {schedule.get('kind')!r})")
+    roles = {}
+    for worker in schedule.get("workers") or []:
+        roles.setdefault(worker.get("role"), []).append(worker.get("binding"))
+    isolated = sorted(set(roles.get("isolated") or []))
+    cooperating = sorted(set(roles.get("cooperating") or []))
+    check.check(len(isolated) >= 3,
+                f"the schedule runs at least three isolated workers on separate Environments "
+                f"(observed {isolated})")
+    check.check(cooperating == sorted(AGENT_COOPERATING_BINDINGS),
+                f"the schedule runs two cooperating workers {sorted(AGENT_COOPERATING_BINDINGS)} "
+                f"(observed {cooperating})")
+    declared_steps = [row["id"] for round_row in schedule.get("rounds") or [] for row in round_row.get("steps") or []]
+    check.check(len(declared_steps) == len(set(declared_steps)),
+                f"every declared step id is unique ({len(set(declared_steps))} of {len(declared_steps)})")
+    if check.status != "PASS":
+        return check.finish()
+
+    # -- the Environments the workers are bound to
+    bindings, native = {}, macos_target(ctx.release_dir)
+    recovery = list((established or {}).get("environments") or [])
+    if not check.check(len(recovery) >= len(AGENT_ISOLATED_BINDINGS),
+                       f"the establishing check left at least {len(AGENT_ISOLATED_BINDINGS)} Environments to "
+                       f"work in (observed {len(recovery)})"):
+        return check.finish()
+    for name, entry in zip(AGENT_ISOLATED_BINDINGS, recovery):
+        try:
+            instance = ctx.reattach(entry["isolate"])
+        except ReattachError as error:
+            check.fail(str(error))
+            return check.finish()
+        machine = (entry.get("machines") or [{}])[0]
+        bindings[name] = {"cwd": str(instance["project"]), "environment": "default",
+                          "machine": machine.get("name"), "target_os": "linux",
+                          "env": dict(instance["env"]), "params": {},
+                          "expected": {"environment_id": entry.get("environment_id"),
+                                       "machine_id": machine.get("machine_id")}}
+    identifiers = [bindings[name]["expected"]["environment_id"] for name in AGENT_ISOLATED_BINDINGS]
+    check.check(len(set(identifiers)) == len(AGENT_ISOLATED_BINDINGS),
+                f"the three isolated workers address three distinct Environments ({identifiers})")
+    if check.status != "PASS":
+        return check.finish()
+
+    try:
+        workspace_definition = agent_workspace_definition(ctx.release_dir)
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return check.finish()
+    workspace = agent_provision_seeded(ctx, check, AGENT_WORKSPACE_ISOLATE, workspace_definition)
+    if workspace.get("unsupported"):
+        check.not_implemented = ("declared workspace projections are not applied by this runtime: " +
+                                 workspace["unsupported"][:300])
+        return check.finish()
+    if check.status != "PASS" or not workspace["status"]:
+        return check.finish()
+    workspace_identity = agent_identities(workspace["status"])
+    check.check(sorted(workspace_identity.get("machines") or {}) == ["machine-0", "machine-1"],
+                f"the workspace Environment reports both declared Machines "
+                f"(observed {sorted(workspace_identity.get('machines') or {})})")
+    if check.status != "PASS":
+        return check.finish()
+    for name, machine, params in (("twin-a", "machine-0", {}), ("twin-b", "machine-0", {}),
+                                  ("writer-rw", "machine-0", {"path": f"{RW_TARGET}/{AGENT_WRITE_NAME}"}),
+                                  ("writer-ro", "machine-1", {"path": f"{RO_TARGET}/{AGENT_SEED_NAME}"})):
+        bindings[name] = agent_binding(workspace, workspace_identity, machine, params=params)
+    check.check(bindings["twin-a"]["expected"] == bindings["twin-b"]["expected"],
+                f"the twin workers address one Environment and one Machine "
+                f"({bindings['twin-a']['expected']})")
+
+    # -- the cooperating pair, when this release can build a native macOS Machine
+    crossing = None
+    if native is not None:
+        crossing = provision(ctx, check, AGENT_CROSSING_ISOLATE, crossing_definition(ctx.release_dir, native))
+        if crossing.get("unsupported"):
+            check.not_implemented = ("declared networks are not applied by this runtime: " +
+                                     crossing["unsupported"][:300])
+            return check.finish()
+        if check.status != "PASS" or not crossing["status"]:
+            return check.finish()
+        crossing_identity = agent_identities(crossing["status"])
+        probed = machine_exec(ctx, check, "agent-cross-port", crossing, "machine-0", FABRIC_PROBE)
+        port = FabricState(probed).port()
+        if not check.check(port is not None,
+                           f"the serving Linux Machine holds the fabric address the host derived "
+                           f"(exit {probed.exit_code})"):
+            return check.finish()
+        bindings["coop-linux"] = agent_binding(crossing, crossing_identity, "machine-0",
+                                               params={"port": str(PRIVATE_PORT)})
+        bindings["coop-macos"] = agent_binding(crossing, crossing_identity, "machine-mac", target_os="macos",
+                                               params={"port": str(PRIVATE_PORT), "peer": port["address"]})
+
+    # -- run the checked-in driver
+    plan = {"schema_version": 1, "kind": "vz-0.4-agent-plan", "run_token": "vzag-" + uuid.uuid4().hex[:16],
+            "cli": str(ctx.state.cli), "env": {}, "wall_timeout_seconds": AGENT_STEP_TIMEOUT,
+            "bindings": {name: {key: value for key, value in binding.items() if key != "expected"}
+                         for name, binding in bindings.items()}}
+    plan_path = ctx.evidence_dir / "agent-plan.json"
+    transcript_path = ctx.evidence_dir / "agent-transcript.json"
+    document(plan_path, plan)
+    check.evidence.append(plan_path.name)
+    ran = ctx.run_tool(check, "agent-driver",
+                       [AGENT_PYTHON, "-B", str(driver), "--schedule", str(schedule_path),
+                        "--plan", str(plan_path), "--transcript", str(transcript_path)],
+                       cwd=ctx.evidence_dir,
+                       env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C",
+                            "PYTHONDONTWRITEBYTECODE": "1"},
+                       timeout=AGENT_DRIVER_TIMEOUT)
+    if not check.check(ran.exit_code == 0,
+                       f"the agent driver ran to completion (exit {ran.exit_code}, {ran.stderr[-200:]!r})"):
+        return check.finish()
+    if not check.check(transcript_path.is_file(), "the agent driver wrote its transcript"):
+        return check.finish()
+    check.evidence.append(transcript_path.name)
+    try:
+        transcript = load_json(transcript_path)
+    except (OSError, ValueError) as error:
+        check.fail(f"the agent transcript is not readable JSON: {error}")
+        return check.finish()
+    check.check(transcript.get("kind") == AGENT_TRANSCRIPT_KIND,
+                f"the transcript declares kind {AGENT_TRANSCRIPT_KIND!r} (observed {transcript.get('kind')!r})")
+    check.check(transcript.get("schedule_sha256") == digest_file(schedule_path),
+                f"the driver ran the checked-in schedule (transcript {transcript.get('schedule_sha256')!r}, "
+                f"file {digest_file(schedule_path)!r})")
+    rows = transcript.get("steps") or []
+    check.check([row.get("step") for row in rows] == declared_steps,
+                f"the driver ran exactly the declared steps in the declared order "
+                f"(observed {[row.get('step') for row in rows]})")
+    if check.status != "PASS":
+        return check.finish()
+    by_step = {row["step"]: row for row in rows}
+    ran_rows = [row for row in rows if not row.get("skipped")]
+
+    # The one honest way out: a runtime whose `--json exec` files no terminal
+    # receipt at all has no attribution surface for this criterion to be about.
+    # Modelled on `check_private_topology_paths`' `unsupported` path -- reported
+    # with what the runtime actually emitted, never inferred from a comparison
+    # that failed.
+    if not any(agent_records(row, "execution_receipt") for row in ran_rows):
+        observed = ""
+        for row in ran_rows:
+            observed = (agent_raw_text(row) or "").strip()[:200]
+            if observed:
+                break
+        check.not_implemented = ("this runtime's `vz --json exec` filed no execution_receipt record for any of "
+                                 f"the {len(ran_rows)} executions the driver issued, so no output, "
+                                 "cancellation, PTY, exit status, event or receipt carries an Environment, "
+                                 f"Machine or request to compare. It answered: {observed!r}")
+        return check.finish()
+
+    # -- per-step attribution
+    identities = {row["step"]: {"request_id": (row.get("intent") or {}).get("request_id"),
+                                "idempotency_key": (row.get("intent") or {}).get("idempotency_key"),
+                                "token": (row.get("intent") or {}).get("token")}
+                  for row in ran_rows}
+    check.check(len({tuple(sorted(value.items())) for value in identities.values()}) == len(identities),
+                f"every step carries its own request identity ({len(identities)} steps)")
+    executions = []
+    for row in ran_rows:
+        step = row["step"]
+        intent = row.get("intent") or {}
+        binding = bindings.get(intent.get("binding")) or {}
+        expected = dict(binding.get("expected") or {})
+        expected.update(request_id=intent.get("request_id"), idempotency_key=intent.get("idempotency_key"))
+        argv = row.get("argv") or []
+        for flag, want in (("--machine", binding.get("machine")), ("--environment", binding.get("environment")),
+                           ("--request-id", intent.get("request_id")),
+                           ("--idempotency-key", intent.get("idempotency_key"))):
+            observed = argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else None
+            check.check(observed == want,
+                        f"{step}: the invocation named {flag} {want!r} (observed {observed!r})")
+        check.check(intent.get("cwd") == binding.get("cwd"),
+                    f"{step}: ran in its own worker's project ({binding.get('cwd')!r} observed "
+                    f"{intent.get('cwd')!r})")
+        # `vz exec --tty` refuses `--json`, so a terminal execution has no
+        # record stream at all and its attribution rests entirely on the
+        # transcript, the invocation and the process status. Asserting an empty
+        # record set against the expected scope would be an assertion that
+        # cannot fail, so the record clauses are made only where records exist.
+        over_terminal = row.get("channel") == "pty"
+        if not over_terminal:
+            scopes = agent_scopes(row)
+            wrong = agent_scope_mismatches(row, expected)
+            # The count is part of the claim: a stream that carried no scope at
+            # all would otherwise satisfy "nothing was misattributed".
+            check.check(scopes and not wrong,
+                        f"{step}: all {len(scopes)} scoped records map to Environment "
+                        f"{expected.get('environment_id')!r}, Machine {expected.get('machine_id')!r}, request "
+                        f"{expected.get('request_id')!r}"
+                        if scopes and not wrong else
+                        (f"{step}: no record carried a scope at all" if not scopes
+                         else f"{step}: misattributed records: " + "; ".join(wrong[:4])))
+            opened = [record.get("request_id") for record in agent_records(row, "request_started")]
+            check.check(opened == [intent.get("request_id")],
+                        f"{step}: the runtime opened exactly this request (expected "
+                        f"{[intent.get('request_id')]}, observed {opened})")
+        emitted = agent_emitted(row)
+        check.check(emitted == (intent.get("request_id"), intent.get("token")),
+                    f"{step}: the guest reported the request and token THIS execution carried (expected "
+                    f"{(intent.get('request_id'), intent.get('token'))}, observed {emitted})")
+        allowed = ({identities[AGENT_SERVE_STEP]["token"]}
+                   if step == AGENT_FETCH_STEP and AGENT_SERVE_STEP in identities else set())
+        foreign = agent_foreign(row, {other: value for other, value in identities.items() if other != step},
+                                allowed)
+        check.check(not foreign,
+                    f"{step}: carries no other worker's identity"
+                    if not foreign else f"{step}: carries another worker's identity: " + "; ".join(foreign[:4]))
+        expectation = row.get("expect") or {}
+        if over_terminal:
+            check.check(row.get("exit_code") == expectation.get("code"),
+                        f"{step}: the terminal execution returned its guest's exit status "
+                        f"(expected {expectation.get('code')!r}, observed {row.get('exit_code')!r})")
+            continue
+        if row.get("held"):
+            # A held service is ended deliberately, by signal, once the workers
+            # that had to reach it have. There is no terminal receipt to demand
+            # of it; its attribution was already asserted from the records it
+            # streamed while it ran.
+            continue
+        receipt = agent_receipt(row)
+        if not check.check(receipt is not None, f"{step}: the runtime filed a terminal receipt"):
+            continue
+        executions.append(receipt.get("execution_id") or (receipt.get("scope") or {}).get("execution_id"))
+        kind = expectation.get("kind")
+        if kind == "exit":
+            check.check(receipt.get("exit_code") == expectation.get("code") and
+                        row.get("exit_code") == expectation.get("code"),
+                        f"{step}: exit status {expectation.get('code')} (receipt {receipt.get('exit_code')!r}, "
+                        f"process {row.get('exit_code')!r})")
+            check.check(receipt.get("state") == "completed",
+                        f"{step}: the receipt is terminal-completed (observed {receipt.get('state')!r})")
+        elif kind == "nonzero":
+            check.check(isinstance(receipt.get("exit_code"), int) and receipt["exit_code"] != 0,
+                        f"{step}: a nonzero exit status (receipt {receipt.get('exit_code')!r})")
+        elif kind == "cancelled":
+            check.check(receipt.get("state") == "quiesced",
+                        f"{step}: its own deadline cancelled it and the runtime proved no live work remained "
+                        f"(receipt state {receipt.get('state')!r}, expected 'quiesced')")
+    check.check(len(set(executions)) == len(executions),
+                f"every execution carries its own execution id ({len(set(executions))} of {len(executions)})")
+
+    # -- the barriers really did make the declared rounds concurrent
+    for round_row in transcript.get("rounds") or []:
+        concurrent = [by_step[step] for step in round_row.get("steps") or []
+                      if step in by_step and not by_step[step].get("skipped") and not by_step[step].get("held")]
+        if len(concurrent) < 2:
+            continue
+        spans = [(row["step"], row.get("started_unix_ns"), row.get("ended_unix_ns")) for row in concurrent]
+        check.check(agent_overlapped(concurrent),
+                    f"round {round_row.get('name')!r} released {len(concurrent)} steps from one barrier and "
+                    f"they overlapped (spans {spans})")
+
+    # -- three separate Environments, three exit statuses, one Machine for the twins
+    exit_round = next((row for row in transcript.get("rounds") or []
+                       if row.get("name") == AGENT_EXIT_STATUS_ROUND), {})
+    statuses = {step: (agent_receipt(by_step.get(step)) or {}).get("exit_code")
+                for step in exit_round.get("steps") or [] if step in by_step}
+    check.check(sorted(value for value in statuses.values() if value is not None) == AGENT_EXIT_STATUSES,
+                f"three concurrent executions reported three different exit statuses (expected "
+                f"{AGENT_EXIT_STATUSES}, observed {statuses})")
+    environments = {step: agent_scope(by_step.get(step)).get("environment_id")
+                    for step in exit_round.get("steps") or [] if step in by_step}
+    check.check(len(set(environments.values())) == len(environments),
+                f"those receipts name one distinct Environment each ({environments})")
+    twin_round = next((row for row in transcript.get("rounds") or [] if row.get("name") == AGENT_TWIN_ROUND), {})
+    twin_scopes = {step: agent_scope(by_step.get(step))
+                   for step in twin_round.get("steps") or [] if step in by_step}
+    check.check(len({(scope.get("environment_id"), scope.get("machine_id"))
+                     for scope in twin_scopes.values()}) == 1,
+                f"the twin workers' receipts name ONE Environment and ONE Machine "
+                f"({[(s.get('environment_id'), s.get('machine_id')) for s in twin_scopes.values()]})")
+    check.check(len({scope.get("request_id") for scope in twin_scopes.values()}) == len(twin_scopes),
+                f"and are told apart only by their request ids "
+                f"({[s.get('request_id') for s in twin_scopes.values()]})")
+
+    # -- cancellation reached exactly one of two concurrent executions
+    cancelled, peer = by_step.get(AGENT_CANCELLED_STEP, {}), by_step.get(AGENT_CANCEL_PEER_STEP, {})
+    peer_receipt = agent_receipt(peer) or {}
+    check.check(peer_receipt.get("state") == "completed" and peer_receipt.get("exit_code") == 0,
+                f"the execution sharing that Machine ran to completion while its peer was cancelled "
+                f"(state {peer_receipt.get('state')!r}, exit {peer_receipt.get('exit_code')!r})")
+    check.check(agent_scope(cancelled).get("request_id") == (cancelled.get("intent") or {}).get("request_id"),
+                f"the cancellation is attributed to the request that asked for it (receipt "
+                f"{agent_scope(cancelled).get('request_id')!r}, requested "
+                f"{(cancelled.get('intent') or {}).get('request_id')!r})")
+
+    # -- the PTY step ran on a terminal and carried its own identity
+    terminal = by_step.get(AGENT_PTY_STEP, {})
+    check.check(terminal.get("terminal") is True,
+                f"the PTY step ran on a terminal the driver allocated (observed {terminal.get('terminal')!r})")
+    check.check(agent_emitted(terminal) == ((terminal.get("intent") or {}).get("request_id"),
+                                            (terminal.get("intent") or {}).get("token")),
+                f"the terminal transcript carries its own request and token (expected "
+                f"{((terminal.get('intent') or {}).get('request_id'), (terminal.get('intent') or {}).get('token'))}, "
+                f"observed {agent_emitted(terminal)})")
+
+    # -- workspace writer policy, observed rather than assumed
+    refused, admitted = by_step.get(AGENT_WRITE_REFUSED_STEP, {}), by_step.get(AGENT_WRITE_OK_STEP, {})
+    refused_receipt, admitted_receipt = agent_receipt(refused) or {}, agent_receipt(admitted) or {}
+    check.check(isinstance(refused_receipt.get("exit_code"), int) and refused_receipt["exit_code"] != 0,
+                f"the worker holding a read_only projection is refused its write (receipt exit "
+                f"{refused_receipt.get('exit_code')!r}, expected nonzero)")
+    check.check(admitted_receipt.get("exit_code") == 0,
+                f"the worker holding a read_write projection is admitted its write (receipt exit "
+                f"{admitted_receipt.get('exit_code')!r}, expected 0)")
+    written = workspace["project"] / AGENT_RW_SOURCE / AGENT_WRITE_NAME
+    observed = written.read_bytes() if written.is_file() else b""
+    want = (identities.get(AGENT_WRITE_OK_STEP) or {}).get("token") or ""
+    check.check(observed == want.encode(),
+                f"the admitted write reached the host worktree with that worker's own bytes (expected "
+                f"{want!r}, observed {observed[:60]!r})")
+    seed = workspace["project"] / AGENT_RO_SOURCE / AGENT_SEED_NAME
+    survived = seed.read_bytes() if seed.is_file() else b""
+    check.check(survived == SEED,
+                f"the read_only source is byte-identical after the refused write (observed {survived[:40]!r})")
+
+    # -- the cooperating pair over the declared cross-target service path
+    if native is not None:
+        serve, fetch = by_step.get(AGENT_SERVE_STEP, {}), by_step.get(AGENT_FETCH_STEP, {})
+        check.check(serve.get("ready_observed") is True,
+                    f"the macOS worker was released by the runtime's own execution_ready event for the Linux "
+                    f"worker's service rather than by a sleep (observed {serve.get('ready_observed')!r})")
+        served = (identities.get(AGENT_SERVE_STEP) or {}).get("token")
+        check.check(bool(served) and served in agent_guest_text(fetch),
+                    f"the native macOS worker read the Linux worker's own token across the declared "
+                    f"cross-target path (expected {served!r} in {agent_guest_text(fetch)[:80]!r})")
+        check.check(agent_scope(fetch).get("machine_id") == bindings["coop-macos"]["expected"]["machine_id"],
+                    f"the fetch is attributed to the native macOS Machine (expected "
+                    f"{bindings['coop-macos']['expected']['machine_id']!r}, observed "
+                    f"{agent_scope(fetch).get('machine_id')!r})")
+
+    # Removed whenever nothing failed -- including when the criterion is only
+    # partly exercisable -- because these Environments are this check's own and
+    # post-wake must find exactly the three the establishing check left running.
+    if not check.failures:
+        for name, instance in ((AGENT_WORKSPACE_ISOLATE, workspace), (AGENT_CROSSING_ISOLATE, crossing)):
+            if instance is None:
+                continue
+            removed = ctx.run(check, name + "-delete",
+                              ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                              cwd=instance["project"], env=instance["env"], timeout=DELETE_TIMEOUT)
+            check.check(removed.exit_code == 0, f"{name}: deleted (exit {removed.exit_code})")
+    # Everything above proves the criterion for Linux Machines. Its cooperating
+    # clause names a native macOS Machine, and a host with no registered macOS
+    # template cannot build one, so claiming PASS here would certify criterion
+    # 12 on evidence that never crossed a target boundary.
+    if native is None and not check.not_implemented:
+        check.not_implemented = (
+            "criterion 12 also requires two cooperating workers against a Linux Machine and a native macOS "
+            "Machine in one Environment over a declared cross-target service path; this release registers no "
+            "Developer macOS target, so that pair could not be built and the schedule's cooperating round was "
+            "skipped. Every other clause above did run. Register a template with vz-macos-setup "
+            "(planning/developer-environments/macos-local-setup.md); this check never provisions one.")
+    return check.finish()
