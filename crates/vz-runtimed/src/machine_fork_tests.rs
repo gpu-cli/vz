@@ -130,13 +130,44 @@ fn seeding_a_fork_clones_the_docker_disk_for_free_space_metadata_not_bytes() {
     )
     .unwrap();
 
-    assert!(
-        consumed < DISK_BYTES / 8,
-        "forking a {DISK_BYTES}-byte Docker disk consumed {consumed} bytes of volume free space; \
-         that is a deep copy, not a fork"
+    // Free space is deliberately NOT the assertion here, though the fork's cost
+    // is still recorded below. Volume free space is a GLOBAL observable and
+    // nextest runs this suite in parallel: an absolute bound on it passed run
+    // alone and failed inside the workspace run, because neighbours moved more
+    // bytes during the window than the entire disk under test. Measuring a
+    // deep-copy control instead does not fix it either, because the two windows
+    // are sequential and see different neighbours.
+    //
+    // The direct observation is whether the two files share physical blocks,
+    // which is what copy-on-write MEANS and what free space was only ever a
+    // proxy for. It is local, exact, and unaffected by anything else on the
+    // volume. Measured 2026-09-10: a `cp -c` clone reports its source's device
+    // offset and a streamed byte copy of the same file reports a different one.
+    let destination = docker_data_disk_path(&fork_store, "stack-forked");
+    assert_eq!(
+        vz_macos_provision::clone::first_physical_extent(&destination).unwrap(),
+        vz_macos_provision::clone::first_physical_extent(&source).unwrap(),
+        "the fork's disk does not share its parent's physical blocks: it consumed \
+         {consumed} bytes of volume free space, which is a deep copy, not a fork"
     );
 
-    let destination = docker_data_disk_path(&fork_store, "stack-forked");
+    // And the control that proves the assertion above can fail: the same bytes,
+    // streamed by hand, land somewhere else. `std::fs::copy` is not usable for
+    // this -- on macOS it reaches for `fclonefileat` and would clone too.
+    let control = temp.path().join("control.img");
+    {
+        let mut reader = std::fs::File::open(&source).unwrap();
+        let mut writer = std::fs::File::create(&control).unwrap();
+        std::io::copy(&mut reader, &mut writer).unwrap();
+        writer.sync_all().unwrap();
+    }
+    assert_ne!(
+        vz_macos_provision::clone::first_physical_extent(&control).unwrap(),
+        vz_macos_provision::clone::first_physical_extent(&source).unwrap(),
+        "a streamed byte copy shares its source's blocks; this measurement cannot \
+         tell a clone from a copy and proves nothing"
+    );
+
     assert_eq!(std::fs::metadata(&destination).unwrap().len(), DISK_BYTES);
     // And why the obvious check is the wrong one: the clone reports the parent's
     // full allocation, because both inodes reference the same blocks.

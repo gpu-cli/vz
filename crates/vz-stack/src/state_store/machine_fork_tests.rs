@@ -162,6 +162,58 @@ fn a_declared_machine_that_is_not_ready_still_refuses_ready() {
     );
 }
 
+#[test]
+fn the_machine_fence_admits_a_fresh_fork_and_refuses_everything_else() {
+    // This fence is minting authority: it decides whether an Up may create the
+    // two runtime ownership reservations for a Machine inside an Environment
+    // that has already started. What it REFUSES is the whole of its value.
+    let (_root, store, environment) = ready_fixture();
+    let parent = environment.machines[0].machine_id.clone();
+    let plan = store
+        .fork_machine_in_environment(environment.environment_id.as_str(), &parent, "feature", 11)
+        .unwrap();
+    let current = store
+        .load_environment_instance(environment.environment_id.as_str())
+        .unwrap()
+        .unwrap();
+    let fork_id = plan.machine.machine_id.clone();
+
+    store
+        .require_machine_admission_fence(&current, &fork_id)
+        .expect("a never-started fork is exactly what this fence admits");
+
+    // The parent is declared, not forked. A declared Machine reaching a
+    // never-started state inside a live Environment means something went wrong
+    // that minting over would hide, so it is refused here and still requires
+    // the whole-Environment fence.
+    let error = store
+        .require_machine_admission_fence(&current, &parent)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("only a fork may be admitted"), "{error}");
+
+    // The fence is compare-and-check against what is persisted, not a reading of
+    // whatever snapshot the caller hands it. A caller acting on a stale view is
+    // refused before any question about the Machine is reached.
+    let mut stale = current.clone();
+    stale.updated_at += 1;
+    let error = store
+        .require_machine_admission_fence(&stale, &fork_id)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("differs from the expected snapshot"),
+        "{error}"
+    );
+
+    let absent = MachineId::generate();
+    let error = store
+        .require_machine_admission_fence(&current, &absent)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("absent from its Environment"), "{error}");
+}
+
 fn forks_in(store: &StateStore, environment_id: &str) -> Vec<String> {
     let environment = store
         .load_environment_instance(environment_id)

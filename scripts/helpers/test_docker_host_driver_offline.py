@@ -952,17 +952,53 @@ class FixtureDigestTests(unittest.TestCase):
 
 class AssertionTests(unittest.TestCase):
     def test_denied_group_signal_retains_prefix_without_broad_fallback(self):
+        # This test was written to pin two things: the caller keeps the bounded
+        # prefix, and a denied group signal is never answered with a broader or
+        # weaker kill that would leave the rest of the group alive.
+        #
+        # It also asserted that EPERM itself is the outcome, which measurement
+        # showed to be wrong on this platform: Darwin returns EPERM from killpg
+        # exactly when every member of the group is an unreaped zombie, and
+        # succeeds whenever any member is still alive. So EPERM is the group
+        # already being gone, and raising it discarded the OutputLimitExceeded
+        # that says why the kill was attempted at all.
+        #
+        # The bounded reap is now the arbiter instead of errno. Both original
+        # properties still hold and are still asserted: no broad fallback, and
+        # the prefix survives.
         original = driver.OutputLimitExceeded("bounded output")
         original.stdout, original.stderr, original.observed_bytes = b"prefix", b"", {"stdout": 7, "stderr": 0}
         with patch.object(subprocess, "Popen") as popen, patch.object(os, "killpg", side_effect=PermissionError("denied")) as kill, \
                 patch.object(driver, "collect_output", side_effect=original):
             process = popen.return_value
             process.pid, process.returncode = 12345, None
-            with self.assertRaises(PermissionError) as raised:
+            process.wait.return_value = -9
+            with self.assertRaises(driver.OutputLimitExceeded) as raised:
                 driver.execute(["owned"], timeout=2, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             kill.assert_called_once_with(12345, driver.signal.SIGKILL)
-            process.wait.assert_not_called()
+            # The group is signalled once and never again by any other means.
+            process.kill.assert_not_called()
+            process.terminate.assert_not_called()
+            # The reap, not the errno, decides whether the process is gone.
+            process.wait.assert_called_once_with(timeout=5)
             process.__exit__.assert_not_called()
+            self.assertEqual(raised.exception.stdout, b"prefix")
+
+    def test_denied_group_signal_over_a_live_process_is_still_reported(self):
+        # The counterpart: EPERM is only benign because the reap confirms it.
+        # A process that is alive and cannot be killed must never be reported as
+        # bounded, and must not draw a weaker kill either.
+        original = driver.OutputLimitExceeded("bounded output")
+        original.stdout, original.stderr, original.observed_bytes = b"prefix", b"", {"stdout": 7, "stderr": 0}
+        with patch.object(subprocess, "Popen") as popen, patch.object(os, "killpg", side_effect=PermissionError("denied")), \
+                patch.object(driver, "collect_output", side_effect=original):
+            process = popen.return_value
+            process.pid, process.returncode = 12345, None
+            process.wait.side_effect = subprocess.TimeoutExpired(["owned"], 5)
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                driver.execute(["owned"], timeout=2, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process.kill.assert_not_called()
+            process.terminate.assert_not_called()
             self.assertEqual(raised.exception.stdout, b"prefix")
 
     def test_failed_sigkill_reap_is_bounded_without_context_manager_wait(self):

@@ -89,6 +89,61 @@ pub fn volume_free_bytes(path: &Path) -> Result<u64> {
     Ok(stats.f_frsize.saturating_mul(stats.f_bavail as u64))
 }
 
+/// Device offset of the first physical extent backing `path`.
+///
+/// The direct observation of copy-on-write, where [`volume_free_bytes`] is an
+/// indirect one. Two files that share blocks report the same offset; a file
+/// holding its own copy of the bytes reports a different one.
+///
+/// Both exist because they answer the same question under different
+/// constraints. Free space is what a gate lane measures, because it is what a
+/// clone actually *costs* and the lane owns its volume. But free space is a
+/// property of the whole volume, so it cannot be asserted anywhere something
+/// else may be writing -- measured 2026-09-10, a bound on it passed run alone
+/// and failed inside a parallel test suite whose neighbours moved more bytes
+/// during the window than the file under test. This function is unaffected by
+/// anything outside the two files.
+pub fn first_physical_extent(path: &Path) -> Result<u64> {
+    use std::os::unix::io::AsRawFd;
+
+    // `struct log2phys` from <sys/fcntl.h>. `repr(C)` reproduces the padding
+    // after the 32-bit flags that the kernel's own layout has.
+    #[repr(C)]
+    struct Log2Phys {
+        flags: u32,
+        contigbytes: i64,
+        devoffset: i64,
+    }
+    const F_LOG2PHYS_EXT: i32 = 65;
+
+    let file = std::fs::File::open(path)?;
+    let mut mapping = Log2Phys {
+        flags: 0,
+        contigbytes: 0,
+        devoffset: 0,
+    };
+    // SAFETY: F_LOG2PHYS_EXT takes a pointer to one `struct log2phys`, which
+    // `mapping` is: correctly sized, aligned, fully initialised, and exclusively
+    // borrowed for the duration of the call. `file` owns an open descriptor that
+    // outlives the call, and the kernel writes only into that struct, retaining
+    // neither pointer afterwards.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            F_LOG2PHYS_EXT,
+            &raw mut mapping as *mut libc::c_void,
+        )
+    };
+    ensure!(
+        result == 0,
+        "could not read the physical extent of {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    Ok(mapping.devoffset as u64)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

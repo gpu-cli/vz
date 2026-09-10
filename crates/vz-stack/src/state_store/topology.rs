@@ -2641,6 +2641,96 @@ impl StateStore {
         Ok(environment)
     }
 
+    /// Authority to mint ONE never-started fork's runtime reservations into an
+    /// Environment that is already live.
+    ///
+    /// [`Self::require_environment_admission_fence`] is the whole-Environment
+    /// form of this, and it is the only authority that existed while the only
+    /// never-started Machines were the ones a never-started Environment
+    /// declared. A fork breaks that: `fork_machine_in_environment` mints a
+    /// Machine that has never run into an Environment that has, so its two
+    /// runtime reservations must be minted against a live aggregate or its
+    /// first Up can never take them.
+    ///
+    /// The scoped fence asks the same questions the Environment fence asks,
+    /// about one Machine instead of all of them, plus the one that keeps it
+    /// narrow: the Machine must be a FORK. A declared Machine that is somehow
+    /// never-started inside a live Environment is not covered here and still
+    /// requires the Environment fence, because a declared Machine reaching that
+    /// state means something went wrong that minting over would hide.
+    pub fn require_machine_admission_fence(
+        &self,
+        expected: &EnvironmentInstance,
+        machine_id: &MachineId,
+    ) -> Result<EnvironmentInstance, StackError> {
+        let conflict = |reason: &str| StackError::Machine {
+            code: vz_runtime_contract::MachineErrorCode::StateConflict,
+            message: format!("Machine `{machine_id}` admission fence refused: {reason}",),
+        };
+        expected
+            .validate()
+            .map_err(|error| TopologyLifecycleError::InvalidOperation {
+                reason: format!("invalid expected admission snapshot: {error}"),
+            })?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let project = self
+            .load_project_state(expected.project_id.as_str())?
+            .ok_or_else(|| conflict("owning Project is absent"))?;
+        let environment = project
+            .environments
+            .into_iter()
+            .find(|environment| environment.environment_id == expected.environment_id)
+            .ok_or_else(|| conflict("Environment is absent from its owning Project"))?;
+        if environment != *expected {
+            return Err(conflict(
+                "persisted aggregate differs from the expected snapshot",
+            ));
+        }
+        if environment.legacy_migration.is_some() {
+            return Err(conflict("Environment carries a legacy Sandbox migration"));
+        }
+        let machine = environment
+            .machines
+            .iter()
+            .find(|machine| machine.machine_id == *machine_id)
+            .ok_or_else(|| conflict("Machine is absent from its Environment"))?;
+        if machine.fork.is_none() {
+            return Err(conflict(
+                "only a fork may be admitted into an Environment that has already started",
+            ));
+        }
+        if machine.state != MachineState::Creating
+            || machine.backend.is_some()
+            || machine.incarnation.is_some()
+            || machine.runtime_identity.is_some()
+            || machine.legacy_sandbox_id.is_some()
+            || !machine.negotiated_capabilities.capabilities.is_empty()
+            || !machine.negotiated_capabilities.unsupported.is_empty()
+        {
+            return Err(conflict("Machine retains activation or lifecycle state"));
+        }
+        // A fork that already appears in a machine step of some past operation
+        // has been through an Up, whatever its current fields say. Minting a
+        // second set of reservations over that is the thing this fence exists
+        // to refuse.
+        let has_history: bool = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM environment_lifecycle_operations AS operation,
+                      json_each(operation.operation_json, '$.machine_steps') AS step
+                 WHERE operation.environment_id = ?1
+                   AND json_extract(step.value, '$.machine_id') = ?2
+             )",
+            params![environment.environment_id.as_str(), machine_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if has_history {
+            return Err(conflict("Machine has persisted lifecycle history"));
+        }
+        transaction.commit()?;
+        Ok(environment)
+    }
+
     /// Require one exact persisted ownership edge without reserving or mutating it.
     ///
     /// The ownership row, its Environment aggregate, and any attached lifecycle

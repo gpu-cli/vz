@@ -269,8 +269,33 @@ impl EnvironmentControllerLease {
             for record in pair {
                 admitted = state.access(|store| {
                     load_exact(store, &admitted)?;
+                    // Reserving is per Machine, not per Environment. A fork is a
+                    // never-started Machine inside an Environment that has
+                    // already run, so it needs its two runtime reservations
+                    // minted here; `fresh` alone would send it to
+                    // `require_owned_resource` and refuse its first Up with
+                    // `not_found` on a row nothing had ever created.
+                    //
+                    // Order matters: a record already in the aggregate is
+                    // REQUIRED, never re-minted, so a replayed fork Up verifies
+                    // the reservations it took the first time rather than
+                    // minting a second set.
+                    let mint_for_fork = !fresh
+                        && !admitted.ownership.contains(record)
+                        && record.machine_id.as_ref().is_some_and(|machine_id| {
+                            admitted.machines.iter().any(|machine| {
+                                machine.machine_id == *machine_id && machine.fork.is_some()
+                            })
+                        });
                     if fresh {
                         store.require_environment_admission_fence(&admitted)?;
+                        store.reserve_owned_resource(record, now)?;
+                    } else if mint_for_fork {
+                        let machine_id = record
+                            .machine_id
+                            .as_ref()
+                            .ok_or_else(|| conflict("fork reservation carries no Machine"))?;
+                        store.require_machine_admission_fence(&admitted, machine_id)?;
                         store.reserve_owned_resource(record, now)?;
                     } else {
                         store.require_owned_resource(record)?;

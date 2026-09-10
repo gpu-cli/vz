@@ -15,6 +15,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+from unittest.mock import patch
 
 from jsonschema import Draft202012Validator
 
@@ -3156,7 +3157,41 @@ class CriterionTwentyThreeTests(unittest.TestCase):
         ctx = checks.CheckContext(repo_root=common.REPO_ROOT, release_dir=self.release, state=state,
                                   recorder=recorder.Recorder(evidence, RUN_ID), evidence_dir=evidence,
                                   cli_removal={}, docker_client=str(self.docker))
-        return checks.check_machine_fork(ctx, TOP23).scenario()
+        with patch.object(checks, "volume_free_bytes", self.charged_free_bytes(mode)):
+            return checks.check_machine_fork(ctx, TOP23).scenario()
+
+    def charged_free_bytes(self, mode: str):
+        """Free space charged to THIS fixture's disks and nothing else.
+
+        The stand-in really does clone with `cp -c`, so the physics under this
+        check is real -- but the observable that distinguishes a clone from a
+        deep copy is how much the VOLUME lost, and the volume is shared with
+        every other test in the suite. Measured 2026-09-10: this assertion
+        passed run alone and failed inside the full suite, reporting a 127 MB
+        loss across a window that cost kilobytes, because two thousand
+        neighbouring tests were writing to the same volume. A real `statvfs`
+        here is a coin flip weighted by load.
+
+        So the fixture charges only the disks it created itself, at the rate the
+        mode implies. What that proves is the check's own arithmetic, its
+        reporting, and that it separates the two modes -- which is all a
+        fixture can prove. The physics is proved on hardware, where the lane
+        owns the volume.
+        """
+        base = 1 << 50
+        deep = mode == "fork_deep_copy"
+
+        def free_bytes(path) -> int:
+            # Charge the disks under the very tree the check is measuring; the
+            # lane's isolate lives outside this test's temp dir, so anything
+            # else silently charges nothing and every bound passes.
+            charged = 0
+            for disk in Path(path).rglob("data.img"):
+                # A clone costs its metadata; a byte copy costs the whole file.
+                charged += disk.stat().st_size if deep else 64 * 1024
+            return base - charged
+
+        return free_bytes
 
     @staticmethod
     def failures(scenario) -> list:
