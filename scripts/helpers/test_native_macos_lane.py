@@ -9,13 +9,16 @@ the vacuity suite rather than by the next physical run.
 """
 import copy
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import frozen_tree  # noqa: E402
 import native_macos_lane_result as lane_module  # noqa: E402
 import vz04_lanes as lanes  # noqa: E402
 import vz04_schema as schema  # noqa: E402
@@ -418,6 +421,34 @@ class WrapperTests(unittest.TestCase):
         body = (common.REPO_ROOT / lane_module.ENTRY_POINT).read_text()
         self.assertNotIn("vz04_lanes.py stub", body)
         self.assertIn("native_macos_lane_result.py", body)
+
+    def test_the_wrapper_reaches_the_lane_through_a_frozen_tree(self):
+        """The wrapper runs the lane from a frozen worktree and leaves none behind.
+
+        `test_the_entry_point_is_no_longer_the_stub` reads the wrapper as text,
+        which cannot tell whether it still executes. This one runs it.
+
+        The exit code alone proves nothing and asserting only on it made this
+        test vacuous: a wrapper pointed at a file that does not exist also exits
+        2, because that is what CPython returns when it cannot open the script.
+        So the assertions are the two things that are true only of a real run --
+        `frozen_tree` announced the tree it froze, and the REJECTION IS THE
+        LANE'S OWN, in the lane's own words. Neither survives breaking the
+        wrapper.
+
+        The frozen root must also be gone afterwards: a lane that leaks a full
+        worktree per run fills the volume the Machines are provisioned on.
+        """
+        script = common.REPO_ROOT / lane_module.ENTRY_POINT
+        before = set(frozen_tree.FROZEN_BASE.glob(frozen_tree.FROZEN_PREFIX + "*"))
+        completed = subprocess.run([str(script), "--suite", "lifecycle"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   timeout=600, check=False,
+                                   env={"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/")})
+        stdout, stderr = completed.stdout.decode(), completed.stderr.decode()
+        self.assertEqual(completed.returncode, 2, stderr[-2000:])
+        self.assertIn("==> frozen tree ", stdout)
+        self.assertIn(f"{lane_module.LANE} lane rejected input", stderr)
+        self.assertEqual(set(frozen_tree.FROZEN_BASE.glob(frozen_tree.FROZEN_PREFIX + "*")) - before, set())
 
     def test_the_contract_still_names_this_entry_point(self):
         contract = json.loads((common.REPO_ROOT / "config/vz-0.4-e2e-contract.json").read_text())

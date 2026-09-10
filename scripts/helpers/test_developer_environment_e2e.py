@@ -777,6 +777,11 @@ class TopologyLaneTests(unittest.TestCase):
                                    env={"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/")})
         # The fake release dir's dummy binaries fail the real codesign verifier only as findings; admission itself succeeds.
         self.assertEqual(completed.returncode, 3, completed.stderr.decode())
+        # The wrapper runs the lane from a frozen worktree, not this checkout, so
+        # a 45-minute run does not have to hold the tree still and the result's
+        # `source_tree` names the tree that actually executed. The banner is the
+        # only externally visible proof the freeze happened.
+        self.assertIn("==> frozen tree ", completed.stdout.decode())
         result = common.load_json(evidence / "lane-result.json")
         self.assertEqual(schema.validate("lane-result", result), [])
         self.assertEqual(result["entry_point"]["path"], "scripts/run-developer-environment-e2e.sh")
