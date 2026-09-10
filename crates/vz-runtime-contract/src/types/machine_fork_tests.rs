@@ -11,7 +11,7 @@ use crate::types::topology::{
 ///
 /// Deliberately the smallest topology that exercises everything a fork mints:
 /// a network attachment, an egress record, and an endpoint it must NOT copy.
-fn definition() -> ProjectDefinition {
+pub(super) fn definition() -> ProjectDefinition {
     ProjectDefinition {
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         project_id: ProjectId::new("prj_fork").unwrap(),

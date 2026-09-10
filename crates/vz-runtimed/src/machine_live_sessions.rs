@@ -319,9 +319,7 @@ impl MachineLiveSessions {
                     ));
                 }
                 if prior.kind == EnvironmentLifecycleKind::Delete {
-                    if prior.generation != environment.lifecycle_generation
-                        || environment.active_operation_id.as_ref() != Some(&prior.operation_id)
-                    {
+                    if !prior.fences_environment(environment) {
                         return Err(error("Delete preflight has an unrelated teardown attempt"));
                     }
                 } else {
@@ -1399,8 +1397,11 @@ fn require_delete_journal<S: EnvironmentStateStore>(
             .iter()
             .find(|row| &row.machine_id == machine)
             != Some(step)
-        || environment.active_operation_id.as_ref() != Some(&operation.operation_id)
-        || environment.lifecycle_generation != operation.generation
+        // Both shapes of Delete fence here. An Environment-wide operation holds
+        // the Environment's active operation; a Machine-scoped one holds its
+        // generation and deliberately no active operation, because the
+        // Environment it is reclaiming a fork from is still serving.
+        || !operation.fences_environment(&environment)
     {
         return Err(error("Delete journal is stale, foreign, or not active"));
     }
@@ -1424,8 +1425,7 @@ fn require_acknowledged_delete(
     if environment.project_id != operation.project_id
         || environment.environment_id != operation.environment_id
         || environment.definition_digest != operation.definition_digest
-        || environment.lifecycle_generation != operation.generation
-        || environment.active_operation_id.as_ref() != Some(&operation.operation_id)
+        || !operation.fences_environment(environment)
         || operation.status != vz_runtime_contract::EnvironmentLifecycleStatus::Running
         || step.status != vz_runtime_contract::LifecycleStepStatus::Succeeded
         || !environment
@@ -2030,6 +2030,7 @@ mod tests {
     fn operation(owner: &ResourceOwner) -> EnvironmentLifecycleOperation {
         EnvironmentLifecycleOperation {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
+            machine_scope: None,
             operation_id: LifecycleOperationId::generate(),
             project_id: owner.project_id.clone(),
             environment_id: owner.environment_id.clone(),

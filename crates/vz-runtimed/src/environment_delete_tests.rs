@@ -64,25 +64,39 @@ struct Fixture {
     daemon: Arc<RuntimeDaemon>,
     initial: ProjectState,
     stores: BTreeMap<MachineId, PathBuf>,
+    /// The fork of `app` in `first`, when this fixture was built with one.
+    fork: Option<MachineId>,
 }
 
 impl Fixture {
     fn new(policy: Arc<dyn RuntimePolicyHook>) -> Self {
-        Self::build(policy, false, false)
+        Self::build(policy, false, false, false)
     }
 
     fn with_extra_ownership(policy: Arc<dyn RuntimePolicyHook>, extra: bool) -> Self {
-        Self::build(policy, extra, false)
+        Self::build(policy, extra, false, false)
+    }
+
+    /// `first` additionally holds `app@feat-x`: a fork of its declared `app`,
+    /// minted the way `vz up --fork-from` mints one and then stopped with its
+    /// siblings, so it carries the same ownership a booted fork carries.
+    fn forked(policy: Arc<dyn RuntimePolicyHook>, extra: bool) -> Self {
+        Self::build(policy, extra, false, true)
     }
 
     /// A fixture whose definition declares one network, one endpoint and one
     /// attachment per Machine, so `instantiate_environment` emits the three
     /// fabric ownership kinds Delete must expect and reclaim.
     fn networked(policy: Arc<dyn RuntimePolicyHook>) -> Self {
-        Self::build(policy, false, true)
+        Self::build(policy, false, true, false)
     }
 
-    fn build(policy: Arc<dyn RuntimePolicyHook>, extra: bool, networked: bool) -> Self {
+    fn build(
+        policy: Arc<dyn RuntimePolicyHook>,
+        extra: bool,
+        networked: bool,
+        forked: bool,
+    ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("vz-del-")
             .tempdir_in("/private/tmp")
@@ -201,6 +215,43 @@ impl Fixture {
         }
         let store = vz_stack::StateStore::open(&config.state_store_path).unwrap();
         store.save_project_state(&project).unwrap();
+        // Minted before the fixture's Stop, so the fork is stopped with its
+        // siblings and the Environment holds one positive Stop journal covering
+        // all three Machines -- which is the absence authority a host-only test
+        // has in place of a live VM.
+        let fork = forked.then(|| {
+            let environment = project
+                .environments
+                .iter()
+                .find(|environment| environment.name == "first")
+                .unwrap();
+            let parent = environment
+                .machines
+                .iter()
+                .find(|machine| machine.name == "app")
+                .unwrap()
+                .machine_id
+                .clone();
+            let plan = store
+                .fork_machine_in_environment(environment.environment_id.as_str(), &parent, "feat-x", 1)
+                .unwrap();
+            let owner = ResourceOwner {
+                project_id: environment.project_id.clone(),
+                environment_id: environment.environment_id.clone(),
+                machine_id: Some(plan.machine_id().clone()),
+            };
+            // The two reservations `EnvironmentRuntimeController` takes for every
+            // Machine it is about to boot, fork included.
+            for record in [
+                MachineRuntimeRegistry::<vz_oci_macos::MacosRuntimeBackend>::reservation(&owner)
+                    .unwrap(),
+                MachineRuntimeEntry::<crate::machine_backend::MachineBackendRuntime>::vm_reservation(&owner)
+                    .unwrap(),
+            ] {
+                store.reserve_owned_resource(&record, 1).unwrap();
+            }
+            plan.machine_id().clone()
+        });
         // These fixture-issued acknowledgements establish controller authority
         // for deliberately runtime-free stores, not that a VM was tested.
         for environment in &project.environments {
@@ -264,6 +315,19 @@ impl Fixture {
             daemon,
             initial,
             stores,
+            fork,
+        }
+    }
+
+    /// The exact input `vz delete --machine <selector>` produces.
+    fn fork_input(&self, selector: &str) -> DeleteEnvironmentInput {
+        DeleteEnvironmentInput {
+            machine: Some(selector.to_string()),
+            metadata: RequestMetadata::new(
+                Some(format!("req-delete-{selector}")),
+                Some(format!("idem-delete-{selector}")),
+            ),
+            ..self.input()
         }
     }
 
@@ -1144,4 +1208,252 @@ async fn all_acknowledgements_remain_running_and_replay_finishes_genuine_tombsto
         .unwrap()
         .validate_for_operation(&result.operation)
         .unwrap();
+}
+
+// `vz delete --machine <machine>@<label>`, at the daemon's own boundary.
+//
+// Host controller/filesystem tests, not physical VM quiescence evidence: the
+// fixture's Machines are stopped with a positive Stop journal rather than
+// running, which is the absence authority a host-only test has in place of a
+// live VM. What is real here is everything the reclamation must be exact
+// about — the persisted Machine-scoped operation, the ownership set it
+// releases, the runtime store it removes from disk, and the Environment and
+// siblings it must leave completely alone.
+
+/// The three answers criterion 23 asks `--machine` to distinguish.
+///
+/// They must differ from each other, because that is what proves the selector
+/// was *resolved* rather than refused wholesale: a declared Machine is not a
+/// fork, an unknown label is not a Machine at all, and a fork is reclaimed.
+#[tokio::test]
+async fn the_three_machine_delete_answers_differ_and_only_the_fork_is_reclaimed() {
+    if isolated("the_three_machine_delete_answers_differ_and_only_the_fork_is_reclaimed") {
+        return;
+    }
+    let fixture = Fixture::forked(Arc::new(DeleteOnlyPolicy::default()), false);
+    let fork = fixture.fork.clone().unwrap();
+    let before = fixture.snapshot();
+
+    // A Machine the definition declares: removing it would leave the
+    // Environment unable to instantiate its own `vz.json`.
+    let declared = fixture
+        .daemon
+        .delete_environment(fixture.fork_input("app"))
+        .await
+        .unwrap_err();
+    assert_eq!(declared.code, MachineErrorCode::UnsupportedOperation);
+    assert!(declared.message.contains("app"), "{}", declared.message);
+
+    // A label no Machine answers to.
+    let unknown = fixture
+        .daemon
+        .delete_environment(fixture.fork_input("app@no-such-label"))
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.code, MachineErrorCode::NotFound);
+    assert!(
+        unknown.message.contains("app@no-such-label"),
+        "{}",
+        unknown.message
+    );
+
+    // Neither answer touched anything.
+    assert_eq!(fixture.snapshot(), before);
+    assert!(fixture.stores[&fork].exists());
+
+    // And the fork itself is reclaimed.
+    let outcome = terminal(
+        fixture
+            .daemon
+            .delete_environment(fixture.fork_input("app@feat-x"))
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.terminal && outcome.error.is_none());
+    assert_eq!(
+        outcome.operation.status,
+        EnvironmentLifecycleStatus::Succeeded
+    );
+    assert_eq!(outcome.operation.machine_scope.as_ref(), Some(&fork));
+    // No tombstone: a tombstone retires an Environment identity, and this
+    // Environment is still running.
+    assert!(outcome.tombstone.is_none());
+    assert_eq!(outcome.operation.machine_steps.len(), 1);
+    assert!(
+        outcome
+            .operation
+            .machine_steps
+            .iter()
+            .all(|step| step.status == LifecycleStepStatus::Succeeded)
+    );
+    assert!(
+        outcome
+            .operation
+            .cleanup_steps
+            .iter()
+            .all(|step| step.status == LifecycleStepStatus::Succeeded
+                && step.ownership.machine_id.as_ref() == Some(&fork))
+    );
+
+    // The fork's runtime store -- which is where its Docker data disk lives --
+    // is gone from the host, and every sibling's is byte-identical.
+    assert!(!fixture.stores[&fork].exists());
+    let after = fixture.snapshot();
+    let first = after
+        .environments
+        .iter()
+        .find(|environment| environment.name == "first")
+        .unwrap();
+    let mut names: Vec<_> = first
+        .machines
+        .iter()
+        .map(|machine| machine.name.clone())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["app".to_string(), "worker".to_string()]);
+    assert_eq!(
+        after.environments.len(),
+        2,
+        "the sibling Environment stands"
+    );
+    assert!(
+        !first
+            .ownership
+            .iter()
+            .any(|record| record.machine_id.as_ref() == Some(&fork)),
+        "the reclaimed fork left an ownership row behind"
+    );
+    for machine in &first.machines {
+        assert_eq!(
+            fs::read(fixture.stores[&machine.machine_id].join("fixture-persistence")).unwrap(),
+            machine.machine_id.as_str().as_bytes(),
+            "a sibling's store was disturbed"
+        );
+    }
+    // The Environment kept running throughout: it never entered `Deleting`, it
+    // holds no active operation, and it was never tombstoned.
+    assert_ne!(first.state, EnvironmentState::Deleting);
+    assert_eq!(first.active_operation_id, None);
+    assert_eq!(first.lifecycle_generation, outcome.operation.generation);
+    assert!(
+        fixture
+            .daemon
+            .with_state_store(
+                |store| store.load_environment_tombstone(first.environment_id.as_str())
+            )
+            .unwrap()
+            .is_none()
+    );
+
+    // Replay of the same immutable request answers from the durable journal
+    // rather than reclaiming a second time.
+    let replay = terminal(
+        fixture
+            .daemon
+            .delete_environment(fixture.fork_input("app@feat-x"))
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.operation, outcome.operation);
+    assert_eq!(fixture.snapshot(), after);
+}
+
+/// A resource the Environment cannot reclaim blocks the Environment, not the
+/// fork: the scoped plan covers one Machine's ownership and nothing else.
+#[tokio::test]
+async fn an_unreclaimable_sibling_resource_refuses_the_environment_and_not_the_fork() {
+    if isolated("an_unreclaimable_sibling_resource_refuses_the_environment_and_not_the_fork") {
+        return;
+    }
+    let fixture = Fixture::forked(Arc::new(DeleteOnlyPolicy::default()), true);
+    let fork = fixture.fork.clone().unwrap();
+
+    // The whole Environment holds an owned resource with no cleanup adapter, so
+    // deleting it is refused before any effect.
+    let refused = fixture
+        .daemon
+        .delete_environment(fixture.input())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, MachineErrorCode::UnsupportedOperation);
+
+    // The fork owns none of it, so reclaiming the fork is exact and admitted.
+    let outcome = terminal(
+        fixture
+            .daemon
+            .delete_environment(fixture.fork_input("app@feat-x"))
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.terminal && outcome.error.is_none());
+    assert_eq!(
+        outcome.operation.status,
+        EnvironmentLifecycleStatus::Succeeded
+    );
+    assert!(!fixture.stores[&fork].exists());
+    let after = fixture.snapshot();
+    let first = after
+        .environments
+        .iter()
+        .find(|environment| environment.name == "first")
+        .unwrap();
+    assert_eq!(first.machines.len(), 2);
+    // And the Environment is still refused for the same reason as before: a
+    // scoped reclamation neither fixed nor hid the resource it cannot reclaim.
+    let still_refused = fixture
+        .daemon
+        .delete_environment(DeleteEnvironmentInput {
+            metadata: RequestMetadata::new(
+                Some("req-delete-again".into()),
+                Some("idem-delete-again".into()),
+            ),
+            ..fixture.input()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(still_refused.code, MachineErrorCode::UnsupportedOperation);
+}
+
+/// An Environment-wide Delete still reclaims a fork, because a fork is an owned
+/// Machine of that Environment like any other.
+#[tokio::test]
+async fn deleting_the_environment_reclaims_its_forks_with_everything_else() {
+    if isolated("deleting_the_environment_reclaims_its_forks_with_everything_else") {
+        return;
+    }
+    let fixture = Fixture::forked(Arc::new(DeleteOnlyPolicy::default()), false);
+    let fork = fixture.fork.clone().unwrap();
+    let machines: Vec<_> = fixture
+        .first()
+        .machines
+        .iter()
+        .map(|machine| machine.machine_id.clone())
+        .collect();
+    assert!(machines.contains(&fork), "the fixture built its fork");
+
+    let outcome = terminal(
+        fixture
+            .daemon
+            .delete_environment(fixture.input())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.terminal && outcome.error.is_none());
+    assert_eq!(
+        outcome.operation.status,
+        EnvironmentLifecycleStatus::Succeeded
+    );
+    assert_eq!(outcome.operation.machine_scope, None);
+    assert!(outcome.tombstone.is_some());
+    for machine in &machines {
+        assert!(!fixture.stores[machine].exists());
+    }
 }

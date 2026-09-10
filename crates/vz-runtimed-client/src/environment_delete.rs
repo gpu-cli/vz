@@ -40,6 +40,11 @@ struct DeleteValidator {
     expected_environment: Option<EnvironmentId>,
     selection: EnvironmentSelectionContext,
     machine_timeout_millis: u64,
+    /// The `<machine>@<label>` this request named, if any. Its presence is what
+    /// the daemon's answer must agree with: an Environment-wide Delete must
+    /// never come back scoped, and a fork Delete must never come back as one
+    /// that would remove the Environment.
+    machine: Option<String>,
     scope: Option<EnvironmentLifecycleOperation>,
     last_sequence: Option<u64>,
     terminal: bool,
@@ -87,6 +92,7 @@ impl DeleteValidator {
             || operation.request_hash != expected_hash
             || operation.machine_steps.len() > 128
             || operation.cleanup_steps.len() > 4096
+            || operation.machine_scope.is_some() != self.machine.is_some()
             || self
                 .expected_environment
                 .as_ref()
@@ -116,8 +122,12 @@ impl DeleteValidator {
         // Delete failure retains the aggregate/journal for reconciliation;
         // contract-valid failed Delete plans are Blocked, never Failed.
         let failed = operation.status == EnvironmentLifecycleStatus::Blocked;
+        // A tombstone retires an Environment identity, so only an
+        // Environment-wide Delete produces one. A Machine-scoped Delete leaves
+        // the Environment running and must carry none at all.
+        let expects_tombstone = succeeded && operation.machine_scope.is_none();
         if wire.terminal != (succeeded || failed)
-            || tombstone.is_some() != succeeded
+            || tombstone.is_some() != expects_tombstone
             || error.is_some() != failed
             || error
                 .as_ref()
@@ -222,6 +232,7 @@ impl DaemonClient {
             expected_environment,
             selection,
             machine_timeout_millis: request.machine_timeout_millis,
+            machine: request.machine.clone(),
             scope: None,
             last_sequence: None,
             terminal: false,

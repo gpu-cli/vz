@@ -120,6 +120,7 @@ fn successful_delete() -> (
 
 fn validator(operation: &EnvironmentLifecycleOperation) -> DeleteValidator {
     DeleteValidator {
+        machine: None,
         project_id: operation.project_id.clone(),
         request_id: operation.request_id.clone(),
         idempotency_key: operation.idempotency_key.clone(),
@@ -521,4 +522,116 @@ fn blocked_terminal_requires_exact_error_correlation_and_no_tombstone() {
         }
         assert_rejected(&mut validator(&initial), wire);
     }
+}
+
+// ── the Machine-scoped Delete stream ─────────────────────────────────────────
+//
+// A fork reclamation is a Delete whose receipt is not a tombstone: the
+// Environment it belonged to is still running. The validator must accept that
+// shape only when this client actually asked for it, and must never accept an
+// Environment-wide Delete in its place, or the reverse.
+
+fn scoped_delete_stream() -> (EnvironmentLifecycleOperation, EnvironmentLifecycleOperation) {
+    let definition: ProjectDefinition = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "project_id": ProjectId::generate(),
+        "name": "fork-delete-validator",
+        "environment": {
+            "schema_version": 1,
+            "machines": [{
+                "schema_version": 1, "name": "alpha", "profile": "developer",
+                "target": {"os": "linux", "arch": "aarch64", "image": "vz-linux-appliance"},
+                "resources": {"cpus": 2, "memory_mb": 4096}
+            }]
+        }
+    }))
+    .unwrap();
+    let mut environment = definition.instantiate_environment("test", 100).unwrap();
+    let parent = environment.machines[0].machine_id.clone();
+    let plan = environment.plan_machine_fork(&parent, "feat-x").unwrap();
+    let forked = plan.machine_id().clone();
+    plan.apply(&mut environment);
+    let mut operation = EnvironmentLifecycleOperation::plan_machine_delete(
+        &environment,
+        &forked,
+        LifecycleOperationId::generate(),
+        "delete-request",
+        "delete-idempotency",
+        environment_delete_request_hash(
+            &environment.project_id,
+            &environment.environment_id,
+            &selection(),
+            u128::from(MACHINE_TIMEOUT_MILLIS),
+        )
+        .unwrap(),
+        101,
+    )
+    .unwrap();
+    operation
+        .begin_machine_scope(&mut environment, 102)
+        .unwrap();
+    let running = operation.clone();
+    acknowledge_machines(&mut environment, &mut operation);
+    acknowledge_cleanup(&environment, &mut operation, false);
+    operation.finish_machine_delete(&environment, 105).unwrap();
+    (running, operation)
+}
+
+#[test]
+fn a_machine_scoped_delete_succeeds_without_a_tombstone_only_when_it_was_requested() {
+    let (running, succeeded) = scoped_delete_stream();
+    let selector = "alpha@feat-x".to_string();
+    let terminal = {
+        let mut wire = frame(&succeeded, 2);
+        wire.terminal = true;
+        wire
+    };
+
+    let mut accepting = validator(&running);
+    accepting.machine = Some(selector.clone());
+    accepting.event(frame(&running, 1)).unwrap();
+    let event = accepting.event(terminal.clone()).unwrap();
+    assert!(event.terminal && event.tombstone.is_none());
+    assert!(event.operation.machine_scope.is_some());
+
+    // This client asked to delete the Environment. A scoped operation is not the
+    // answer to that request, whatever its steps say.
+    let mut environment_wide = validator(&running);
+    assert_rejected(&mut environment_wide, frame(&running, 1));
+
+    // And a scoped success may not carry a tombstone: nothing was tombstoned.
+    let (_, tombstoned) = successful_delete_tombstone_for(&succeeded);
+    let mut with_tombstone = validator(&running);
+    with_tombstone.machine = Some(selector);
+    with_tombstone.event(frame(&running, 1)).unwrap();
+    assert_rejected(&mut with_tombstone, tombstoned);
+}
+
+/// A scoped terminal frame that wrongly carries an Environment tombstone.
+fn successful_delete_tombstone_for(
+    operation: &EnvironmentLifecycleOperation,
+) -> (
+    EnvironmentLifecycleOperation,
+    runtime_v2::DeleteEnvironmentEvent,
+) {
+    let (_, environment_wide, tombstone) = successful_delete();
+    let mut wire = frame(operation, 2);
+    wire.terminal = true;
+    wire.tombstone = Some(vz_runtime_translate::environment_tombstone_to_proto(
+        &tombstone,
+    ));
+    (environment_wide, wire)
+}
+
+#[test]
+fn an_environment_wide_delete_is_never_accepted_for_a_fork_request() {
+    let (_, environment_wide, tombstone) = successful_delete();
+    let mut validator = validator(&environment_wide);
+    validator.machine = Some("alpha@feat-x".to_string());
+    // Correct in every other way, and still refused: the daemon answered a
+    // request this client did not make.
+    assert_rejected(
+        &mut validator,
+        success_frame(&environment_wide, &tombstone, 1),
+    );
 }

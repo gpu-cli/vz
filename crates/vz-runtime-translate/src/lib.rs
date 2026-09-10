@@ -1343,6 +1343,10 @@ pub fn environment_lifecycle_operation_to_proto(
             .iter()
             .map(ownership_cleanup_step_to_proto)
             .collect(),
+        machine_scope: operation
+            .machine_scope
+            .as_ref()
+            .map(std::string::ToString::to_string),
         created_at: operation.created_at,
         updated_at: operation.updated_at,
         completed_at: operation.completed_at,
@@ -1383,6 +1387,11 @@ pub fn environment_lifecycle_operation_from_proto(
             .iter()
             .map(ownership_cleanup_step_from_proto)
             .collect::<Result<_, _>>()?,
+        machine_scope: operation
+            .machine_scope
+            .clone()
+            .map(MachineId::new)
+            .transpose()?,
         created_at: operation.created_at,
         updated_at: operation.updated_at,
         completed_at: operation.completed_at,

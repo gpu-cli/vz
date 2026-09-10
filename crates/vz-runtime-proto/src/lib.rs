@@ -1168,6 +1168,7 @@ mod tests {
                     ("created_at", 16),
                     ("updated_at", 17),
                     ("completed_at", 18),
+                    ("machine_scope", 19),
                 ],
             ),
             (
@@ -1946,6 +1947,7 @@ mod tests {
         };
         let operation = EnvironmentLifecycleOperation {
             schema_version: 1,
+            machine_scope: None,
             operation_id: "lop_up_8".into(),
             project_id: "prj_demo".into(),
             environment_id: "env_agent_a".into(),
@@ -2165,6 +2167,7 @@ mod tests {
             let terminal = succeeded || failure.is_some();
             let operation = EnvironmentLifecycleOperation {
                 schema_version: 1,
+                machine_scope: None,
                 operation_id: "lop_delete".into(),
                 project_id: "prj_selected".into(),
                 environment_id: "env_selected".into(),
@@ -2427,6 +2430,7 @@ mod tests {
                 terminal,
                 operation: Some(EnvironmentLifecycleOperation {
                     schema_version: 1,
+                    machine_scope: None,
                     operation_id: "lop_stop".into(),
                     project_id: "prj_selected".into(),
                     environment_id: "env_selected".into(),

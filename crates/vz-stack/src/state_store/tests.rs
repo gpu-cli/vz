@@ -12894,7 +12894,7 @@ fn stale_unbound_runtime_ownership_binds_cleanup_only_and_replays_exactly() {
         .unwrap();
     assert!(
         store
-            .require_no_nonterminal_stack_container_creates("env_journal")
+            .require_no_nonterminal_stack_container_creates("env_journal", None)
             .is_ok()
     );
 }
@@ -13205,7 +13205,7 @@ fn stack_activation_rejects_non_runnable_current_generation_but_cleanup_remains_
             .unwrap();
         assert!(
             store
-                .require_no_nonterminal_stack_container_creates("env_journal")
+                .require_no_nonterminal_stack_container_creates("env_journal", None)
                 .is_ok()
         );
     }
@@ -13273,7 +13273,7 @@ fn stale_recovery_discovery_survives_reopen_for_cleanup_and_abandonment() {
         }
         assert!(
             reopened
-                .require_no_nonterminal_stack_container_creates("env_journal")
+                .require_no_nonterminal_stack_container_creates("env_journal", None)
                 .is_ok()
         );
         assert!(
@@ -13322,7 +13322,7 @@ fn blocked_recovery_is_executable_after_reopen_and_clears_deletion_fence() {
         let reopened = StateStore::open(&path).unwrap();
         assert!(
             reopened
-                .require_no_nonterminal_stack_container_creates("env_journal")
+                .require_no_nonterminal_stack_container_creates("env_journal", None)
                 .is_err()
         );
         let recovery = reopened.list_stack_container_recovery_records().unwrap();
@@ -13367,7 +13367,7 @@ fn blocked_recovery_is_executable_after_reopen_and_clears_deletion_fence() {
         }
         assert!(
             reopened
-                .require_no_nonterminal_stack_container_creates("env_journal")
+                .require_no_nonterminal_stack_container_creates("env_journal", None)
                 .is_ok()
         );
         assert!(
@@ -13514,7 +13514,7 @@ fn machine_workload_recovery_discovers_old_incarnations_without_sibling_leakage(
         .unwrap();
     assert!(
         reopened
-            .require_no_nonterminal_stack_container_creates("env_journal")
+            .require_no_nonterminal_stack_container_creates("env_journal", None)
             .is_ok()
     );
 
@@ -13813,7 +13813,7 @@ fn stack_cleanup_transitions_are_atomic_replayable_and_clear_the_fence() {
         .unwrap();
     assert!(
         store
-            .require_no_nonterminal_stack_container_creates("env_journal")
+            .require_no_nonterminal_stack_container_creates("env_journal", None)
             .is_err()
     );
 
@@ -13881,7 +13881,7 @@ fn stack_cleanup_transitions_are_atomic_replayable_and_clear_the_fence() {
     assert_eq!(cleaned.updated_at, 104);
     assert!(
         store
-            .require_no_nonterminal_stack_container_creates("env_journal")
+            .require_no_nonterminal_stack_container_creates("env_journal", None)
             .is_ok()
     );
 
@@ -13978,7 +13978,7 @@ fn malformed_stack_journal_projection_cannot_bypass_environment_delete_fence() {
         .unwrap();
 
     let error = store
-        .require_no_nonterminal_stack_container_creates("env_journal")
+        .require_no_nonterminal_stack_container_creates("env_journal", None)
         .unwrap_err()
         .to_string();
     assert!(error.contains("mismatched `environment_id` projection"));

@@ -3661,9 +3661,15 @@ impl StateStore {
         })
     }
 
+    ///
+    /// `machine_id` narrows the fence to one Machine, which is what a
+    /// Machine-scoped Delete needs: an in-flight create on a sibling Machine is
+    /// none of its business, and one on the Machine being reclaimed is exactly
+    /// the unaccounted work it must refuse.
     pub(super) fn require_no_nonterminal_stack_container_creates(
         &self,
         environment_id: &str,
+        machine_id: Option<&vz_runtime_contract::MachineId>,
     ) -> Result<(), StackError> {
         let mut statement = self.conn.prepare(
             "SELECT reservation_id FROM stack_container_create_intents
@@ -3681,6 +3687,7 @@ impl StateStore {
                     ))
                 })?;
             if intent.scope.environment_id.as_str() == environment_id
+                && machine_id.is_none_or(|machine_id| &intent.scope.machine_id == machine_id)
                 && !intent.status.is_terminal()
             {
                 return conflict(format!(

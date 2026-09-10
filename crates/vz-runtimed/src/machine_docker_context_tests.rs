@@ -50,6 +50,7 @@ fn delete_fixture() -> Result<(
 fn delete_operation(store: &MachineRuntimeStoreLease) -> EnvironmentLifecycleOperation {
     EnvironmentLifecycleOperation {
         schema_version: 1,
+        machine_scope: None,
         operation_id: LifecycleOperationId::generate(),
         project_id: store.owner().project_id.clone(),
         environment_id: store.owner().environment_id.clone(),

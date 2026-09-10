@@ -27,6 +27,10 @@ use crate::StackError;
 #[path = "machine_fork_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "machine_fork_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
 fn conflict(message: impl Into<String>) -> StackError {
     StackError::Machine {
         code: MachineErrorCode::StateConflict,
@@ -167,6 +171,30 @@ impl StateStore {
         now: u64,
     ) -> Result<EnvironmentInstance, StackError> {
         self.with_immediate_transaction(|store| {
+            store.delete_exact_machine_fork_rows(
+                environment_id,
+                machine_id,
+                expected_ownership,
+                now,
+            )
+        })
+    }
+
+    /// The exact reclaim itself, inside a transaction the caller already owns.
+    ///
+    /// A Machine-scoped Delete finishes its lifecycle journal and removes these
+    /// rows in one transaction, so the journal can never claim a reclamation
+    /// that the rows did not commit, and the rows can never disappear without a
+    /// terminal journal that accounts for them.
+    pub(super) fn delete_exact_machine_fork_rows(
+        &self,
+        environment_id: &str,
+        machine_id: &MachineId,
+        expected_ownership: &[OwnershipRecord],
+        now: u64,
+    ) -> Result<EnvironmentInstance, StackError> {
+        {
+            let store = self;
             let before = store
                 .load_environment_instance(environment_id)?
                 .ok_or_else(|| conflict(format!("Environment `{environment_id}` not found")))?;
@@ -271,7 +299,9 @@ impl StateStore {
             }
 
             let mut after = before.clone();
-            after.machines.retain(|entry| entry.machine_id != *machine_id);
+            after
+                .machines
+                .retain(|entry| entry.machine_id != *machine_id);
             after
                 .network_attachments
                 .retain(|entry| entry.machine_id != *machine_id);
@@ -285,7 +315,7 @@ impl StateStore {
                 .map_err(|error| conflict(error.to_string()))?;
             store.replace_environment_snapshot(&before, &after)?;
             Ok(after)
-        })
+        }
     }
 
     /// Rewrite one Environment's durable snapshot, refusing a concurrent change.

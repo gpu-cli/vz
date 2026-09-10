@@ -362,6 +362,7 @@ mod tests {
         use vz_runtime_contract::*;
         EnvironmentLifecycleOperation {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
+            machine_scope: None,
             operation_id: LifecycleOperationId::generate(),
             project_id: ProjectId::generate(),
             environment_id: EnvironmentId::generate(),

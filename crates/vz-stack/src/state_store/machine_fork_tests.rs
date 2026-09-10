@@ -8,7 +8,7 @@ use vz_runtime_contract::{
 /// One Linux Machine on one private network, reachable, admitted through the
 /// ordinary Up reservation so the rows under test were written the way
 /// production writes them.
-fn fixture() -> (tempfile::TempDir, StateStore, EnvironmentInstance) {
+pub(super) fn fixture() -> (tempfile::TempDir, StateStore, EnvironmentInstance) {
     let root = tempfile::tempdir().unwrap();
     let store = StateStore::open(&root.path().join("state.db")).unwrap();
     let definition: ProjectDefinition = serde_json::from_value(serde_json::json!({

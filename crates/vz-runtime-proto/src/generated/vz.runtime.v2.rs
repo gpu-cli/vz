@@ -642,6 +642,12 @@ pub struct EnvironmentLifecycleOperation {
     pub updated_at: u64,
     #[prost(uint64, optional, tag = "18")]
     pub completed_at: ::core::option::Option<u64>,
+    /// Set when this operation reclaims exactly one forked Machine rather than the
+    /// whole Environment: one Machine step, that Machine's ownership only, and an
+    /// Environment that keeps its state and its other Machines throughout. A pure
+    /// append; absent means the Environment-wide shape.
+    #[prost(string, optional, tag = "19")]
+    pub machine_scope: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EnvironmentTombstone {

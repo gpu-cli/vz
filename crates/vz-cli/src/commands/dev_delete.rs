@@ -123,6 +123,7 @@ pub async fn cmd_dev_delete(
     // Parsed before the daemon is contacted: `--machine backend` names a
     // declared Machine, which this verb never removes on its own, and saying so
     // locally is faster and clearer than a round trip.
+    let reclaiming_fork = args.machine.is_some();
     let machine = args
         .machine
         .map(|selector| {
@@ -209,10 +210,16 @@ pub async fn cmd_dev_delete(
                 "terminal": event.terminal, "error": event.error, "tombstone": event.tombstone})
             );
         } else if !event.terminal {
-            println!(
-                "Deleting Environment {} (operation {})",
-                event.operation.environment_id, event.operation.operation_id
-            );
+            match &event.operation.machine_scope {
+                Some(machine_id) => println!(
+                    "Reclaiming Machine {machine_id} in Environment {} (operation {})",
+                    event.operation.environment_id, event.operation.operation_id
+                ),
+                None => println!(
+                    "Deleting Environment {} (operation {})",
+                    event.operation.environment_id, event.operation.operation_id
+                ),
+            }
         }
         if event.terminal {
             terminal = Some(event);
@@ -229,6 +236,26 @@ pub async fn cmd_dev_delete(
         // envelope on stderr whether the failure was decided before the stream
         // or inside its terminal receipt.
         return Err(original_error(error));
+    }
+    // A reclaimed fork has no tombstone to show: the Environment it belonged to
+    // is still running. Its receipt is the terminal Machine-scoped journal,
+    // which the daemon writes in the same transaction that removes its rows.
+    if reclaiming_fork {
+        let machine_id = terminal.operation.machine_scope.as_ref().ok_or_else(|| {
+            local_error(
+                "invalid_daemon_response",
+                "fork reclamation returned an Environment-wide operation".into(),
+            )
+        })?;
+        if !json_output {
+            println!(
+                "Delete operation {} reclaimed Machine {machine_id} from Environment {} (generation {}); owned state deleted.",
+                terminal.operation.operation_id,
+                terminal.operation.environment_id,
+                terminal.operation.generation
+            );
+        }
+        return Ok(());
     }
     let tombstone = terminal.tombstone.ok_or_else(|| {
         local_error(

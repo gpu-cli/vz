@@ -7,7 +7,7 @@ use vz_runtime_contract::types::{
     EnvironmentLifecycleOperation, EnvironmentLifecycleStatus, EnvironmentSelection,
     EnvironmentSelectionContext, EnvironmentState, EnvironmentTombstone, EnvironmentUpDecision,
     HostExportInstance, HostImportInstance, LegacyMigrationError, LifecycleOperationId,
-    LifecycleStepResult, LifecycleStepStatus, MachineInstance, MachineLifecycleStep,
+    LifecycleStepResult, LifecycleStepStatus, MachineId, MachineInstance, MachineLifecycleStep,
     MachineLifecycleStepAcknowledgement, MachineState, NetworkAttachmentInstance, NetworkInstance,
     OwnedResourceKind, OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition,
     ProjectState, TOPOLOGY_SCHEMA_VERSION, TopologyLifecycleError, TopologyResolutionError,
@@ -2748,24 +2748,46 @@ impl StateStore {
         let environment = self
             .load_environment_instance(expected_operation.environment_id.as_str())?
             .ok_or_else(|| environment_not_found(expected_operation.environment_id.as_str()))?;
-        let active_operation_id = environment.active_operation_id.as_ref().ok_or_else(|| {
-            TopologyLifecycleError::OperationMismatch {
-                environment_id: environment.environment_id.to_string(),
-                expected: "active operation".to_string(),
-                found: expected_operation.operation_id.to_string(),
+        // A Machine-scoped operation never takes `active_operation_id`: the
+        // Environment stays in a stable state, and a stable state may retain no
+        // active operation. Its fence is the generation it advanced, plus the
+        // absence of any Environment-wide operation that would have taken the
+        // next one. `fences_environment` is the single statement of that rule.
+        let current_operation_id = match &expected_operation.machine_scope {
+            Some(_) => {
+                if !expected_operation.fences_environment(&environment) {
+                    return Err(TopologyLifecycleError::OperationMismatch {
+                        environment_id: environment.environment_id.to_string(),
+                        expected: "no active operation at this generation".to_string(),
+                        found: expected_operation.operation_id.to_string(),
+                    }
+                    .into());
+                }
+                expected_operation.operation_id.clone()
             }
-        })?;
-        if active_operation_id != &expected_operation.operation_id {
-            return Err(TopologyLifecycleError::OperationMismatch {
-                environment_id: environment.environment_id.to_string(),
-                expected: active_operation_id.to_string(),
-                found: expected_operation.operation_id.to_string(),
+            None => {
+                let active_operation_id =
+                    environment.active_operation_id.clone().ok_or_else(|| {
+                        TopologyLifecycleError::OperationMismatch {
+                            environment_id: environment.environment_id.to_string(),
+                            expected: "active operation".to_string(),
+                            found: expected_operation.operation_id.to_string(),
+                        }
+                    })?;
+                if active_operation_id != expected_operation.operation_id {
+                    return Err(TopologyLifecycleError::OperationMismatch {
+                        environment_id: environment.environment_id.to_string(),
+                        expected: active_operation_id.to_string(),
+                        found: expected_operation.operation_id.to_string(),
+                    }
+                    .into());
+                }
+                active_operation_id
             }
-            .into());
-        }
+        };
         let current_operation = self
-            .load_environment_lifecycle(active_operation_id.as_str())?
-            .ok_or_else(|| operation_not_found(active_operation_id.as_str()))?;
+            .load_environment_lifecycle(current_operation_id.as_str())?
+            .ok_or_else(|| operation_not_found(current_operation_id.as_str()))?;
         current_operation.validate_against_environment(&environment)?;
         if current_operation.status != EnvironmentLifecycleStatus::Running {
             return Err(TopologyLifecycleError::InvalidOperation {
@@ -3013,6 +3035,7 @@ impl StateStore {
                 .load_environment_instance(environment_id)?
                 .ok_or_else(|| environment_not_found(environment_id))?;
             let before = environment.clone();
+            store.require_no_inflight_machine_scope(&environment)?;
 
             if let Some(active_operation_id) = environment.active_operation_id.clone() {
                 let mut active = store
@@ -3084,6 +3107,182 @@ impl StateStore {
             store.update_environment_parent_cas(&before, &environment)?;
             store.update_environment_lifecycle_cas(&planned_operation, &operation)?;
             Ok(operation)
+        })
+    }
+
+    /// Begin a Machine-scoped Delete: one fork's teardown, persisted and fenced.
+    ///
+    /// The Environment-wide counterpart moves the Environment to `Deleting` and
+    /// takes its `active_operation_id`. This one does neither, because the
+    /// Environment is not being deleted: its declared Machines and its sibling
+    /// forks keep serving from here to the terminal journal. What it does take
+    /// is the next lifecycle generation, which is what fences it — a later
+    /// Environment-wide operation takes the one after, and strands this one's
+    /// acknowledgements exactly as it would strand a stale Environment-wide
+    /// operation's.
+    ///
+    /// Replay is exact and includes the scope: an idempotency key that named a
+    /// different Machine, or no Machine at all, is a different immutable
+    /// request and is refused rather than answered with this one's journal.
+    pub fn begin_machine_lifecycle_delete(
+        &self,
+        environment_id: &str,
+        machine_id: &MachineId,
+        request_id: &str,
+        idempotency_key: &str,
+        request_hash: &str,
+        now: u64,
+    ) -> Result<EnvironmentLifecycleOperation, StackError> {
+        self.with_immediate_transaction(|store| {
+            if let Some(existing) =
+                store.load_environment_lifecycle_by_idempotency_key(idempotency_key)?
+            {
+                store.require_exact_lifecycle_replay(
+                    &existing,
+                    environment_id,
+                    EnvironmentLifecycleKind::Delete,
+                    request_id,
+                    request_hash,
+                )?;
+                if existing.machine_scope.as_ref() != Some(machine_id) {
+                    return Err(TopologyLifecycleError::InvalidOperation {
+                        reason: format!(
+                            "idempotency key `{idempotency_key}` was already used by a lifecycle request with a different Machine scope"
+                        ),
+                    }
+                    .into());
+                }
+                return Ok(existing);
+            }
+
+            let mut environment = store
+                .load_environment_instance(environment_id)?
+                .ok_or_else(|| environment_not_found(environment_id))?;
+            let before = environment.clone();
+            store.require_no_inflight_machine_scope(&environment)?;
+            let mut operation = EnvironmentLifecycleOperation::plan_machine_delete(
+                &environment,
+                machine_id,
+                LifecycleOperationId::generate(),
+                request_id,
+                idempotency_key,
+                request_hash,
+                now,
+            )?;
+            store.insert_environment_lifecycle(&operation)?;
+            let planned_operation = operation.clone();
+            operation.begin_machine_scope(&mut environment, now)?;
+            store.update_environment_parent_cas(&before, &environment)?;
+            store.update_environment_lifecycle_cas(&planned_operation, &operation)?;
+            Ok(operation)
+        })
+    }
+
+    /// Refuse to admit any new lifecycle operation over an unfinished scoped one.
+    ///
+    /// A Machine-scoped operation holds no `active_operation_id`, so the
+    /// Environment-wide admission guard cannot see it. It does hold the
+    /// Environment's current generation, and that is how it is found here. A
+    /// new operation of either shape would take the next generation and strand
+    /// it mid-teardown — with a fork stopped, its Docker context removed and
+    /// its rows still claiming it — which is the unaccounted state a partial
+    /// reclamation was refused for in the first place. Resume the scoped
+    /// operation with its own request and idempotency IDs instead.
+    fn require_no_inflight_machine_scope(
+        &self,
+        environment: &EnvironmentInstance,
+    ) -> Result<(), StackError> {
+        let Some(operation) = self.load_environment_lifecycle_at_generation(
+            &environment.environment_id,
+            environment.lifecycle_generation,
+        )?
+        else {
+            return Ok(());
+        };
+        if operation.machine_scope.is_some()
+            && matches!(
+                operation.status,
+                EnvironmentLifecycleStatus::Planned
+                    | EnvironmentLifecycleStatus::Running
+                    | EnvironmentLifecycleStatus::Blocked
+            )
+        {
+            return Err(TopologyLifecycleError::OperationConflict {
+                environment_id: environment.environment_id.to_string(),
+                active_operation_id: operation.operation_id.to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Finish a Machine-scoped Delete and remove exactly that Machine's rows.
+    ///
+    /// The terminal journal and the row removal commit in one transaction, so
+    /// the two halves the exact-ownership design exists to keep together cannot
+    /// come apart: no journal claims a reclamation whose rows survived, and no
+    /// rows disappear without a journal that accounted for every one of them.
+    ///
+    /// There is no tombstone. A tombstone retires an Environment identity, and
+    /// this Environment keeps running; the proof here is the operation's own
+    /// exact cleanup plan, compared against what the Machine actually owned.
+    pub fn finish_machine_delete(
+        &self,
+        operation_id: &str,
+        generation: u64,
+        now: u64,
+    ) -> Result<(EnvironmentLifecycleOperation, EnvironmentInstance), StackError> {
+        self.with_immediate_transaction(|store| {
+            let mut operation = store
+                .load_environment_lifecycle(operation_id)?
+                .ok_or_else(|| operation_not_found(operation_id))?;
+            store.require_operation_generation(&operation, generation)?;
+            let Some(machine_id) = operation.machine_scope.clone() else {
+                return Err(TopologyLifecycleError::InvalidOperation {
+                    reason: format!(
+                        "lifecycle operation `{operation_id}` is not scoped to a Machine"
+                    ),
+                }
+                .into());
+            };
+            let environment = store
+                .load_environment_instance(operation.environment_id.as_str())?
+                .ok_or_else(|| environment_not_found(operation.environment_id.as_str()))?;
+            // Replay after a lost response: the journal is already terminal and
+            // the Machine is already gone, so the reclamation is reported from
+            // the durable record rather than attempted a second time.
+            if operation.status == EnvironmentLifecycleStatus::Succeeded {
+                if environment
+                    .machines
+                    .iter()
+                    .any(|machine| machine.machine_id == machine_id)
+                {
+                    return Err(StackError::InvalidSpec(format!(
+                        "completed Machine-scoped Delete `{operation_id}` left Machine `{machine_id}` in Environment `{}`",
+                        operation.environment_id
+                    )));
+                }
+                return Ok((operation, environment));
+            }
+            store.require_no_nonterminal_stack_container_creates(
+                operation.environment_id.as_str(),
+                Some(&machine_id),
+            )?;
+            let expected_ownership = operation
+                .cleanup_steps
+                .iter()
+                .map(|step| step.ownership.clone())
+                .collect::<Vec<_>>();
+            let operation_before = operation.clone();
+            operation.finish_machine_delete(&environment, now)?;
+            store.update_environment_lifecycle_cas(&operation_before, &operation)?;
+            let remaining = store.delete_exact_machine_fork_rows(
+                operation.environment_id.as_str(),
+                &machine_id,
+                &expected_ownership,
+                now,
+            )?;
+            Ok((operation, remaining))
         })
     }
 
@@ -3303,6 +3502,7 @@ impl StateStore {
                 .ok_or_else(|| environment_not_found(operation.environment_id.as_str()))?;
             store.require_no_nonterminal_stack_container_creates(
                 operation.environment_id.as_str(),
+                None,
             )?;
             let operation_before = operation.clone();
             let tombstone = operation.finish_delete(&environment, now)?;
