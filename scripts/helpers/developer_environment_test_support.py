@@ -1216,6 +1216,26 @@ done
 case "$url" in https://*) ;; *) fail invalid_arguments 2 ;; esac
 rest=${url#https://}
 host=${rest%%/*}
+# A public Internet address, reached over TLS on 443 because that is what 443
+# serves. The matrix used to probe these with plaintext `wget http://host:443/`,
+# which opens the connection, sends HTTP to a TLS listener and exits non-zero --
+# recording `deny` for a host the Machine reached perfectly well. Every deny
+# cell passed anyway for the wrong reason, so the confusion only surfaced when
+# an `allowed` Machine could finally be built and its one `allow` cell failed.
+#
+# Answered from the Machine's declared egress, exactly as the plaintext path
+# is, and against the image's PUBLIC bundle with no --ca-file: 1.1.1.1 and
+# 8.8.8.8 present certificates for their own addresses, so no Environment
+# authority is involved.
+case "$host" in
+  1.1.1.1|8.8.8.8)
+    [ -z "$ca" ] || fail invalid_arguments 2
+    [ -f "$state/egress-$machine" ] || fail connect_failed 6
+    printf '{"schema_version":1,"kind":"vz-guest-fetch-response","url":"%s","host":"%s","port":443,"peer":"%s","peer_port":443,"status":200,"protocol":"TLSv1_3","body_bytes":0,"trust_bundle":"public","trust_anchors":1,"verified":true}\n' \
+      "$url" "$host" "$host"
+    exit 0
+    ;;
+esac
 # Resolution goes through the Environment's own resolver, which answers this
 # Environment's declared name and nothing else.
 { [ -n "$edge_name" ] && [ "$host" = "$edge_name" ] ; } || fail resolve_failed 5

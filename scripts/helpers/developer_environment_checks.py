@@ -6555,7 +6555,7 @@ def enumerate_denial_matrix(plan: dict) -> list:
         for address in MATRIX_INTERNET_ADDRESSES:
             for port in MATRIX_INTERNET_PORTS:
                 add("internet_offline", source, f"internet:{address}", "tcp", port, "deny",
-                    phase="open", probe="tcp", target=address,
+                    phase="open", probe=internet_probe(port), target=address,
                     requires=("src:" + matrix_source_parts(source)[0],))
         add("internet_offline", source, f"internet:{MATRIX_INTERNET_NAME}", "dns", 53, "deny",
             phase="open", probe="dns", target=MATRIX_INTERNET_NAME,
@@ -6566,9 +6566,9 @@ def enumerate_denial_matrix(plan: dict) -> list:
     #    attachments, neither governing the other's policy or host import.
     permissive, restricted = plan["egress_machines"]
     add("internet_allowed", permissive, f"internet:{MATRIX_INTERNET_ADDRESSES[0]}", "tcp", 443, "allow",
-        phase="open", probe="tcp", target=MATRIX_INTERNET_ADDRESSES[0], requires=("src:dm-egress",))
+        phase="open", probe=internet_probe(443), target=MATRIX_INTERNET_ADDRESSES[0], requires=("src:dm-egress",))
     add("egress_attachment_crosstalk", restricted, f"internet:{MATRIX_INTERNET_ADDRESSES[0]}", "tcp", 443, "deny",
-        phase="open", probe="tcp", target=MATRIX_INTERNET_ADDRESSES[0], requires=("src:dm-egress",))
+        phase="open", probe=internet_probe(443), target=MATRIX_INTERNET_ADDRESSES[0], requires=("src:dm-egress",))
     add("egress_attachment_crosstalk", permissive, f"host-loopback:{GRANTED_GUEST_PORT}", "tcp",
         GRANTED_GUEST_PORT, "allow", phase="open", probe="tcp", target="127.0.0.1",
         token=plan["host_service_token"], requires=("src:dm-egress",))
@@ -6577,7 +6577,7 @@ def enumerate_denial_matrix(plan: dict) -> list:
         token=plan["host_service_token"], requires=("src:dm-egress",))
     for address, expected in ((MATRIX_CIDR_INSIDE, "allow"), (MATRIX_CIDR_OUTSIDE, "deny")):
         add("internet_cidr", plan["cidr_machine"], f"internet:{address}", "tcp", 443, expected,
-            phase="open", probe="tcp", target=address, requires=("src:dm-cidr",))
+            phase="open", probe=internet_probe(443), target=address, requires=("src:dm-cidr",))
     for name, expected in ((MATRIX_DOMAIN_ALLOWED, "allow"), (MATRIX_DOMAIN_BLOCKED, "deny")):
         for protocol, port, probe in (("dns", 53, "dns"), ("https", 443, "https")):
             add("internet_domain", plan["domain_machine"], f"internet:{name}", protocol, port, expected,
@@ -6609,6 +6609,26 @@ def enumerate_denial_matrix(plan: dict) -> list:
     for index, cell in enumerate(cells):
         cell.index = index
     return cells
+
+
+# Which probe an Internet cell on this port needs.
+#
+# The `tcp` probe is `busybox wget ... http://host:port/`, so it speaks
+# PLAINTEXT HTTP. Pointed at 443 it opens the connection, sends an HTTP request
+# to a TLS listener, gets nothing it can parse, and exits non-zero -- which the
+# matrix records as `deny` for a host the Machine reached perfectly well.
+#
+# Every deny cell passed anyway, for the wrong reason, and that is exactly why
+# it went unnoticed until an `allowed` Machine could finally be built: the one
+# cell that expects `allow` at 443 is the only one the confusion can fail. It
+# did, on the first run in which `EgressPolicy::Allowed` was admitted.
+#
+# So each Internet cell speaks the protocol its port actually serves: HTTPS via
+# the guest's own TLS client at 443, plaintext HTTP at 80. Both 1.1.1.1 and
+# 8.8.8.8 present certificates for their own addresses, so the default public
+# bundle verifies them and no per-cell anchor is needed.
+def internet_probe(port: int) -> str:
+    return "https" if port == 443 else "tcp"
 
 
 def matrix_probe_command(cell: MatrixCell) -> str:
