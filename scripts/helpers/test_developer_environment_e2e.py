@@ -160,7 +160,12 @@ class TopologyLaneTests(unittest.TestCase):
         argv = lanes.lane_argv(self.lane, ctx, phase, evidence, handoff)
         for key, value in overrides.items():
             flag = "--" + key.replace("_", "-")
-            argv[argv.index(flag) + 1] = value
+            if flag in argv:
+                argv[argv.index(flag) + 1] = value
+            else:
+                # `--only` is optional, so the gate's argv builder does not emit
+                # it and there is nothing to replace.
+                argv += [flag, value]
         return argv
 
     def evidence(self) -> Path:
@@ -322,11 +327,22 @@ class TopologyLaneTests(unittest.TestCase):
         self.assertIn("sun_path", result["failure"]["detail"])
         self.assertFalse((self.state_root / "topology").exists())
 
-    def assert_regression(self, mode: str, slug: str, needle: str):
+    def assert_regression(self, mode: str, slug: str, needle: str, *also: str):
+        """One falsifying mode, asserted against the one sub-check it breaks.
+
+        `--only` runs that sub-check alone. Running the whole phase to assert one
+        claim costs ten unrelated checks per test and, across this module, most
+        of the suite's runtime -- and it does not strengthen the assertion. The
+        phase still grades every scenario it is assigned, so a partial run can
+        never report `passed`; `test_conformant_cli_passes_every_implemented_sub_check`
+        keeps running the full set, which is the test whose job that is.
+        """
         self.set_mode(mode)
         evidence = self.evidence()
-        code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        code, result = self.run_lane(
+            self.argv("clean-provision", evidence, only=",".join((slug, *also))), evidence)
         self.assertEqual((code, result["outcome"], result["failure"]["reason"]), (1, "failed", "assertion"), mode)
+        self.assertIn("subcheck-filter.txt", result["evidence_files"])
         sub = self.by_slug(result)[slug]
         self.assertEqual(sub["status"], "FAIL", mode)
         self.assertTrue(any(needle in a for a in sub["assertions"]), (mode, sub["assertions"]))
@@ -337,14 +353,15 @@ class TopologyLaneTests(unittest.TestCase):
         return result
 
     def test_bare_mutation_fails_bare_help(self):
-        result = self.assert_regression("mutate", "bare_help", "isolated root changed: appeared: project/discovered")
+        result = self.assert_regression("mutate", "bare_help", "isolated root changed: appeared: project/discovered",
+                                        "legacy_rejection")
         self.assertEqual(self.by_slug(result)["legacy_rejection"]["status"], "PASS")
 
     def test_snapshot_drift_fails_bare_help(self):
         self.assert_regression("drift", "bare_help", "FAILED: bare vz: stdout == snapshot")
 
     def test_executable_alias_fails_legacy_rejection(self):
-        result = self.assert_regression("alias", "legacy_rejection", "vz create: exit 0 (expected 2)")
+        result = self.assert_regression("alias", "legacy_rejection", "vz create: exit 0 (expected 2)", "bare_help")
         self.assertEqual(self.by_slug(result)["bare_help"]["status"], "PASS")
 
     def test_a_typed_channel_that_disagrees_fails_criterion_15(self):
@@ -356,11 +373,14 @@ class TopologyLaneTests(unittest.TestCase):
         must refuse it, or it is comparing shapes rather than identities.
         """
         result = self.assert_regression("probe_drift", "grpc_api_live_agreement",
-                                        "Environment environment_id agrees")
+                                        "Environment environment_id agrees", "status_json_field_set")
         self.assertEqual(self.by_slug(result)["status_json_field_set"]["status"], "PASS")
 
     def test_provisioning_up_fails_clean_directory_check(self):
-        result = self.assert_regression("provisions", "clean_up_refuses", "lane state root changed")
+        # criterion 7's check is named as well, because the second half of this
+        # test is about what an Up that persists nothing does to it.
+        result = self.assert_regression("provisions", "clean_up_refuses", "lane state root changed",
+                                        "host_import_export_boundaries")
         self.assertTrue(any("exit 0 (expected 2)" in a for a in self.by_slug(result)["clean_up_refuses"]["assertions"]))
         # An Up that reports success and persists no topology leaves every
         # criterion-7 clause unexercised. The check must FAIL rather than return
@@ -374,7 +394,10 @@ class TopologyLaneTests(unittest.TestCase):
     def test_hanging_command_is_uncertain_effects(self):
         self.set_mode("hang")
         evidence = self.evidence()
-        code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        # `hang` makes `vz ls` sleep past its deadline, and legacy_rejection is
+        # the check that invokes it.
+        code, result = self.run_lane(
+            self.argv("clean-provision", evidence, only="legacy_rejection"), evidence)
         self.assertEqual((code, result["failure"]["reason"]), (1, "uncertain_effects"))
         errors = [p for p in (evidence / "receipts").glob("*.json") if common.load_json(p)["state"] == "error"]
         self.assertTrue(errors)
@@ -548,7 +571,8 @@ class TopologyLaneTests(unittest.TestCase):
         """Run the lane in `mode` and return criterion 19's own sub-check."""
         self.set_mode(mode)
         evidence = self.evidence()
-        _code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        _code, result = self.run_lane(
+            self.argv("clean-provision", evidence, only="install_upgrade_rollback_uninstall"), evidence)
         return self.by_slug(result)["install_upgrade_rollback_uninstall"]
 
     def assert_claims(self, sub: dict, *needles: str) -> None:
@@ -673,7 +697,8 @@ class TopologyLaneTests(unittest.TestCase):
     def assert_criterion_two_regression(self, mode: str, needle: str):
         self.set_mode(mode)
         evidence = self.evidence()
-        code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        code, result = self.run_lane(
+            self.argv("clean-provision", evidence, only="mixed_profile_topology_status"), evidence)
         self.assertEqual((code, result["outcome"], result["failure"]["reason"]),
                          (1, "failed", "assertion"), mode)
         sub = self.by_slug(result)["mixed_profile_topology_status"]
@@ -873,7 +898,8 @@ class TopologyLaneTests(unittest.TestCase):
     def ingress(self, mode: str = ""):
         self.set_mode(mode)
         evidence = self.evidence()
-        code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        code, result = self.run_lane(
+            self.argv("clean-provision", evidence, only=INGRESS_SLUG), evidence)
         return code, result, self.by_slug(result)[INGRESS_SLUG]
 
     def test_the_edge_is_proved_and_only_its_unimplemented_clauses_are_reported(self):
@@ -1009,7 +1035,8 @@ class TopologyLaneTests(unittest.TestCase):
         if mode:
             self.set_mode(mode)
         evidence = self.evidence()
-        _code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        _code, result = self.run_lane(
+            self.argv("clean-provision", evidence, only="host_import_export_boundaries"), evidence)
         return result, self.by_slug(result)["host_import_export_boundaries"]
 
     def assert_asserted(self, sub: dict, needle: str, mode: str):

@@ -58,6 +58,13 @@ CRITERION_10 = "gate.lifecycle.recovery_including_sleep_wake"
 CRITERION_17 = "gate.storage.workspace_projection_policy"
 CRITERION_19 = "gate.migration.install_upgrade_rollback_uninstall"
 HANDOFF_SENTINEL = "state-handoff-sentinel.txt"
+# Run one named sub-check instead of the phase's whole set. A single-claim test
+# otherwise runs every other criterion's checks to assert one thing, which is
+# most of this suite's runtime. It cannot be used to manufacture evidence: the
+# phase always grades every scenario `assigned()` returns, so the ones with no
+# sub-check become FAIL and the outcome can never be `passed`. The gate's own
+# `lanes.lane_argv` never emits it.
+OPTIONAL_OPTIONS = ("only",)
 # The Environments pre-sleep leaves running and post-wake must find again.
 # Criterion 8 wants three mutually isolated Environments and criterion 10 wants
 # their identity preserved across the checkpoint, so three are established once
@@ -73,7 +80,9 @@ class Rejected(Exception):
 def scan_argv(argv: list) -> tuple:
     """{option: value} for `--k v` / `--k=v` pairs plus a list of problems."""
     options, problems = {}, []
-    known = ("suite", *lanes.LANE_OPTIONS)
+    # `only` is optional and belongs to this lane alone, so it is not in
+    # LANE_OPTIONS -- every entry there is required of every lane.
+    known = ("suite", *lanes.LANE_OPTIONS, *OPTIONAL_OPTIONS)
     index = 0
     while index < len(argv):
         item = argv[index]
@@ -96,7 +105,7 @@ def scan_argv(argv: list) -> tuple:
         else:
             options[key] = value
     for key in known:
-        if key not in options:
+        if key not in OPTIONAL_OPTIONS and key not in options:
             problems.append(f"missing required option --{key}")
     return options, problems
 
@@ -579,23 +588,52 @@ class Lane:
                      CRITERION_19: []}
         crash = None
         started = now_ns()
+        # One table, so `--only` selects from exactly the set that would
+        # otherwise run, and a slug that names nothing is a rejection rather
+        # than a silently empty phase.
+        dispatch = [
+            ("bare_help", CRITERION_21, checks.check_bare_help),
+            ("legacy_rejection", CRITERION_21, checks.check_legacy_rejection),
+            ("clean_up_refuses", CRITERION_21, checks.check_clean_up),
+            ("bootstrap_read_only", CRITERION_21, checks.check_bootstrap_read_only),
+            ("bootstrap_creates_default", CRITERION_21, checks.check_bootstrap_creates_default),
+            ("help_surface_exact", CRITERION_15, checks.check_help_surface),
+            ("error_envelope_agreement", CRITERION_15, checks.check_error_envelope),
+            ("status_json_field_set", CRITERION_15, checks.check_status_field_set),
+            ("grpc_api_live_agreement", CRITERION_15, checks.check_grpc_agreement),
+            ("three_concurrent_no_collision", CRITERION_1, checks.check_three_concurrent_environments),
+            ("private_topology_paths", CRITERION_5, checks.check_private_topology_paths),
+            ("public_like_ingress", CRITERION_6, checks.check_public_like_ingress),
+            ("host_import_export_boundaries", CRITERION_7, checks.check_host_import_export_boundaries),
+            ("mixed_profile_topology_status", CRITERION_2, checks.check_mixed_profile_topology_status),
+            ("workspace_storage_policy", CRITERION_17, checks.check_workspace_projection_policy),
+            ("install_upgrade_rollback_uninstall", CRITERION_19, checks.check_migration_install_upgrade_rollback_uninstall)
+        ]
+        # A comma-separated set, because some claims are only meaningful beside a
+        # control: "this mode broke X and left Y passing" needs both to have run.
+        selected = None if self.options.get("only") is None else set(self.options["only"].split(","))
+        known_slugs = {slug for slug, _c, _r in dispatch}
+        if selected is not None and not selected <= known_slugs:
+            result = self.failed("prerequisite", f"--only names no sub-check of this phase: "
+                                 f"{sorted(selected - known_slugs)}; known: {sorted(known_slugs)}",
+                                 EXIT_FAILED)
+            self.write_result(result)
+            return EXIT_FAILED
+        if selected is not None:
+            # Named in the retained evidence so a partial run is never mistaken
+            # for a full one. It cannot pass in any case -- every scenario with
+            # no sub-check grades FAIL -- but evidence should say what it was
+            # rather than leave it inferred from an absence. The lane-result
+            # schema is closed, so this is a file rather than a new field.
+            write_exclusive(self.evidence_dir / "subcheck-filter.txt",
+                            (f"--only {','.join(sorted(selected))}\nthis phase ran "
+                             f"{len(selected)} sub-check(s) of {len(dispatch)}; it is not a full "
+                             f"clean-provision run\n").encode())
         try:
-            subchecks[CRITERION_21].append(checks.check_bare_help(ctx, CRITERION_21))
-            subchecks[CRITERION_21].append(checks.check_legacy_rejection(ctx, CRITERION_21))
-            subchecks[CRITERION_21].append(checks.check_clean_up(ctx, CRITERION_21))
-            subchecks[CRITERION_21].append(checks.check_bootstrap_read_only(ctx, CRITERION_21))
-            subchecks[CRITERION_21].append(checks.check_bootstrap_creates_default(ctx, CRITERION_21))
-            subchecks[CRITERION_15].append(checks.check_help_surface(ctx, CRITERION_15))
-            subchecks[CRITERION_15].append(checks.check_error_envelope(ctx, CRITERION_15))
-            subchecks[CRITERION_15].append(checks.check_status_field_set(ctx, CRITERION_15))
-            subchecks[CRITERION_15].append(checks.check_grpc_agreement(ctx, CRITERION_15))
-            subchecks[CRITERION_1].append(checks.check_three_concurrent_environments(ctx, CRITERION_1))
-            subchecks[CRITERION_5].append(checks.check_private_topology_paths(ctx, CRITERION_5))
-            subchecks[CRITERION_6].append(checks.check_public_like_ingress(ctx, CRITERION_6))
-            subchecks[CRITERION_7].append(checks.check_host_import_export_boundaries(ctx, CRITERION_7))
-            subchecks[CRITERION_2].append(checks.check_mixed_profile_topology_status(ctx, CRITERION_2))
-            subchecks[CRITERION_17].append(checks.check_workspace_projection_policy(ctx, CRITERION_17))
-            subchecks[CRITERION_19].append(checks.check_migration_install_upgrade_rollback_uninstall(ctx, CRITERION_19))
+            for slug, criterion, run in dispatch:
+                if selected is not None and slug not in selected:
+                    continue
+                subchecks[criterion].append(run(ctx, criterion))
         except Exception:  # noqa: BLE001 - recorded as a crash, never swallowed
             crash = traceback.format_exc()
             write_exclusive(self.evidence_dir / "crash.txt", crash.encode())
