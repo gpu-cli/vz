@@ -20614,6 +20614,122 @@ fn a_slot_another_binding_already_resolves_is_a_state_conflict() {
     );
 }
 
+/// A first `vz up` has exactly one window in which to resolve its declared
+/// workspace slots, and `begin_environment_lifecycle` closes it.
+///
+/// Two independent rules meet at that transition. `begin` moves a first Up's
+/// Environment from `Creating` to `Reconciling`;
+/// `reserve_workspace_binding_for_environment` reserves only while the
+/// Environment is `Creating`; and `validate_definition_instance` requires
+/// every slot a Machine names to be resolved in every state after creation.
+/// So an Up that begins its lifecycle before reserving has not merely missed
+/// an optimisation -- it has produced a project aggregate that no longer
+/// loads, and it cannot reserve its way out afterwards either.
+#[test]
+fn a_declared_workspace_slot_left_unresolved_past_lifecycle_begin_strands_the_project() {
+    let store = StateStore::in_memory().unwrap();
+    let environment = created_environment_for_slots(&store, "prj_slot_ordering");
+    assert_eq!(environment.state, EnvironmentState::Creating);
+    store
+        .begin_environment_lifecycle(
+            environment.environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "req-strand",
+            "idem-strand",
+            "hash-strand",
+            200,
+        )
+        .expect("beginning the Up itself is admitted");
+
+    let error = store
+        .load_project_state("prj_slot_ordering")
+        .expect_err("the aggregate cannot load with a declared slot unresolved past Creating");
+    assert!(
+        error
+            .to_string()
+            .contains("unresolved workspace binding slot `workspace`"),
+        "unexpected error: {error}"
+    );
+
+    // And the window really is shut: the reservation the Up still owes is now
+    // refused, so this is a stranded Environment rather than a late one. Note
+    // WHICH rule refuses it -- not the `Creating` precondition, which the
+    // reservation never reaches, but the aggregate load the reservation has to
+    // do first. The Environment cannot be read at all, so nothing can be
+    // written to it either.
+    let late = WorkspaceBinding {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        binding_id: WorkspaceBindingId::generate(),
+        project_id: environment.project_id.clone(),
+        environment_id: environment.environment_id.clone(),
+        name: "worktree-late".to_string(),
+        workspace_key: "late-token".to_string(),
+        path_hint: None,
+        slots: BTreeSet::from(["workspace".to_string()]),
+    };
+    let refused = store
+        .reserve_workspace_binding_for_environment(&late, 201)
+        .expect_err("a slot cannot be reserved once the Environment has left Creating");
+    assert_eq!(
+        refused.to_string(),
+        error.to_string(),
+        "the late reservation is refused by the same unloadable aggregate"
+    );
+}
+
+/// The same sequence with the reservation on the correct side of `begin`.
+///
+/// This is the ordering `EnvironmentUpSupervisor::drive_up` implements, and
+/// the assertion that matters is the one the stranded case fails: the project
+/// aggregate still loads once the Environment is `Reconciling`.
+#[test]
+fn reserving_the_workspace_slot_before_lifecycle_begin_keeps_the_project_loadable() {
+    let store = StateStore::in_memory().unwrap();
+    let environment = created_environment_for_slots(&store, "prj_slot_ordered");
+    let binding = WorkspaceBinding {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        binding_id: WorkspaceBindingId::generate(),
+        project_id: environment.project_id.clone(),
+        environment_id: environment.environment_id.clone(),
+        name: "worktree-ordered".to_string(),
+        workspace_key: "ordered-token".to_string(),
+        path_hint: None,
+        slots: BTreeSet::from(["workspace".to_string()]),
+    };
+    store
+        .reserve_workspace_binding_for_environment(&binding, 100)
+        .expect("the slot is reserved while the Environment is still Creating");
+    store
+        .begin_environment_lifecycle(
+            environment.environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "req-ordered",
+            "idem-ordered",
+            "hash-ordered",
+            200,
+        )
+        .expect("beginning the Up is admitted");
+
+    let loaded = store
+        .load_project_state("prj_slot_ordered")
+        .expect("the aggregate loads with its slot resolved")
+        .expect("the project exists");
+    let reconciling = loaded
+        .environments
+        .iter()
+        .find(|candidate| candidate.environment_id == environment.environment_id)
+        .expect("the Environment survives its own lifecycle begin");
+    assert_eq!(reconciling.state, EnvironmentState::Reconciling);
+    assert_eq!(
+        reconciling
+            .bindings
+            .iter()
+            .flat_map(|binding| binding.slots.iter().cloned())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["workspace".to_string()]),
+    );
+}
+
 #[test]
 fn refreshing_a_binding_preserves_its_durable_slot_resolution_table() {
     let store = StateStore::in_memory().unwrap();

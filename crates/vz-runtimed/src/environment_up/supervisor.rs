@@ -223,6 +223,75 @@ impl RuntimeDaemon {
                 "Up deadline elapsed before lifecycle effects",
             ));
         }
+        // Workspace projections are resolved here for the same reason the
+        // fabric is: a VirtioFS share is fixed when `LinuxVm::create` runs, so
+        // a share cannot be minted inside the loop that boots the Machine
+        // holding it. Decision 8's slot resolution therefore has to be durable
+        // BEFORE the first boot, not published with the success binding after
+        // the last one.
+        //
+        // It is durable before `begin_environment_lifecycle` specifically, and
+        // not merely before the boot loop, because `begin` moves a first Up's
+        // Environment out of `Creating` and into `Reconciling`. Two rules meet
+        // at that transition: `reserve_workspace_binding_for_environment`
+        // reserves only while the Environment is `Creating`, and
+        // `validate_definition_instance` requires every declared slot to be
+        // resolved in every state after creation -- so the whole project
+        // aggregate stops loading. Reserving on this side of `begin` is what
+        // keeps both rules true at once; a first `vz up` of a definition that
+        // declares `machine.workspace` cannot otherwise reach its own boot.
+        let declared_slots =
+            workspace_projection::declared_workspace_slots(&request.definition.environment);
+        let resolved_workspace = if declared_slots.is_empty() {
+            workspace_projection::ResolvedWorkspaceMounts::default()
+        } else {
+            let workspace_key = request.selection.workspace_key.as_deref().ok_or_else(|| {
+                failure(
+                    &metadata,
+                    MachineErrorCode::ValidationError,
+                    "declared workspace projection requires a worktree binding token",
+                )
+            })?;
+            let mut resolved: BTreeSet<String> = environment
+                .bindings
+                .iter()
+                .flat_map(|binding| binding.slots.iter().cloned())
+                .collect();
+            if !declared_slots.is_subset(&resolved) {
+                let binding = WorkspaceBinding {
+                    schema_version: 1,
+                    binding_id: WorkspaceBindingId::generate(),
+                    project_id: environment.project_id.clone(),
+                    environment_id: environment.environment_id.clone(),
+                    name: workspace_projection::minted_binding_name(workspace_key),
+                    workspace_key: workspace_key.to_string(),
+                    path_hint: request.path_hint.clone(),
+                    slots: declared_slots.clone(),
+                };
+                let reserved = self
+                    .with_state_store(|store| {
+                        store.reserve_workspace_binding_for_environment(
+                            &binding,
+                            current_unix_secs(),
+                        )
+                    })
+                    .map_err(state_error)?;
+                resolved.extend(reserved.slots);
+            }
+            workspace_projection::resolve_environment_workspace_mounts(
+                &request.definition.environment,
+                &environment.machines,
+                &resolved,
+                request.workspace_root.as_deref(),
+            )
+            .map_err(|error| {
+                failure(
+                    &metadata,
+                    MachineErrorCode::ValidationError,
+                    error.to_string(),
+                )
+            })?
+        };
         let mut operation = self
             .with_state_store(|store| {
                 store.begin_environment_lifecycle(
@@ -340,64 +409,6 @@ impl RuntimeDaemon {
                     error.to_string(),
                 )
             })?;
-        // Workspace projections are resolved here for the same reason the
-        // fabric is: a VirtioFS share is fixed when `LinuxVm::create` runs, so
-        // a share cannot be minted inside the loop that boots the Machine
-        // holding it. Decision 8's slot resolution therefore has to be durable
-        // BEFORE the first boot, not published with the success binding after
-        // the last one.
-        let declared_slots =
-            workspace_projection::declared_workspace_slots(&request.definition.environment);
-        let resolved_workspace = if declared_slots.is_empty() {
-            workspace_projection::ResolvedWorkspaceMounts::default()
-        } else {
-            let workspace_key = request.selection.workspace_key.as_deref().ok_or_else(|| {
-                failure(
-                    &metadata,
-                    MachineErrorCode::ValidationError,
-                    "declared workspace projection requires a worktree binding token",
-                )
-            })?;
-            let mut resolved: BTreeSet<String> = environment
-                .bindings
-                .iter()
-                .flat_map(|binding| binding.slots.iter().cloned())
-                .collect();
-            if !declared_slots.is_subset(&resolved) {
-                let binding = WorkspaceBinding {
-                    schema_version: 1,
-                    binding_id: WorkspaceBindingId::generate(),
-                    project_id: environment.project_id.clone(),
-                    environment_id: environment.environment_id.clone(),
-                    name: workspace_projection::minted_binding_name(workspace_key),
-                    workspace_key: workspace_key.to_string(),
-                    path_hint: request.path_hint.clone(),
-                    slots: declared_slots.clone(),
-                };
-                let reserved = self
-                    .with_state_store(|store| {
-                        store.reserve_workspace_binding_for_environment(
-                            &binding,
-                            current_unix_secs(),
-                        )
-                    })
-                    .map_err(state_error)?;
-                resolved.extend(reserved.slots);
-            }
-            workspace_projection::resolve_environment_workspace_mounts(
-                &request.definition.environment,
-                &environment.machines,
-                &resolved,
-                request.workspace_root.as_deref(),
-            )
-            .map_err(|error| {
-                failure(
-                    &metadata,
-                    MachineErrorCode::ValidationError,
-                    error.to_string(),
-                )
-            })?
-        };
         let mut workspace_mounts = resolved_workspace.mounts;
         // A `snapshot` Machine's share still points at its SOURCE here. The
         // private clone is made inside the boot loop, where the Machine's own
