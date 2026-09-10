@@ -246,9 +246,22 @@ instructive than the fixes.
    reported an address MISMATCH; now the fabric NIC is the Machine's only one,
    so the same failure reports as an empty list.
 
-   The probe should also poll to a declared deadline, but that is diagnosis.
-   The fix is that Up must not report `ready` for a Machine whose declared
-   attachment produced no NIC.
+   **Root-caused and fixed** (`f7e2b546`). `configure_fabric_nic` in
+   `linux/initramfs/init` scanned `/sys/class/net` exactly once for the MAC the
+   host put on the cmdline. virtio-net devices are probed asynchronously, so a
+   scan that runs first finds nothing -- and the block's own header says
+   configuration is reboot-only, so nothing is permanent. Load is what moves a
+   probe past a single unwaited scan, which is why `--only` passed twice and
+   the full lane failed twice.
+
+   The scan is now a bounded wait, checked before each sleep so the budget
+   bounds the wait rather than exceeding it by one; the first scan runs before
+   any sleep, so a healthy boot pays nothing. Two tests against the block
+   lifted verbatim from the guest init by the existing harness -- one makes the
+   race deterministic and was verified to fail against the old code by setting
+   the budget to 0, the other pins the bound. Hardware verification is a FULL
+   lane run against `0.4.0-rc20`, because the full lane is where it reproduced
+   and `--only` never did.
 
 3. **There is no reconciliation** (P0). `vz up` refuses every ProjectDefinition
    change before admission -- `project definition drift`. No plan, no durable
