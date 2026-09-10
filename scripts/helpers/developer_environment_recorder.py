@@ -13,6 +13,7 @@ not mistaken for typed evidence.
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -332,6 +333,93 @@ class Recorder:
         return paths
 
 
+BLOCK = 1024 * 1024
+# Refuse to walk a pathological extent map forever. A file this fragmented is
+# itself worth knowing about, so the fallback reads it whole rather than
+# reporting a partial digest.
+MAX_EXTENTS = 100_000
+
+
+def _data_extents(fd: int, size: int):
+    """[(offset, length)] of the regions that are not holes, or None.
+
+    None means the filesystem would not answer, in which case the caller reads
+    the file whole. An empty list means the file is entirely holes.
+    """
+    if not (hasattr(os, "SEEK_DATA") and hasattr(os, "SEEK_HOLE")):
+        return None
+    extents, offset = [], 0
+    while offset < size:
+        try:
+            start = os.lseek(fd, offset, os.SEEK_DATA)
+        except OSError as error:
+            # ENXIO is "no data at or after this offset", i.e. the tail is a
+            # hole and the map is complete. Anything else means the filesystem
+            # does not support the query and there is no map to trust.
+            if error.errno == errno.ENXIO:
+                break
+            return None
+        try:
+            end = os.lseek(fd, start, os.SEEK_HOLE)
+        except OSError:
+            end = size
+        if end <= start:
+            return None
+        extents.append((start, end - start))
+        if len(extents) > MAX_EXTENTS:
+            return None
+        offset = end
+    return extents
+
+
+def file_digest(path, size: int) -> str:
+    """A file's content digest, without reading its holes.
+
+    A Developer Machine's Docker `data.img` is a 64 GiB sparse file. Measured on
+    one from a real lane run: 68,719,476,736 bytes logical, **29,171,712 bytes
+    of actual data in 78 extents**, and `SEEK_DATA`/`SEEK_HOLE` finds that map
+    in 2 milliseconds. Hashing the file whole read 2,355 times more bytes than
+    it needed to, per file, and most checks inventory the state root BEFORE and
+    AFTER. It was the dominant cost of a lane run.
+
+    This is not sampling and nothing is skipped: a hole is provably zeros, and
+    the extent boundaries are hashed alongside the bytes, so two files that
+    differ anywhere -- in content or in where the holes are -- differ here.
+
+    A file that is one unbroken extent, which is nearly every file, keeps the
+    plain whole-file SHA-256 it has always had, so ordinary rows are unchanged
+    and comparable with digests computed anywhere else. Only a file with holes
+    gets the framed digest, and it is labelled `sparse:` so it can never be read
+    as a number it is not.
+    """
+    hasher = hashlib.sha256()
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        extents = _data_extents(fd, size)
+        if extents == [(0, size)] or size == 0:
+            extents = None  # dense: the plain digest, exactly as before
+        if extents is None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            with open(fd, "rb", closefd=False) as stream:
+                for block in iter(lambda: stream.read(BLOCK), b""):
+                    hasher.update(block)
+            return hasher.hexdigest()
+        hasher.update(f"sparse:{size}:{len(extents)}".encode("ascii"))
+        for start, length in extents:
+            hasher.update(f":{start}:{length}".encode("ascii"))
+            os.lseek(fd, start, os.SEEK_SET)
+            remaining = length
+            while remaining:
+                block = os.read(fd, min(BLOCK, remaining))
+                if not block:
+                    break
+                hasher.update(block)
+                remaining -= len(block)
+        return "sparse:" + hasher.hexdigest()
+    finally:
+        os.close(fd)
+
+
 def inventory(root: Path) -> list:
     """Sorted rows `[relative, type, mode, size, sha256]` under `root` (lstat,
     never following symlinks; sockets/fifos/devices are listed by type). An
@@ -353,11 +441,7 @@ def inventory(root: Path) -> list:
                 rows.append([relative, "dir", mode, 0, None])
                 walk(child, relative + "/")
             elif stat.S_ISREG(metadata.st_mode):
-                hasher = hashlib.sha256()
-                with open(child, "rb") as stream:
-                    for block in iter(lambda: stream.read(1024 * 1024), b""):
-                        hasher.update(block)
-                rows.append([relative, "file", mode, metadata.st_size, hasher.hexdigest()])
+                rows.append([relative, "file", mode, metadata.st_size, file_digest(child, metadata.st_size)])
             elif stat.S_ISLNK(metadata.st_mode):
                 rows.append([relative, "symlink", mode, 0, sha256_bytes(os.readlink(child).encode("utf-8", "surrogateescape"))])
             elif stat.S_ISSOCK(metadata.st_mode):
