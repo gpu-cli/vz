@@ -55,6 +55,7 @@ CRITERION_2 = "gate.machines.mixed_profile_topology_status"
 CRITERION_6 = "gate.network.public_like_ingress"
 CRITERION_7 = "gate.host.import_export_boundaries"
 CRITERION_10 = "gate.lifecycle.recovery_including_sleep_wake"
+CRITERION_8 = "gate.isolation.cross_environment_isolation"
 CRITERION_17 = "gate.storage.workspace_projection_policy"
 CRITERION_19 = "gate.migration.install_upgrade_rollback_uninstall"
 HANDOFF_SENTINEL = "state-handoff-sentinel.txt"
@@ -330,9 +331,11 @@ class Lane:
             state.create()
         recorder = Recorder(self.evidence_dir, self.ctx.run_id)
         ctx = self.check_context(state, recorder)
-        subchecks, crash, established, establish = {}, None, None, None
+        subchecks, crash, established, establish = {CRITERION_8: []}, None, None, None
         try:
             established, establish = checks.establish_recovery_environments(ctx, RECOVERY_ISOLATES)
+            if established is not None:
+                subchecks[CRITERION_8].extend(checks.check_cross_environment_isolation(ctx, CRITERION_8, established))
         except Exception:  # noqa: BLE001 - recorded as a crash, never swallowed
             crash = traceback.format_exc()
             write_exclusive(self.evidence_dir / "crash.txt", crash.encode())

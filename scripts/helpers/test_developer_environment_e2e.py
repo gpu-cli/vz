@@ -1344,3 +1344,289 @@ class PeerAddressTests(unittest.TestCase):
         """The clause it serves is `origin peer == edge` and `!= client`."""
         self.assertNotEqual(checks.peer_address("[::ffff:10.31.71.1]"),
                             checks.peer_address("[::ffff:10.31.71.200]"))
+
+
+# Criterion 8 (`gate.isolation.cross_environment_isolation`), the topology lane's
+# persisted-recovery/pre-sleep phase. The subjects are the three Environments
+# `establish_recovery_environments` leaves running, so these drive the phase
+# itself rather than the check functions in isolation.
+#
+# Every denial has its own deliberately wrong stand-in, and every one of them
+# leaves that sub-check's positive control intact: a mode that also broke the
+# control would prove only that the fixture can be broken.
+CROSS_SLUGS = frozenset(("cross_environment_resolution", "cross_environment_routing",
+                         "cross_environment_read", "cross_environment_control",
+                         "cross_environment_events"))
+
+
+class CrossEnvironmentIsolationTests(unittest.TestCase):
+    """Five verbs, five denials, and one falsifying stand-in for each."""
+
+    # The lane fixture is `TopologyLaneTests`'; borrowed rather than subclassed
+    # so this class runs criterion 8's tests and not the whole lane's again.
+    stop_lane_daemons = TopologyLaneTests.stop_lane_daemons
+    argv = TopologyLaneTests.argv
+    evidence = TopologyLaneTests.evidence
+    run_lane = TopologyLaneTests.run_lane
+    by_slug = TopologyLaneTests.by_slug
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vztl-", dir="/private/tmp"))
+        self.mode_file = self.tmp / "mode"
+        self.release = support.build_fake_release(self.tmp / "release", mode_file=self.mode_file)
+        self.state_root = self.tmp / DEEP_STATE_ROOT_PADDING / "state"
+        self.contract = contract_module.load_contract()
+        self.lane = contract_module.lane_by_name(self.contract)["topology"]
+        self.counter = 0
+        self.socket_root = recorder.socket_root_for(self.state_root)
+        self.addCleanup(shutil.rmtree, self.socket_root, ignore_errors=True)
+        # pre-sleep leaves its daemons running on purpose; the lane's own stopper
+        # ends exactly what it started before tearDown removes the tree.
+        self.addCleanup(self.stop_lane_daemons)
+
+    def tearDown(self):
+        fixtures.make_writable(self.release)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def isolation(self, mode: str = ""):
+        """Run pre-sleep under `mode`; return (result, {slug: scenario})."""
+        if mode:
+            self.mode_file.write_text(mode)
+        evidence = self.evidence()
+        _code, result = self.run_lane(self.argv("persisted-recovery/pre-sleep", evidence), evidence)
+        return result, self.by_slug(result)
+
+    def failures(self, sub: dict) -> list:
+        return [a for a in sub["assertions"] if a.startswith("FAILED: ")]
+
+    def assert_asserted(self, sub: dict, needle: str, mode: str):
+        """It FAILED for a stated reason, not for want of running."""
+        self.assertEqual(sub["status"], "FAIL", (mode, sub["assertions"]))
+        self.assertTrue(any(needle in a for a in self.failures(sub)), (mode, self.failures(sub)))
+
+    def assert_intact(self, subs: dict, *slugs: str):
+        """The named sub-checks still hold, so the mode broke one denial only."""
+        for slug in slugs:
+            self.assertEqual(self.failures(subs[slug]), [], slug)
+
+    # -- the conformant runtime ---------------------------------------------------------
+    def test_the_conformant_runtime_holds_every_verb_apart(self):
+        """Four of the five verbs are proved outright; the fifth says what it
+        could not reach instead of claiming the clause."""
+        result, subs = self.isolation()
+        self.assertEqual(set(subs) & CROSS_SLUGS, CROSS_SLUGS, sorted(subs))
+        for slug in ("cross_environment_routing", "cross_environment_read",
+                     "cross_environment_control", "cross_environment_events"):
+            self.assertEqual(subs[slug]["status"], "PASS", (slug, subs[slug]["assertions"]))
+            self.assertTrue(subs[slug]["evidence"], slug)
+        # The one honest gap: these Environments declare no network and no
+        # endpoint, so no name is DECLARED in one for another's resolver to be
+        # asked about. What could be settled was settled and is recorded above
+        # the not_implemented line.
+        resolution = subs["cross_environment_resolution"]
+        self.assertEqual(resolution["status"], "FAIL")
+        self.assertEqual(self.failures(resolution), [], resolution["assertions"])
+        gaps = [a for a in resolution["assertions"] if a.startswith("not_implemented:")]
+        self.assertEqual(len(gaps), 1, resolution["assertions"])
+        self.assertIn("declare no networks and no", gaps[0])
+        # Criterion 8 cannot be claimed while one of its verbs is unproved, and
+        # the phase carries two other criteria nothing implements yet.
+        top = next(s for s in result["scenarios"] if s["id"] == e2e.CRITERION_8)
+        self.assertEqual(top["status"], "FAIL", top["assertions"])
+        self.assertEqual((result["outcome"], result["failure"]["reason"]), ("failed", "not_implemented"))
+        assertions = "\n".join(a for slug in CROSS_SLUGS for a in subs[slug]["assertions"])
+        # Each verb of the criterion, named in the evidence it produced.
+        for needle in (
+            "resolver view names none of",
+            "resolver refuses to answer for",
+            "holds at least one non-loopback address to be aimed at",
+            "answers its own listener after",
+            "did not read",
+            "failed to connect to",
+            "status reports exactly its own machine identities",
+            "status names its own definition",
+            "status payload carries none of",
+            "exposes no path under",
+            "share no state root, database or socket path",
+            "is refused (expected a non-zero exit",
+            "structured error with a declared code",
+            "identities are unchanged by",
+            "Environment state is unchanged by",
+            "sentinel is byte-identical afterwards",
+            "wrote nothing into",
+            "observer is watching before any event is generated",
+            "observer reported that it had emptied its stream",
+            "stream was live and ended on its own Environment's event",
+            "stream carried its own event",
+            "stream carried no event and no identity belonging to",
+        ):
+            self.assertIn(needle, assertions, needle)
+
+    # -- resolve --------------------------------------------------------------------------
+    def test_a_resolver_view_that_names_another_environments_machine_fails(self):
+        """Vacuity: put every sibling Environment's Machine identity in this
+        Machine's static table. The search has to notice it."""
+        _result, subs = self.isolation("cross_environment_resolve")
+        self.assert_asserted(subs["cross_environment_resolution"],
+                             "resolver view names none of", "cross_environment_resolve")
+        # A leaked name is not a leaked route, a leaked payload or a leaked
+        # event: the other four denials must be untouched, or the mode would not
+        # say which clause caught it.
+        self.assert_intact(subs, "cross_environment_routing", "cross_environment_read",
+                           "cross_environment_control", "cross_environment_events")
+
+    def test_a_resolver_that_answers_for_another_environment_fails(self):
+        """The lookup is a separate claim from the file read: a resolver that
+        answered without listing the name anywhere still answered."""
+        _result, subs = self.isolation("cross_environment_resolve")
+        self.assert_asserted(subs["cross_environment_resolution"],
+                             "resolver refuses to answer for", "cross_environment_resolve")
+
+    # -- route ----------------------------------------------------------------------------
+    def test_a_merged_route_domain_fails(self):
+        """Vacuity: let a Machine reach another Environment's listener at its
+        literal address. The loopback control still passes, so the failure is
+        the cross-Environment denial and not the fixture."""
+        _result, subs = self.isolation("cross_environment_route")
+        routing = subs["cross_environment_routing"]
+        self.assert_asserted(routing, "did not read", "cross_environment_route")
+        # Both halves of the denial: the served token arrived, and the client
+        # reported success rather than a refused connection.
+        self.assertTrue(any("failed to connect to" in a for a in self.failures(routing)),
+                        self.failures(routing))
+        held = "\n".join(a for a in routing["assertions"] if not a.startswith("FAILED: "))
+        self.assertIn("answers its own listener after", held)
+        self.assert_intact(subs, "cross_environment_read", "cross_environment_control")
+
+    # -- read -----------------------------------------------------------------------------
+    def test_a_status_that_reports_a_sibling_environment_fails(self):
+        """Vacuity: report every sibling Environment in this project's status,
+        with the identities that sibling's own Up minted."""
+        _result, subs = self.isolation("cross_environment_read")
+        self.assert_asserted(subs["cross_environment_read"],
+                             "status reports exactly its own machine identities", "cross_environment_read")
+
+    def test_a_status_carrying_another_environments_identities_fails(self):
+        """The same leak read the other way round: the payload is searched for
+        the OTHER Environment's recorded identities, not only compared with this
+        one's. Both claims must be able to fail, which is why neither returns
+        before the other has run."""
+        _result, subs = self.isolation("cross_environment_read")
+        self.assert_asserted(subs["cross_environment_read"],
+                             "status payload carries none of", "cross_environment_read")
+
+    def test_a_status_that_names_another_environments_definition_fails(self):
+        """The stand-in also names a sibling Environment's directory as the
+        source of this project's definition; the equality has to catch it."""
+        _result, subs = self.isolation("cross_environment_read")
+        self.assert_asserted(subs["cross_environment_read"],
+                             "status names its own definition", "cross_environment_read")
+
+    def test_a_status_that_names_a_path_inside_another_environment_fails(self):
+        """A leaked identity and a leaked path are different exposures: the
+        stand-in leaks the sibling's runtime directory as well, and the path
+        claim has to catch it on its own."""
+        _result, subs = self.isolation("cross_environment_read")
+        self.assert_asserted(subs["cross_environment_read"],
+                             "exposes no path under", "cross_environment_read")
+
+    # -- control --------------------------------------------------------------------------
+    def test_a_lifecycle_verb_aimed_at_another_environment_that_is_not_refused_fails(self):
+        """Vacuity: honour an Environment selector naming another Environment.
+        The verb must be refused, and it was not."""
+        _result, subs = self.isolation("cross_environment_control")
+        control = subs["cross_environment_control"]
+        self.assert_asserted(control, "is refused (expected a non-zero exit", "cross_environment_control")
+        # Not merely a non-zero exit: a verb that succeeded wrote no refusal
+        # envelope at all, and the declared-code comparison has to say so.
+        self.assertTrue(any("structured error with a declared code" in a and "observed None" in a
+                            for a in self.failures(control)), self.failures(control))
+
+    def test_a_foreign_lifecycle_verb_that_changes_its_target_fails(self):
+        """The other half of the same claim: fail-closed is not enough on its
+        own, so the target's identities, Environment state, Machine-local
+        sentinel and Machine contents are all compared before and after. The
+        stand-in does to the target what a Machine driven from outside its own
+        Environment would -- a fresh incarnation and no Machine-local state --
+        so each of those comparisons has to be able to fail."""
+        _result, subs = self.isolation("cross_environment_control")
+        control = subs["cross_environment_control"]
+        self.assertEqual(control["status"], "FAIL")
+        failures = self.failures(control)
+        for needle in ("machine identities are unchanged by",
+                       "incarnation identities are unchanged by",
+                       "Environment state is unchanged by",
+                       "sentinel is byte-identical afterwards",
+                       "wrote nothing into"):
+            self.assertTrue(any(needle in a for a in failures), (needle, failures))
+
+    # -- events ---------------------------------------------------------------------------
+    def test_a_daemon_that_fans_events_across_environments_fails(self):
+        """Vacuity: deliver every Machine's events to every OTHER Environment's
+        observers. The observer still sees its own Environment's event, so the
+        stream is still live and only the silence about the others breaks."""
+        _result, subs = self.isolation("cross_environment_events")
+        events = subs["cross_environment_events"]
+        self.assert_asserted(events, "stream carried no event and no identity belonging to",
+                             "cross_environment_events")
+        held = "\n".join(a for a in events["assertions"] if not a.startswith("FAILED: "))
+        self.assertIn("stream was live and ended on its own Environment's event", held)
+        self.assertIn("stream carried its own event", held)
+
+
+class CrossEnvironmentParserTests(unittest.TestCase):
+    """The small readers criterion 8's claims are built on, pinned separately.
+
+    A parser that quietly returned nothing would make every search find nothing,
+    which is the shape of a denial that cannot fail.
+    """
+
+    def test_addresses_are_read_by_kernel_report_and_loopback_is_excluded(self):
+        receipt = _CrossReceipt(b"ADDR eth0 192.168.64.31\nADDR enp0s5 10.7.9.4\n")
+        self.assertEqual(checks.cross_addresses(receipt), [("eth0", "192.168.64.31"), ("enp0s5", "10.7.9.4")])
+        self.assertEqual(checks.cross_addresses(_CrossReceipt(b"")), [])
+        # A row that is not an address row is not silently read as one.
+        self.assertEqual(checks.cross_addresses(_CrossReceipt(b"ADDR eth0\nIFACE eth0 1.2.3.4\n")), [])
+
+    def test_a_refusal_is_read_from_its_own_envelope(self):
+        envelope = b'{"error":{"code":"environment_not_found","message":"no such"},"schema_version":1}\n'
+        self.assertEqual(checks.cross_error_code(_CrossReceipt(b"", envelope)), "environment_not_found")
+        # Anything that is not one structured envelope is None, never a code the
+        # fail-closed comparison would accept.
+        for stderr in (b"", b"boom\n", b'{"schema_version":1}\n', b'{"error":"boom"}\n',
+                       b'{"error":{"code":42}}\n'):
+            self.assertIsNone(checks.cross_error_code(_CrossReceipt(b"", stderr)), stderr)
+
+    def test_recorded_identities_exclude_the_names_that_collide_by_design(self):
+        entry = {"isolate": "rec-a", "project_id": "prj_1", "environment_id": "env_1",
+                 "environment_name": "default", "token": "vzrec-1",
+                 "machines": [{"name": "machine-0", "machine_id": "mch_1", "incarnation_id": "inc_1",
+                               "docker_context": "vzr1-ctx-1"}]}
+        self.assertEqual(checks.cross_identities(entry),
+                         {"project": {"prj_1"}, "environment": {"env_1"}, "machine": {"mch_1"},
+                          "incarnation": {"inc_1"}, "context": {"vzr1-ctx-1"}})
+        # `default` and `machine-0` are shared by every Environment here on
+        # purpose, so a claim made about them would be a claim about a
+        # deliberate collision.
+        self.assertEqual(checks.cross_tokens(entry), ["env_1", "inc_1", "mch_1", "prj_1", "vzr1-ctx-1"])
+        self.assertNotIn("default", checks.cross_tokens(entry))
+        self.assertNotIn("machine-0", checks.cross_tokens(entry))
+
+    def test_reported_identities_are_read_from_the_whole_payload(self):
+        payload = {"project_id": "prj_1", "environments": [
+            {"environment_id": "env_1", "machines": [
+                {"machine_id": "mch_1", "incarnation_id": "inc_1", "docker_context": {"name": "ctx_1"}}]},
+            {"environment_id": "env_2", "machines": [{"machine_id": "mch_2"}]}]}
+        reported = checks.cross_reported_identities(payload)
+        self.assertEqual(reported["environment"], {"env_1", "env_2"})
+        self.assertEqual(reported["machine"], {"mch_1", "mch_2"})
+        self.assertEqual(reported["context"], {"ctx_1"})
+        self.assertEqual(checks.cross_reported_identities({})["environment"], set())
+
+
+class _CrossReceipt:
+    """The two fields criterion 8's readers take off a recorded invocation."""
+
+    def __init__(self, stdout: bytes, stderr: bytes = b""):
+        self.stdout = stdout
+        self.stderr = stderr

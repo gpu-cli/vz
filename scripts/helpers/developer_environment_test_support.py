@@ -33,6 +33,17 @@ grants), export_wildcard (the export listener binds 0.0.0.0 instead of
 
 The last ten exist to make the criterion 2, 6 and 17 checks falsifiable
 offline: each one breaks exactly one claim, and the check has to notice.
+
+Criterion 8 adds five more of the same kind, one per verb of the
+cross-Environment isolation claim: cross_environment_resolve (a Machine's
+static table names every other Environment's Machine), cross_environment_route
+(the route domains are merged, so another Environment's listener answers),
+cross_environment_read (`status` also reports every sibling Environment, with
+the identities that sibling's own Up minted), cross_environment_control (an
+Environment selector naming another Environment is honoured and the verb acts
+on it), and cross_environment_events (the daemon fans every Machine event out
+to every other Environment's observers). Each breaks exactly one of the five
+denials and leaves that sub-check's positive control intact.
 """
 from __future__ import annotations
 
@@ -105,6 +116,46 @@ if [ -n "$verb" ]; then
   # A real Up persists topology; `status` succeeds only afterwards, which is
   # what the bootstrap-creates-default check depends on.
   topology="$VZ_RUNTIME_DATA_DIR/topology.json"
+  # `cross_environment_control` is criterion 8's deliberately wrong stand-in for
+  # a control plane with no Environment boundary: a selector naming ANOTHER
+  # Environment's identity is honoured, and the verb acts on that Environment.
+  # It is the only thing that can make the fail-closed and target-unchanged
+  # claims falsifiable -- a mode that merely ran the verb locally would leave
+  # the target unchanged for the wrong reason.
+  if [ "$mode" = cross_environment_control ] && [ -n "$selected" ] && [ "$selected" != default ]; then
+    for other in "$(dirname "$VZ_RUNTIME_DATA_DIR")"/*/topology.json; do
+      [ -f "$other" ] || continue
+      osfx=$(awk '$1=="S"{print $2}' "$other")
+      # The identity the caller named stays addressable after the wreck below
+      # rewrote it, so a second verb aimed at the same Environment still lands
+      # on it. Without this the first verb would make every later one refuse
+      # honestly, and half the target-unchanged claims would never be exercised.
+      alias_file="$(dirname "$other")/cross-alias"
+      aliased=""
+      [ -f "$alias_file" ] && aliased=$(cat "$alias_file")
+      { [ "$selected" = "env_$osfx" ] || { [ -n "$aliased" ] && [ "$selected" = "env_$aliased" ]; }; } || continue
+      [ -f "$alias_file" ] || printf '%s' "$osfx" > "$alias_file"
+      VZ_RUNTIME_DATA_DIR=$(dirname "$other"); export VZ_RUNTIME_DATA_DIR
+      topology=$other; selected=default
+      # And it does to that Environment what a Machine driven from outside its
+      # own Environment would: a fresh incarnation and no Machine-local state.
+      # Without this the mode would falsify "the verb is refused" but leave
+      # "the target is unchanged" unable to fail on its identity or sentinel.
+      awk '$1=="S"{print "S ffffffffffffffff"; next} {print}' "$topology" > "$topology.x" \
+        && mv "$topology.x" "$topology"
+      rm -f "$VZ_RUNTIME_DATA_DIR/sentinel"
+      break
+    done
+  fi
+  # An Environment selector naming an Environment this project does not have is
+  # refused for EVERY verb, before any of them acts. The fallthrough refusal
+  # further down is reached only by `status`, so without this `stop`, `delete`
+  # and `exec` would silently act on the local Environment instead -- which is
+  # precisely the cross-Environment control criterion 8 forbids.
+  if [ -n "$selected" ] && [ "$selected" != default ] && [ -f "$topology" ]; then
+    printf '{"error":{"code":"environment_not_found","message":"no Environment named %s in this project"},"schema_version":1}\n' "$selected" >&2
+    exit 2
+  fi
   # Up is idempotent reconcile, not recreate. A second Up of an Environment
   # that already exists must hand back the identities it already has --
   # criterion 10 claims stop/up preserves them, and criterion 15's typed
@@ -265,6 +316,19 @@ if [ -n "$verb" ]; then
     machine=$(awk '$1=="M"{print $2; exit}' "$topology")
   fi
   if [ "$verb" = exec ] && [ -f "$topology" ]; then
+    # `cross_environment_events` is criterion 8's deliberately wrong stand-in
+    # for a daemon that fans every Machine event out to every Environment's
+    # observers instead of only to the Environment that produced it. It never
+    # writes into the Environment that produced the event, so an observer still
+    # sees its OWN Environment's events exactly as it does conformantly and only
+    # the cross-Environment silence can break.
+    if [ "$mode" = cross_environment_events ]; then
+      for other in "$(dirname "$VZ_RUNTIME_DATA_DIR")"/*/; do
+        case "$other" in "$VZ_RUNTIME_DATA_DIR"/) continue ;; esac
+        [ -d "$other/www" ] || continue
+        printf 'EVENT %s\n' "$command_tail" >> "$other/www/vz-cross-events"
+      done
+    fi
     # Model Machine-local mutable state: run the script with the sentinel path
     # rewritten into this isolated runtime dir, so a recreated Environment with
     # a fresh state directory genuinely has none of it.
@@ -330,7 +394,19 @@ if [ -n "$verb" ]; then
     # The full declared success-payload field set, so an exact comparison of it
     # is exercised here and not only against the installed binaries.
     printf '{\n "schema_version": 1,\n "request_id": "req-%s",\n "topology_state_source": "persisted",\n' "$sfx"
-    printf ' "definition_path": "%s/vz.json",\n "project_name": "vz04-topology-bootstrap",\n' "$PWD"
+    # Under `cross_environment_read` this project also names ANOTHER
+    # Environment's directory as the source of its own definition, so the claim
+    # that a status names its OWN definition can fail as well as pass. Armed by
+    # the same sentinel gate as the leaked Environment objects below.
+    dpath="$PWD"
+    if [ "$mode" = cross_environment_read ] && [ -f "$VZ_RUNTIME_DATA_DIR/sentinel" ]; then
+      for other in "$(dirname "$VZ_RUNTIME_DATA_DIR")"/*/topology.json; do
+        [ -f "$other" ] || continue
+        [ "$other" = "$topology" ] && continue
+        dpath=$(dirname "$other"); break
+      done
+    fi
+    printf ' "definition_path": "%s/vz.json",\n "project_name": "vz04-topology-bootstrap",\n' "$dpath"
     printf ' "host": {"os": "macos", "arch": "aarch64"},\n'
     printf ' "daemon": {"backend_name": "macos-vz", "version": "0.1.0"},\n'
     printf ' "desired_definition_digest": "%s",\n "persisted_definition_digest": "%s",\n' "$dg" "$dg"
@@ -396,7 +472,37 @@ if [ -n "$verb" ]; then
       sep=", "
     done
     printf ']\n'
-    printf '  }\n ]\n}\n'
+    printf '  }'
+    # `cross_environment_read` is criterion 8's deliberately wrong stand-in for
+    # a control plane that exposes another Environment's state: this project's
+    # status also reports every sibling Environment, with the identities that
+    # sibling's own Up minted. Reading them out of the sibling's persisted
+    # topology is what makes it a real leak -- identities invented here would
+    # match nothing the isolation check recorded, and the claim would be
+    # unfalsifiable.
+    # Armed only once this Environment holds the sentinel that
+    # `establish_recovery_environments` writes AFTER it has read this status,
+    # so the leak falsifies criterion 8's read denial without breaking the
+    # precondition that establishes the three Environments to hold apart.
+    if [ "$mode" = cross_environment_read ] && [ -f "$VZ_RUNTIME_DATA_DIR/sentinel" ]; then
+      for other in "$(dirname "$VZ_RUNTIME_DATA_DIR")"/*/topology.json; do
+        [ -f "$other" ] || continue
+        [ "$other" = "$topology" ] && continue
+        osfx=$(awk '$1=="S"{print $2}' "$other")
+        opid=$(awk '$1=="P"{print $2}' "$other")
+        printf ',\n  {"environment_id": "env_%s", "name": "default", "state": "ready",' "$osfx"
+        printf ' "definition_digest": "sha256:%s", "lifecycle_generation": 1, "project_id": "%s",' "$osfx" "$opid"
+        # The sibling's runtime directory, so the leak is a readable PATH into
+        # another Environment's state as well as a readable identity.
+        printf ' "runtime_directory": "%s",' "$(dirname "$other")"
+        printf ' "machines": [{"name": "machine-0", "state": "ready", "health": "supervised",'
+        printf ' "machine_id": "mch_%s_machine-0", "incarnation_id": "inc_%s_machine-0",' "$osfx" "$osfx"
+        printf ' "incarnation_generation": 1, "profile": "developer",'
+        printf ' "docker_context": {"name": "vzr1-ctx-%s-machine-0"}}],' "$osfx"
+        printf ' "networks": [], "network_attachments": [], "endpoints": []}'
+      done
+    fi
+    printf '\n ]\n}\n'
     exit 0
   fi
   if [ ! -f vz.json ]; then
@@ -1197,6 +1303,19 @@ case "$applet" in
     done
     exit 0 ;;
   nslookup)
+    # `cross_environment_resolve` is criterion 8's deliberately wrong stand-in
+    # for a merged name space: this resolver also ANSWERS for a Machine that
+    # belongs to another Environment, not merely lists it in a static table.
+    if [ "$mode" = cross_environment_resolve ]; then
+      for other in "$(dirname "$state")"/*/topology.json; do
+        [ -f "$other" ] || continue
+        [ "$(dirname "$other")" = "$state" ] && continue
+        osfx=$(awk '$1=="S"{print $2}' "$other")
+        { [ "$1" = "env_$osfx" ] || [ "$1" = "mch_${osfx}_machine-0" ] ; } || continue
+        printf 'Server:\t10.0.0.1\nAddress:\t10.0.0.1:53\n\nName:\t%s\nAddress: 10.0.0.9\n' "$1"
+        exit 0
+      done
+    fi
     # Resolution through the Environment's own resolver, which answers the
     # Environment's declared name and nothing else. There is no upstream: a name
     # this Environment did not declare is not looked for anywhere.
@@ -1266,6 +1385,19 @@ case "$applet" in
         # asked, so the mode that puts one there must break the DNS claims.
         if [ -n "$edge_name" ] && [ "${VZ_FAKE_MODE:-}" = edge_hosts_shortcut ]; then
           printf '%s %s\n' "$origin_addr" "$edge_name"
+        fi
+        # `cross_environment_resolve` is criterion 8's deliberately wrong
+        # stand-in for a merged name space: this Machine's static table names
+        # every OTHER Environment's Machine, so its resolver view answers for a
+        # Machine that belongs to a different Environment. The identity is read
+        # from that Environment's own persisted topology, so it is the identity
+        # criterion 8's record holds rather than an invented string.
+        if [ "$mode" = cross_environment_resolve ]; then
+          for other in "$(dirname "$state")"/*/topology.json; do
+            [ -f "$other" ] || continue
+            [ "$(dirname "$other")" = "$state" ] && continue
+            printf '10.0.0.9 mch_%s_machine-0\n' "$(awk '$1=="S"{print $2}' "$other")"
+          done
         fi
         exit 0 ;;
       /proc/net/arp)
@@ -1350,6 +1482,21 @@ case "$applet" in
       kill -0 "$pid" 2>/dev/null || exit 1
       cat "$(cut -d' ' -f3- < "$state/httpd-$machine")/index.html"
       exit 0
+    fi
+    # `cross_environment_route` is criterion 8's deliberately wrong stand-in for
+    # a merged route domain: an address belonging to ANOTHER Environment's
+    # Machine is reachable and its listener answers. It never serves the
+    # caller's own Environment, so the loopback control that proves the client
+    # and server work is untouched and only the cross-Environment denial breaks.
+    if [ "$mode" = cross_environment_route ]; then
+      for marker in "$(dirname "$state")"/*/httpd-*; do
+        [ -f "$marker" ] || continue
+        case "$marker" in "$state"/*) continue ;; esac
+        mpid=$(cut -d' ' -f1 < "$marker"); mroot=$(cut -d' ' -f3- < "$marker")
+        kill -0 "$mpid" 2>/dev/null || continue
+        cat "$mroot/index.html"
+        exit 0
+      done
     fi
     # No port on the switch means no route to any Environment address,
     # whatever is listening on it.
