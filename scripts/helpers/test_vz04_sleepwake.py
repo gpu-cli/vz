@@ -138,6 +138,71 @@ class AckTests(unittest.TestCase):
             result = sleepwake.wait_for_ack(NONCE, 30, str(ack), prompt_stream=io.StringIO())
             self.assertEqual(result["state"], "nonce_mismatch")
 
+    def test_truncated_file_mid_write_is_not_a_mismatch(self):
+        """The regression this settling rule exists for.
+
+        Every way an operator acknowledges -- `echo $nonce > ack`, an editor
+        save, `Path.write_text` -- truncates the file before it writes the
+        bytes, so the file is observably empty for a moment. Reading it in that
+        window and concluding `nonce_mismatch` turned a correct acknowledgement
+        into a terminal gate failure; it showed up as a flake under load, where
+        the window is wide enough to be sampled. The correct nonce arriving
+        second must still be an ack.
+        """
+        with tempfile.TemporaryDirectory(prefix="vz04-ack-") as tmp:
+            ack = Path(tmp) / "ack"
+
+            def truncate_then_write():
+                ack.write_text("")          # the window
+                time.sleep(1.5)             # three ACK_POLL_SECONDS inside it
+                ack.write_text(NONCE + "\n")
+
+            threading.Thread(target=truncate_then_write, daemon=True).start()
+            result = sleepwake.wait_for_ack(NONCE, 30, str(ack), prompt_stream=io.StringIO())
+            self.assertEqual((result["state"], result["channel"]), ("acked", "file"))
+
+    def test_partial_prefix_of_the_nonce_is_not_a_mismatch(self):
+        """A short read is a short read, not a wrong nonce."""
+        with tempfile.TemporaryDirectory(prefix="vz04-ack-") as tmp:
+            ack = Path(tmp) / "ack"
+
+            def dribble():
+                ack.write_text(NONCE[:8])   # a plausible partial write
+                time.sleep(1.5)
+                ack.write_text(NONCE + "\n")
+
+            threading.Thread(target=dribble, daemon=True).start()
+            result = sleepwake.wait_for_ack(NONCE, 30, str(ack), prompt_stream=io.StringIO())
+            self.assertEqual(result["state"], "acked")
+
+    def test_content_that_never_matches_still_fails_at_the_deadline(self):
+        """Tolerating a mid-write read must not tolerate a wrong nonce forever.
+
+        A writer that keeps rewriting different wrong bytes never settles, so
+        the two-consecutive-reads rule never fires. The deadline must still
+        report `nonce_mismatch` -- content was seen and it was never the nonce --
+        rather than `ack_deadline_exceeded`, which would say nobody answered.
+        """
+        with tempfile.TemporaryDirectory(prefix="vz04-ack-") as tmp:
+            ack = Path(tmp) / "ack"
+            stop = threading.Event()
+
+            def churn():
+                counter = 0
+                while not stop.is_set():
+                    counter += 1
+                    ack.write_text(f"not-the-nonce-{counter}\n")
+                    time.sleep(0.05)
+
+            writer = threading.Thread(target=churn, daemon=True)
+            writer.start()
+            try:
+                result = sleepwake.wait_for_ack(NONCE, 3, str(ack), prompt_stream=io.StringIO())
+            finally:
+                stop.set()
+                writer.join(timeout=5)
+            self.assertEqual((result["state"], result["channel"]), ("nonce_mismatch", "file"))
+
     def test_deadline_exceeded(self):
         if os.isatty(0):
             self.skipTest("controlling TTY present; deadline test needs a non-interactive stdin")

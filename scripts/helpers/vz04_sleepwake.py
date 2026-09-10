@@ -227,6 +227,26 @@ def _tty():
         return None
 
 
+def _still_arriving(content: str, nonce: str) -> bool:
+    """Could these bytes still become an acknowledgement by growing?
+
+    A writer that has truncated but not finished leaves a prefix of what it
+    intends to write. If any tail of what we can see is the start of the nonce,
+    the next bytes may complete it, so this is a short read rather than a wrong
+    nonce. Two characters is the shortest overlap worth believing: a single
+    coincidental hex character would make almost any text look unfinished.
+
+    Being generous here is the safe direction. Mistaking an unfinished write for
+    a wrong nonce ends the gate on a correct acknowledgement; mistaking a wrong
+    nonce for an unfinished write costs the ack deadline and still ends in
+    `nonce_mismatch`.
+    """
+    if not content:
+        return True
+    limit = min(len(content), len(nonce) - 1)
+    return any(nonce.startswith(content[-length:]) for length in range(limit, 1, -1))
+
+
 def wait_for_ack(nonce: str, deadline_seconds: int, ack_file, *, prompt_stream=sys.stderr, clock=time.monotonic, sleep=time.sleep) -> dict:
     """Block until Enter on the controlling TTY or `ack_file` contains the nonce.
 
@@ -242,10 +262,16 @@ def wait_for_ack(nonce: str, deadline_seconds: int, ack_file, *, prompt_stream=s
     print(f"==> SLEEP/WAKE CHECKPOINT nonce={nonce}", file=prompt_stream, flush=True)
     print(f"==> Put this Mac to sleep for at least the contract minimum, wake it, then press Enter"
           f"{' or write the nonce to ' + str(ack_path) if ack_path else ''} (deadline {deadline_seconds}s).", file=prompt_stream, flush=True)
+    # The previous non-matching read of the ack file, or None if there has not
+    # been one. See the settling rule below.
+    settled = None
     try:
         while True:
             waited = clock() - started
             if waited > deadline_seconds:
+                if settled is not None:
+                    return {"state": "nonce_mismatch", "channel": "file", "waited_seconds": round(waited, 3),
+                            "detail": f"{ack_path} never contained the checkpoint nonce within {deadline_seconds}s"}
                 return {"state": "ack_deadline_exceeded", "channel": None, "waited_seconds": round(waited, 3),
                         "detail": f"no acknowledgement within {deadline_seconds}s"}
             if ack_path is not None and ack_path.is_file():
@@ -255,8 +281,21 @@ def wait_for_ack(nonce: str, deadline_seconds: int, ack_file, *, prompt_stream=s
                     content = ""
                 if nonce in content:
                     return {"state": "acked", "channel": "file", "waited_seconds": round(clock() - started, 3), "detail": str(ack_path)}
-                return {"state": "nonce_mismatch", "channel": "file", "waited_seconds": round(clock() - started, 3),
-                        "detail": f"{ack_path} exists but does not contain the checkpoint nonce"}
+                # An empty or partial read is "not acknowledged yet", not a wrong
+                # nonce. Every way an operator writes this file -- a shell
+                # redirect, `write_text`, an editor save -- truncates before it
+                # writes, so the file is observably empty for a moment and
+                # observably short for another. Concluding `nonce_mismatch` on
+                # the first sight of the file turned that window into a terminal
+                # verdict: under load the poll landed inside it and the gate
+                # failed a real, correct acknowledgement. A file is settled only
+                # when two consecutive polls read the same non-empty bytes, and
+                # only a settled file can be a mismatch. A writer that keeps
+                # rewriting wrong content still fails, at the deadline, above.
+                if content == settled and not _still_arriving(content, nonce):
+                    return {"state": "nonce_mismatch", "channel": "file", "waited_seconds": round(clock() - started, 3),
+                            "detail": f"{ack_path} exists but does not contain the checkpoint nonce"}
+                settled = content or None
             if tty is not None:
                 ready, _w, _x = select.select([tty], [], [], ACK_POLL_SECONDS)
                 if ready:
