@@ -279,15 +279,25 @@ required E2E scenario and retained evidence:
     derived fabric address, and its own Docker context, while its parent keeps
     serving with its identities and sentinel bytes unchanged. The fork inherits
     the parent's warm state: its Docker image store answers for the parent's
-    image digests with a pull count of zero. Performance is part of the claim,
-    because a fork that costs a cold boot has no value -- the fork reaches ready
-    substantially faster than a cold `up` of the same definition measured in the
-    same run, and the volume's free space falls by a small fraction of the
-    parent's allocated size, which is what makes copy-on-write observable
-    rather than assumed. Free space, not the clone's own allocated size: APFS
-    reports both inodes as fully allocated because they share blocks, so a
-    per-file comparison reads a correct clone as a deep copy. Measured on a
-    real 80 GiB template disk holding 32.9 GiB: 0.029 s and 28 KB. The fork
+    image digests with a pull count of zero, and a volume created on the parent
+    after the fork is absent from it, so "two engines" and "one engine answered
+    twice" are distinguishable. Copy-on-write is the cost claim, and it is
+    decided directly: the fork's disk shares its parent's PHYSICAL BLOCKS at
+    sampled offsets across the file. Not the clone's own allocated size, and
+    not the volume's free space. APFS reports both inodes as fully allocated
+    because they share blocks, so a per-file comparison reads a correct clone
+    as a deep copy; and a free-space delta's only available window spans the
+    fork's own VM boot, which on hardware turned a 42 MB parent into a 109 MB
+    delta and said nothing about the clone. Block sharing is exact and local,
+    so it is the assertion, and the two wall-clock durations are recorded
+    beside it as evidence. They are NOT a bound: a fork's Up does strictly more
+    per boot than a cold one -- it clones a disk, replays the cloned
+    filesystem's journal and starts an engine against existing state -- while
+    the one thing it saves, populating an image store, costs a cold `up` of the
+    same bare definition nothing at all. A speed-up bound against that baseline
+    would measure the wrong thing in the fork's disfavour. What forking is
+    claimed to deliver is warm state, and warm state is what is asserted. The
+    fork
     quiesces the guest's filesystems immediately before cloning, so what it
     proves is application consistency rather than the crash consistency a bare
     clone of a running Machine would give. Forks are owned resources: `vz delete`

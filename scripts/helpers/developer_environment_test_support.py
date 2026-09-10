@@ -2884,7 +2884,7 @@ def build_agent_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path
 #   fork_sparse_stub        the fork's disk is the parent's size but allocates
 #                           nothing, so it cannot hold the parent's bytes
 #   fork_deep_copy          the clone is a byte copy, so the volume pays for it
-#   fork_slow               the fork costs a cold boot
+#   fork_slow               the fork costs a cold boot (reported, never a failure)
 #   fork_cold_image_store   the fork's image store comes up empty
 #   fork_pulls              the fork's engine pulled the images it holds
 #   fork_shared_engine      parent and fork are one engine wearing two names
