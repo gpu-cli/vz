@@ -81,6 +81,45 @@ Tracked under `vz-mzs.5`.
   (`crates/vz-guest-agent/src/docker.rs:588-600`), so `-p` binds inside the
   guest.
 
+## Step 5 measured, 2026-09-10: `offline` is declared and not enforced
+
+Step 5 is the last unlanded increment, and until it lands the runtime's ONE
+admitted egress policy is the one it does not implement. Measured from inside a
+Developer Linux Machine of a definition declaring nothing about networking, and
+therefore taking the default `EgressPolicy::Offline`, against candidate
+0.4.0-rc17:
+
+```
+eth0: 192.168.64.17/24, default via 192.168.64.1 dev eth0
+nslookup example.com      -> 172.66.147.243, 104.20.23.154 (via public 1.1.1.1)
+nc -w 5 1.1.1.1 443       -> REACHED
+wget http://example.com/  -> the page
+```
+
+This is not a surprise to the plan -- "Current state (verified)" below already
+describes the NAT NIC -- but the consequence is worth stating in one place,
+because it is invisible from the outside. `environment_up.rs` REFUSES every
+non-offline policy as unimplemented, so nothing ever contradicts the claim, and
+every Machine silently gets the permissive behaviour regardless of what it
+declared. Tracked as `vz-8cq`.
+
+### The two halves cannot ship separately
+
+Enforcing `offline` alone would be a correctness fix and a gate catastrophe.
+The `linux-docker` lane pulls `docker.io/library/python@sha256:...` from inside
+a Machine over exactly this NIC (`scripts/helpers/linux_docker_e2e.py:901`), as
+do the concurrency and registry suites. Sixty-three of the gate's eighty-five
+scenario rows run in that lane. So:
+
+* `offline` enforcement (attach no NAT NIC) and `allowed` (attach one, with a
+  host-side destination policy) land together, or every Docker row regresses;
+* every definition that pulls from a registry must declare `egress: allowed`,
+  which is the honest declaration and is what the criterion-20 matrix is for.
+
+`cidr` and `domain` may follow separately: they narrow `allowed` rather than
+enabling anything new, and criterion 20 records their absence as the schema's
+own refusal today.
+
 ## Substrate decision
 
 The contract forbids a shared NAT gateway address from being an authorization
