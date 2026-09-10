@@ -1344,3 +1344,496 @@ class PeerAddressTests(unittest.TestCase):
         """The clause it serves is `origin peer == edge` and `!= client`."""
         self.assertNotEqual(checks.peer_address("[::ffff:10.31.71.1]"),
                             checks.peer_address("[::ffff:10.31.71.200]"))
+
+
+TOP20 = e2e.CRITERION_20
+MATRIX_SLUG = "exhaustive_denial_matrix"
+# A plan whose every runtime-resolved value is present, so the enumeration under
+# test is the whole one rather than the degraded one a half-provisioned host
+# would produce.
+MATRIX_PLAN = {
+    "grants": {("dm-grant/machine-0", "host-loopback:15432", "tcp", 15432)},
+    "grant_machines": ["dm-grant/machine-0", "dm-grant/machine-1"],
+    "foreign_machines": ["rec-a/machine-0", "rec-b/machine-0", "rec-c/machine-0"],
+    "edge_machines": ["dm-edge/machine-0", "dm-edge/machine-1"],
+    "egress_machines": ["dm-egress/machine-0", "dm-egress/machine-1"],
+    "cidr_machine": "dm-cidr/machine-0",
+    "domain_machine": "dm-domain/machine-0",
+    "import_machines": ["dm-grant/machine-0", "dm-grant/machine-1", "rec-a/machine-0"],
+    "offline_machines": ["rec-a/machine-0", "rec-b/machine-0", "rec-c/machine-0",
+                         "dm-grant/machine-0", "dm-grant/machine-1"],
+    "lan_machines": ["rec-a/machine-0", "dm-grant/machine-0", "dm-grant/machine-1"],
+    "private_endpoint": "dm-grant/machine-0:probe",
+    "private_address": "10.31.71.4",
+    "private_token": "vzmtxpriv-unit",
+    "host_ports": [("host-loopback:15432", 15432, "granted"), ("host-loopback:15433", 15433, None),
+                   ("host-service:50000", 50000, "granted"), ("host-foil:50001", 50001, "foil")],
+    "host_service_port": 50000,
+    "host_service_token": "granted",
+    "export_host_port": 50002,
+    "undeclared_export_port": 50003,
+    "lan_addresses": [],
+    "edge_name": "api.one.test",
+    "edge_undeclared_name": "admin.one.test",
+    "edge_token": "vzmtxedge-unit",
+    "edge_anchors": {},
+}
+
+
+class DenialMatrixEnumerationTests(unittest.TestCase):
+    """Criterion 20's declaration, checked as data before anything probes it.
+
+    The artifact IS the deliverable here, so its shape is asserted directly:
+    the enumeration is a cartesian product whose expectations come from the set
+    of DECLARED grants, not from whatever a probe happened to return.
+    """
+
+    def cells(self, **overrides):
+        plan = dict(MATRIX_PLAN)
+        plan.update(overrides)
+        return checks.enumerate_denial_matrix(plan)
+
+    def test_the_declared_matrix_covers_every_class_protocol_and_expectation(self):
+        cells = self.cells()
+        self.assertEqual(sorted({cell.klass for cell in cells}), sorted(checks.DENIAL_MATRIX_CLASSES))
+        self.assertEqual(len(cells), checks.DENIAL_MATRIX_MINIMUM_ROWS)
+        self.assertEqual(len({cell.key for cell in cells}), len(cells))
+        self.assertLessEqual({"tcp", "udp"}, {cell.protocol for cell in cells})
+        self.assertEqual(sorted({cell.expected for cell in cells}), ["allow", "deny"])
+        # Every row the schema will see carries exactly its seven fields.
+        self.assertEqual(sorted(cells[0].row()),
+                         ["destination", "expected", "match", "observed", "port", "protocol", "source"])
+
+    def test_the_host_import_block_is_a_product_minus_the_declared_grants(self):
+        """The denials are what is LEFT once the grants are removed.
+
+        Chosen denials could quietly stop covering a port; a product cannot.
+        """
+        cells = [cell for cell in self.cells() if cell.klass.startswith("host_import")]
+        self.assertEqual(len(cells), len(MATRIX_PLAN["import_machines"]) * len(MATRIX_PLAN["host_ports"]) * 2)
+        allowed = [cell for cell in cells if cell.expected == "allow"]
+        self.assertEqual([cell.key for cell in allowed],
+                         [("dm-grant/machine-0", "host-loopback:15432", "tcp", 15432)])
+        self.assertEqual({cell.klass for cell in allowed}, {"host_import_declared"})
+        self.assertEqual({cell.klass for cell in cells if cell.expected == "deny"}, {"host_import_undeclared"})
+
+    def test_a_host_address_adds_lan_and_export_cells_rather_than_replacing_any(self):
+        base = self.cells()
+        widened = self.cells(lan_addresses=["10.31.99.2", "10.31.99.3"])
+        self.assertGreater(len(widened), len(base))
+        self.assertLessEqual({cell.key for cell in base}, {cell.key for cell in widened})
+
+    def test_an_unresolved_private_address_still_names_its_cells(self):
+        """A cell whose address was never discovered stays IN the table."""
+        cells = [cell for cell in self.cells(private_address=None)
+                 if cell.klass in ("private_in_environment", "private_cross_environment")]
+        self.assertEqual(len(cells), 5)
+        self.assertTrue(all(cell.destination.endswith("@unresolved") for cell in cells), cells[0].destination)
+
+
+class DenialMatrixGradingTests(unittest.TestCase):
+    """The comparison, exercised by handing it observations directly.
+
+    Each of these is the FAILING half of one of the check's assertions: a
+    stand-in observation with the wrong value, and the finding that must come
+    back out. The check's own assertions read exactly these functions.
+    """
+
+    def cell(self, expected, observed, *, klass="lan", source="rec-a/machine-0", token=None,
+             destination="lan:192.168.64.1", detail="exit 1"):
+        row = checks.MatrixCell(klass, source, destination, "tcp", 8080, expected,
+                                phase="open", probe="tcp", target="192.168.64.1", token=token)
+        row.index = 0
+        row.observed, row.detail = observed, detail
+        return row
+
+    def test_a_denial_that_succeeded_is_reported_as_an_unexpected_success(self):
+        findings = checks.denial_matrix_findings([self.cell("deny", "allow")])
+        self.assertEqual(len(findings["unexpected_success"]), 1)
+        self.assertEqual(findings["unmet_allow"], [])
+        self.assertIn("expected deny, observed allow", findings["unexpected_success"][0].label())
+
+    def test_an_allow_that_was_refused_is_reported_separately(self):
+        """The two directions must not be reported as one kind of failure."""
+        findings = checks.denial_matrix_findings([self.cell("allow", "deny")])
+        self.assertEqual(len(findings["unmet_allow"]), 1)
+        self.assertEqual(findings["unexpected_success"], [])
+        self.assertEqual(findings["indeterminate"], [])
+
+    def test_an_answer_without_the_destinations_token_is_neither(self):
+        observed, detail = checks.observe_matrix_cell(
+            self.cell("allow", "allow", token="granted"), 0, "some other body")
+        self.assertEqual(observed, "error")
+        self.assertIn("without the destination's token granted", detail)
+        findings = checks.denial_matrix_findings([self.cell("deny", "error", detail=detail)])
+        self.assertEqual(len(findings["indeterminate"]), 1)
+        self.assertEqual(findings["unexpected_success"], [])
+
+    def test_a_cell_nothing_ran_is_unexercised_and_never_a_denial(self):
+        cell = checks.MatrixCell("lan", "rec-a/machine-0", "lan:192.168.64.1", "tcp", 8080, "deny",
+                                 phase="open", probe="tcp", target="192.168.64.1")
+        self.assertEqual((cell.observed, cell.detail), ("error", checks.MATRIX_NOT_EXECUTED))
+        findings = checks.denial_matrix_findings([cell])
+        self.assertEqual(len(findings["unexecuted"]), 1)
+        self.assertEqual(findings["executed"], [])
+        self.assertEqual(findings["indeterminate"], [])
+
+    def test_observation_reads_the_exit_status_and_the_token_and_nothing_else(self):
+        served = self.cell("allow", "allow", token="granted")
+        self.assertEqual(checks.observe_matrix_cell(served, 0, "granted")[0], "allow")
+        self.assertEqual(checks.observe_matrix_cell(served, 1, "granted")[0], "deny")
+        self.assertEqual(checks.observe_matrix_cell(served, None, "")[0], "error")
+        tokenless = self.cell("deny", "deny")
+        self.assertEqual(checks.observe_matrix_cell(tokenless, 0, "")[0], "allow")
+
+    def egress_cells(self, permissive_internet, restricted_internet, permissive_import, restricted_import):
+        rows = []
+        for source, destination, expected, observed in (
+                ("dm-egress/machine-0", "internet:1.1.1.1", "allow", permissive_internet),
+                ("dm-egress/machine-1", "internet:1.1.1.1", "deny", restricted_internet),
+                ("dm-egress/machine-0", "host-loopback:15432", "allow", permissive_import),
+                ("dm-egress/machine-1", "host-loopback:15432", "deny", restricted_import)):
+            klass = "internet_allowed" if (source.endswith("0") and "internet" in destination) \
+                else "egress_attachment_crosstalk"
+            row = checks.MatrixCell(klass, source, destination, "tcp", 443, expected,
+                                    phase="open", probe="tcp", target="1.1.1.1")
+            row.observed, row.detail = observed, "exit 0"
+            rows.append(row)
+        return rows
+
+    def test_two_attachments_that_behave_alike_fail_the_egress_clause(self):
+        """`both worked` is exactly what the clause must be able to refuse."""
+        self.assertEqual(checks.egress_attachment_findings(
+            self.egress_cells("allow", "deny", "allow", "deny")), [])
+        both_online = checks.egress_attachment_findings(
+            self.egress_cells("allow", "allow", "allow", "deny"))
+        self.assertEqual(len(both_online), 1)
+        self.assertIn("Internet policy", both_online[0])
+        self.assertIn("machine-1 observed allow", both_online[0])
+        shared_import = checks.egress_attachment_findings(
+            self.egress_cells("allow", "deny", "allow", "allow"))
+        self.assertEqual(len(shared_import), 1)
+        self.assertIn("host import", shared_import[0])
+
+    def test_the_egress_clause_refuses_a_matrix_with_only_one_machine(self):
+        rows = [row for row in self.egress_cells("allow", "deny", "allow", "deny")
+                if row.source.endswith("machine-0")]
+        findings = checks.egress_attachment_findings(rows)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("exactly two Machines", findings[0])
+
+
+class DenialMatrixProbeTests(unittest.TestCase):
+    """The probe text and its parser, which decide what every cell observed."""
+
+    def cell(self, probe, port=8080, target="127.0.0.1", ca_file=None):
+        row = checks.MatrixCell("lan", "rec-a/machine-0", "d", "tcp", port, "deny",
+                                phase="open", probe=probe, target=target, ca_file=ca_file)
+        row.index = 7
+        return row
+
+    def test_each_protocol_is_probed_by_the_tool_that_speaks_it(self):
+        self.assertIn("wget", checks.matrix_probe_command(self.cell("tcp")))
+        self.assertIn("nc -u", checks.matrix_probe_command(self.cell("udp")))
+        self.assertIn("ping", checks.matrix_probe_command(self.cell("icmp")))
+        self.assertIn("nslookup", checks.matrix_probe_command(self.cell("dns")))
+        https = checks.matrix_probe_command(self.cell("https", target="api.one.test", ca_file="/run/vz-edge/own.pem"))
+        self.assertIn(checks.GUEST_FETCH, https)
+        self.assertIn("--ca-file /run/vz-edge/own.pem", https)
+        # A host cell is a URL for curl, never a guest command line.
+        self.assertEqual(checks.matrix_probe_command(self.cell("host_tcp")), "http://127.0.0.1:8080/")
+
+    def test_a_cell_reports_its_own_index_status_and_bytes(self):
+        script = checks.matrix_probe_script([self.cell("tcp")])
+        self.assertIn("CELL 7 %s", script)
+        receipt = _Receipt(b"CELL 7 0 served-token \nnoise\n")
+        self.assertEqual(checks.parse_matrix_probe(receipt), {7: (0, "served-token ")})
+
+    def test_a_line_that_is_not_a_cell_result_is_not_read_as_one(self):
+        receipt = _Receipt(b"CELL x 0 body\nCELL 7 notanumber body\nCELL\nrandom\n")
+        self.assertEqual(checks.parse_matrix_probe(receipt), {})
+
+    def test_the_preflight_reports_the_applets_this_image_actually_carries(self):
+        applets, fetch = checks.parse_matrix_preflight(_Receipt(b"APPLET wget\nAPPLET awk\nFETCH no\n"))
+        self.assertEqual(applets, {"wget", "awk"})
+        self.assertFalse(fetch)
+        applets, fetch = checks.parse_matrix_preflight(_Receipt(b"APPLET nc\nFETCH yes\n"))
+        self.assertTrue(fetch)
+
+    def test_a_cell_needing_a_missing_applet_names_that_applet(self):
+        self.assertEqual(checks.matrix_tool_requirement(self.cell("udp")), "tool:rec-a/machine-0:nc")
+        self.assertEqual(checks.matrix_tool_requirement(self.cell("https")),
+                         f"tool:rec-a/machine-0:{checks.GUEST_FETCH}")
+        # Host cells run on the host and need no guest applet at all.
+        self.assertIsNone(checks.matrix_tool_requirement(self.cell("host_tcp")))
+
+
+class _Receipt:
+    """The two fields `parse_matrix_probe` reads off a recorded invocation."""
+
+    def __init__(self, stdout: bytes, exit_code: int = 0):
+        self.stdout = stdout
+        self.stderr = b""
+        self.exit_code = exit_code
+
+
+class DenialMatrixLaneTests(unittest.TestCase):
+    """Criterion 20 against the fake CLI, once honestly and once per broken mode.
+
+    Every test here breaks exactly ONE thing and requires the check to name it.
+    The fixture is deliberately the same one criterion 7 is falsified against:
+    `import_any_port` and `import_any_machine` are real stand-in modes that
+    defeat a real clause, so the matrix has to catch them the same way the
+    per-clause check does -- and the two structural modes below make sure a
+    matrix that lost rows cannot pass by having nothing left to disagree with.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vztl-", dir="/private/tmp"))
+        self.mode_file = self.tmp / "mode"
+        self.release = support.build_fake_release(self.tmp / "release", mode_file=self.mode_file)
+        self.contract = contract_module.load_contract()
+        self.lane = contract_module.lane_by_name(self.contract)["topology"]
+        self.counter = 0
+        self.roots = 0
+        self.state_root = None
+        unstaged = mock.patch.dict(os.environ, {checks.LEGACY_ARTIFACT_ENV: str(self.tmp / "unstaged-v0320")})
+        unstaged.start()
+        self.addCleanup(unstaged.stop)
+
+    def tearDown(self):
+        fixtures.make_writable(self.release)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def fresh_root(self) -> None:
+        """A state root per pre-sleep/post-wake pair.
+
+        A test that runs the pair twice is running two gate runs, and the
+        second must not find the first's isolates: `ctx.isolated` creates its
+        directory exclusively, exactly as a real run does, and reusing a root
+        would make the second run fail on the first run's leftovers rather than
+        on the thing the test is about.
+        """
+        self.roots += 1
+        self.state_root = self.tmp / DEEP_STATE_ROOT_PADDING / f"state-{self.roots}"
+        socket_root = recorder.socket_root_for(self.state_root)
+        self.addCleanup(shutil.rmtree, socket_root, ignore_errors=True)
+        self.addCleanup(self.stop_lane_daemons, self.state_root)
+
+    def stop_lane_daemons(self, root: Path):
+        state = e2e.LaneState(root, self.release / "bin")
+        if not state.root.exists():
+            return
+        try:
+            e2e.stop_daemons(state)
+        except e2e.CleanupError:
+            pass
+
+    def evidence(self) -> Path:
+        self.counter += 1
+        path = self.tmp / f"evidence-{self.counter}"
+        path.mkdir()
+        return path
+
+    def argv(self, phase: str, evidence: Path, handoff) -> list:
+        ctx = lanes.LaneContext(run_id=RUN_ID, release_dir=self.release, release_dir_sha256=DIGEST,
+                                state_root=self.state_root,
+                                contract_path=common.REPO_ROOT / common.CONFIG_FILES["e2e_contract"],
+                                contract_sha256=DIGEST, candidate_tuple_sha256=DIGEST, fixture_sha256=DIGEST,
+                                clients={})
+        return lanes.lane_argv(self.lane, ctx, phase, evidence, handoff)
+
+    def post_wake(self, mode: str = "", patches=()):
+        """pre-sleep, then post-wake with `patches` in force, and the matrix row.
+
+        clean-provision is skipped deliberately: pre-sleep creates the lane
+        state root itself, and running that whole phase's sub-checks to exercise
+        one post-wake sub-check is most of the runtime for none of the evidence.
+        """
+        self.mode_file.write_text(mode)
+        self.fresh_root()
+        handoff = self.tmp / "state-handoff.deadbeef.json"
+        if not handoff.exists():
+            handoff.write_bytes(b"{}\n")
+        evidence = self.evidence()
+        e2e.main(self.argv("persisted-recovery/pre-sleep", evidence, str(handoff)),
+                 codesign_verifier=fixtures.fake_codesign_verifier)
+        evidence = self.evidence()
+        for patch in patches:
+            patch.start()
+        try:
+            e2e.main(self.argv("persisted-recovery/post-wake", evidence, str(handoff)),
+                     codesign_verifier=fixtures.fake_codesign_verifier)
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+        result = common.load_json(evidence / "lane-result.json")
+        self.assertEqual(schema.validate("lane-result", result), [])
+        row = next(s for s in result["scenarios"] if s["id"].endswith("__" + MATRIX_SLUG))
+        return evidence, result, row
+
+    def failures(self, row: dict) -> list:
+        return [text for text in row["assertions"] if text.startswith("FAILED:")]
+
+    def named(self, row: dict, needle: str) -> list:
+        return [text for text in self.failures(row) if needle in text]
+
+    # -- the honest run -----------------------------------------------------------
+    def test_the_matrix_is_declared_executed_graded_and_written(self):
+        evidence, result, row = self.post_wake()
+        self.assertEqual(self.failures(row), [], row["assertions"])
+        self.assertEqual(row["status"], "FAIL")
+        # FAIL only because cells this runtime cannot offer stayed unexercised,
+        # and the reason is the refusing component's own words.
+        unexercised = [a for a in row["assertions"] if a.startswith("not_implemented:")]
+        self.assertEqual(len(unexercised), 1, row["assertions"])
+        self.assertIn("adapter is not implemented", unexercised[0])
+        self.assertIn("is not one of ['offline', 'allowed']", unexercised[0])
+        self.assertIn(TOP20, {s["id"] for s in result["scenarios"]})
+        # The artifact, re-read from the file the aggregate validator will read.
+        self.assertIn(checks.DENIAL_MATRIX_EVIDENCE, result["evidence_files"])
+        matrix = common.load_json(evidence / checks.DENIAL_MATRIX_EVIDENCE)
+        self.assertEqual(schema.validate("connectivity-matrix", matrix), [])
+        self.assertEqual((matrix["kind"], matrix["run_id"], matrix["scenario_id"]),
+                         (checks.DENIAL_MATRIX_KIND, RUN_ID, TOP20))
+        self.assertGreaterEqual(len(matrix["rows"]), checks.DENIAL_MATRIX_MINIMUM_ROWS)
+        self.assertEqual(sorted({entry["expected"] for entry in matrix["rows"]}), ["allow", "deny"])
+        # Every cell that ran agreed with its declaration; every cell that did
+        # not is `error`, which is not a denial anybody may claim.
+        executed = [r for r in matrix["rows"] if r["observed"] != "error"]
+        self.assertTrue(all(r["match"] for r in executed), [r for r in executed if not r["match"]])
+        self.assertTrue(any(r["expected"] == "allow" and r["observed"] == "allow" for r in executed))
+        self.assertTrue(any(r["expected"] == "deny" and r["observed"] == "deny" for r in executed))
+        # The three Environments pre-sleep left running really are sources.
+        self.assertTrue(any(r["source"].startswith("rec-") for r in matrix["rows"]))
+
+    # -- unexpected success, the criterion's own hard failure ----------------------
+    def test_a_guest_that_relays_any_host_port_fails_the_matrix(self):
+        """`import_any_port`: a granted Machine reaches undeclared host ports."""
+        _evidence, _result, row = self.post_wake(mode="import_any_port")
+        named = self.named(row, "unexpected success is what fails this criterion")
+        self.assertEqual(len(named), 1, row["assertions"])
+        self.assertIn("expected deny, observed allow", named[0])
+        self.assertIn("host-service:", named[0])
+        self.assertEqual(self.named(row, "was observed allow; a declared path"), [])
+
+    def test_a_grant_honoured_on_the_wrong_machine_fails_the_matrix(self):
+        """`import_any_machine`: the sibling relays machine-0's grant."""
+        _evidence, _result, row = self.post_wake(mode="import_any_machine")
+        named = self.named(row, "unexpected success is what fails this criterion")
+        self.assertEqual(len(named), 1, row["assertions"])
+        self.assertIn("dm-grant/machine-1 -> host-loopback:15432", named[0])
+
+    # -- the other two kinds, reported as themselves -------------------------------
+    def test_a_declared_import_that_does_not_serve_is_an_unmet_allow(self):
+        """The runtime applies the grant to a port nobody declared."""
+        original = checks.matrix_definition
+
+        def elsewhere(release_dir, *, host_port, export_host_port):
+            definition = original(release_dir, host_port=host_port, export_host_port=export_host_port)
+            definition["environment"]["host_imports"][0]["guest_port"] = 15999
+            return definition
+
+        _evidence, _result, row = self.post_wake(
+            patches=(mock.patch.object(checks, "matrix_definition", elsewhere),))
+        named = self.named(row, "was observed allow; a declared path that did not serve")
+        self.assertEqual(len(named), 1, row["assertions"])
+        self.assertIn("dm-grant/machine-0 -> host-loopback:15432", named[0])
+        self.assertIn("expected allow, observed deny", named[0])
+        # The opposite direction is NOT claimed: nothing succeeded that should
+        # not have, and the evidence has to keep the two apart.
+        self.assertEqual(self.named(row, "unexpected success is what fails this criterion"), [])
+
+    def test_an_origin_that_cannot_name_itself_is_indeterminate_not_a_denial(self):
+        """Something answered, and it was not the destination the cell names."""
+        original = checks.origin_script
+        _evidence, _result, row = self.post_wake(
+            patches=(mock.patch.object(checks, "origin_script",
+                                       lambda _token: original("vzmtx-imposter")),))
+        named = self.named(row, "no cell was answered by something that could not name itself")
+        self.assertEqual(len(named), 1, row["assertions"])
+        self.assertIn("observed error", named[0])
+        self.assertEqual(self.named(row, "unexpected success is what fails this criterion"), [])
+
+    # -- the matrix analogue of a sub-check that never ran -------------------------
+    def test_a_probe_loop_that_leaves_a_cell_unreported_fails(self):
+        """A cell nobody probed must never read as a denial that held."""
+        original = checks.matrix_probe_script
+
+        def drop_last(cells):
+            return original(cells[:-1]) if len(cells) > 1 else original(cells)
+
+        _evidence, _result, row = self.post_wake(
+            patches=(mock.patch.object(checks, "matrix_probe_script", drop_last),))
+        self.assertEqual(len(self.named(row, "was probed and reported a result of its own")), 1,
+                         row["assertions"])
+        self.assertEqual(len(self.named(row, "every unexercised cell names the resource")), 1,
+                         row["assertions"])
+
+    def test_an_enumeration_that_lost_a_destination_class_fails(self):
+        original = checks.enumerate_denial_matrix
+
+        def without_control_plane(plan):
+            return [cell for cell in original(plan) if cell.klass != "control_plane"]
+
+        _evidence, _result, row = self.post_wake(
+            patches=(mock.patch.object(checks, "enumerate_denial_matrix", without_control_plane),))
+        self.assertEqual(len(self.named(row, "every destination class the criterion names")), 1,
+                         row["assertions"])
+
+    def test_an_enumeration_that_lost_rows_a_protocol_or_an_expectation_fails(self):
+        original = checks.enumerate_denial_matrix
+
+        def truncated(plan):
+            return original(plan)[:10]
+
+        def without_udp(plan):
+            return [cell for cell in original(plan) if cell.protocol != "udp"]
+
+        def duplicated(plan):
+            cells = original(plan)
+            return [*cells, cells[0]]
+
+        def only_denials(plan):
+            cells = original(plan)
+            for cell in cells:
+                cell.expected = "deny"
+            return cells
+
+        for mutation, needle in ((truncated, f"floor {checks.DENIAL_MATRIX_MINIMUM_ROWS}"),
+                                 (without_udp, "at least TCP and UDP"),
+                                 (duplicated, "is a distinct source x destination"),
+                                 (only_denials, "declares both expectations")):
+            with self.subTest(needle=needle):
+                _evidence, _result, row = self.post_wake(
+                    patches=(mock.patch.object(checks, "enumerate_denial_matrix", mutation),))
+                self.assertEqual(len(self.named(row, needle)), 1, row["assertions"])
+
+    def test_an_artifact_that_does_not_carry_every_declared_cell_fails(self):
+        original = checks.denial_matrix_document
+
+        def lossy(run_id, scenario_id, cells):
+            payload = original(run_id, scenario_id, cells)
+            payload["rows"] = payload["rows"][:-1]
+            return payload
+
+        def unschemad(run_id, scenario_id, cells):
+            payload = original(run_id, scenario_id, cells)
+            payload["rows"][0]["protocol"] = "sctp"
+            return payload
+
+        _evidence, _result, row = self.post_wake(
+            patches=(mock.patch.object(checks, "denial_matrix_document", lossy),))
+        self.assertEqual(len(self.named(row, "carries one row per declared cell")), 1, row["assertions"])
+        self.assertEqual(len(self.named(row, "names exactly the declared cells")), 1, row["assertions"])
+        _evidence, _result, row = self.post_wake(
+            patches=(mock.patch.object(checks, "denial_matrix_document", unschemad),))
+        self.assertEqual(len(self.named(row, "is not schema-valid")), 1, row["assertions"])
+
+    def test_an_environment_that_did_not_survive_the_checkpoint_is_named(self):
+        """The three Environments are the matrix's sources, not decoration."""
+        original = e2e.RECOVERY_ISOLATES
+        with mock.patch.object(e2e, "RECOVERY_ISOLATES", original[:2]):
+            _evidence, _result, row = self.post_wake()
+        self.assertEqual(len(self.named(row, "addressable as matrix sources")), 1, row["assertions"])
+        self.assertIn("observed ['rec-a', 'rec-b']", self.named(row, "addressable as matrix sources")[0])
