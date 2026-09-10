@@ -131,9 +131,10 @@ proves nothing. The gate criterion pins measured bounds:
   is not against a remembered number;
 - the fork's Docker image store **contains its parent's images without pulling**,
   proven by image digests present and a pull count of zero;
-- forking **does not deep-copy the disk** -- host allocated-size growth is a
-  fraction of the parent's logical size, which is what makes copy-on-write
-  observable rather than assumed.
+- forking **does not deep-copy the disk** -- the volume's free space falls by a
+  small fraction of the parent's allocated size, which is what makes
+  copy-on-write observable rather than assumed. Free space, not per-file
+  allocated size; the measurement below says why.
 
 ### Measured, 2026-09-09
 
