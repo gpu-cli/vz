@@ -1,7 +1,7 @@
 # vz 0.4.0: where it stands
 
 Status: living summary, rewritten when a gate run changes it
-Last measured: 2026-09-10, release candidate `0.4.0-rc2`, Apple-silicon macOS 26.3.1
+Last measured: 2026-09-10, release candidate `0.4.0-rc3`, Apple-silicon macOS 26.3.1
 
 This is the short answer to "what's left". The gate itself is
 [GOAL-0.4.0.md](GOAL-0.4.0.md); this file says which of its claims are proved,
@@ -17,17 +17,25 @@ failing in a heap.
 ## What the last hardware run proved
 
 Topology lane, clean-provision phase, against a locally signed release candidate
-with a registered native macOS target. **Eleven of fifteen sub-checks pass.**
+with a registered native macOS target and guest bundles built from source.
+**Thirteen of sixteen sub-checks pass.**
 
 | Passing on hardware | |
 |---|---|
 | criterion 1 | three concurrent Environments, no collision |
 | criterion 2 | mixed Linux + native macOS topology and status |
 | criterion 15 | CLI/API agreement, including live gRPC and the status field set |
+| criterion 19 | clean install, upgrade from the pinned v0.3.20 fixture, injected migration failure and rollback, uninstall |
 | criterion 21 | legacy CLI removal, bare help, bootstrap rules |
 
 Criterion 2 is the notable one: a native macOS Machine boots, is supervised, and
-reports correctly beside Linux Machines in one Environment.
+reports correctly beside Linux Machines in one Environment. Criterion 19 is the
+most substantive: it opens the restored store with the real v0.3.20 daemon.
+
+Zero daemons leak. Earlier runs left eight to ten alive, which on this host
+exhausts the macOS virtual-machine cap and makes every later Environment fail
+with `VZErrorDomain:6` -- three criteria failed that way before it was found,
+with evidence blaming the Environment rather than the daemons nobody stopped.
 
 ## What is in the way, in the order it blocks things
 
@@ -82,15 +90,34 @@ cannot pass. None of them is a harness gap.
    digest, and sweeps seven artifact groups for the literal bytes.
    *Blocks criterion 18's secrets clause.*
 
-8. **A guest RPC was added without bumping `AGENT_PROTOCOL_REVISION`.** The
+8. **A host import declared for a stream protocol also passes UDP** to the same
+   guest port. A grant that widens from what was declared is the same class of
+   defect as treating a NAT alias as authorization: the boundary is not where
+   the declaration says it is. Newly visible -- until the guest bundle was
+   rebuilt, criterion 7 failed at `up` and never reached its own claims.
+
+9. **A guest RPC was added without bumping `AGENT_PROTOCOL_REVISION`.** The
    handshake that exists to refuse a stale guest passed, and the guest answered
    `Unimplemented` deep inside `up` instead. The revision is a hand-maintained
-   constant with nothing tying it to the surface it describes.
+   constant with nothing tying it to the surface it describes. Note the
+   release-grade build path already prevents this by rebuilding both bundles
+   every time; only the `--reuse-guest-bundles` DEV shortcut exposes it.
+
+### P2
+
+10. **A host export port collision is refused without a structured error.** The
+    port is not silently shared, which is the half that matters, but stderr is
+    empty -- no envelope, no machine-readable code, so an agent cannot tell a
+    collision from any other refusal.
 
 ## What the gate will not tell you yet
 
-- **The fork check has never run against real VMs.** Two bounds a first real run
-  must settle: `FORK_SPEEDUP_MIN = 2.0` and `FORK_FREE_SPACE_FRACTION = 0.25`.
+- **The fork check has now run against real VMs and does not yet get far enough
+  to measure.** It brings the parent Environment up, records its identities and
+  round-trips a sentinel, then fails importing a warm image into the parent's
+  own engine: `docker --context <name>` cannot resolve a context whose name
+  `vz status` itself just reported. Two bounds a first *complete* run must still
+  settle: `FORK_SPEEDUP_MIN = 2.0` and `FORK_FREE_SPACE_FRACTION = 0.25`.
   The free-space window spans the whole `up`, so it carries the fork's own boot
   writes. The check records the cold Up's wall time and free-space delta beside
   the fork's so those bounds can be judged from evidence; revising them is a
