@@ -11,6 +11,7 @@ still moves when anything about it moves.
 import hashlib
 import os
 import re
+import socket
 import stat
 import types
 from pathlib import Path
@@ -352,3 +353,42 @@ class MachineExecArgvTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StraySocketTests(unittest.TestCase):
+    """A socket file is only a leak while something is answering on it."""
+
+    def lane(self, tmp: str) -> subject.LaneState:
+        state = subject.LaneState(Path(tmp) / "state", Path(tmp) / "bin")
+        state.create()
+        return state
+
+    def test_a_socket_nobody_is_listening_on_is_not_a_leak(self):
+        # Criterion 19's migration exercise leaves exactly this behind on every
+        # run: a socket with no PID file and nothing serving it. Counting it
+        # failed the whole topology lane on cleanup, and the lane is
+        # all-or-nothing, so every row it would have carried went with it.
+        with tempfile.TemporaryDirectory(prefix="vz04-stray-") as tmp:
+            state = self.lane(tmp)
+            runtime = state.socket_root / "migr"
+            runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+            abandoned = runtime / "d.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(abandoned))
+            listener.listen(1)
+            listener.close()          # the file survives; nothing serves it
+            self.assertTrue(abandoned.exists())
+            self.assertEqual(subject.stray_sockets(state), [])
+
+    def test_a_socket_something_is_still_serving_is_a_leak(self):
+        """The exemption is evidence, not amnesty for a filename."""
+        with tempfile.TemporaryDirectory(prefix="vz04-stray-") as tmp:
+            state = self.lane(tmp)
+            runtime = state.socket_root / "migr"
+            runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+            served = runtime / "d.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(listener.close)
+            listener.bind(str(served))
+            listener.listen(1)
+            self.assertEqual(subject.stray_sockets(state), [served])

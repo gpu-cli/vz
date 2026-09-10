@@ -79,6 +79,22 @@ RECOVERY_ISOLATES = ("rec-a", "rec-b", "rec-c")
 RECOVERY_RECORD = "persisted-recovery-environments.json"
 
 
+def describe_leaks(leaks: list) -> str:
+    """Say what actually leaked, by kind and by name.
+
+    This read "N live processes reference the lane state root" whatever the
+    leaks were, so a run that leaked two SOCKETS sent its reader looking for
+    processes that had never existed. A cleanup failure is only useful if it
+    names the thing that did not get cleaned up.
+    """
+    kinds = {}
+    for leak in leaks:
+        kinds.setdefault(leak["kind"], []).append(leak["identifier"])
+    return "; ".join(f"{len(names)} {kind}(s) still reference the lane state root: "
+                     + ", ".join(name[:120] for name in names[:4])
+                     for kind, names in sorted(kinds.items()))
+
+
 class Rejected(Exception):
     """Argument/contract/release admission failure (exit 2)."""
 
@@ -420,8 +436,7 @@ class Lane:
         if (cleanup_errors or leaks) and result["failure"] is None:
             result["outcome"] = "failed"
             result["failure"] = {"reason": "cleanup", "detail": "; ".join(cleanup_errors) or
-                                 f"{len(leaks)} live processes still reference the lane state root",
-                                 "exit_code": EXIT_FAILED}
+                                 describe_leaks(leaks), "exit_code": EXIT_FAILED}
             code = EXIT_FAILED
         if result["failure"] is not None:
             result["failure"]["detail"] += f"; lane state root inventory {len(rows)} entries"
@@ -705,7 +720,7 @@ class Lane:
             base["failure"] = {"reason": "uncertain_effects", "detail": f"observers with uncertain effects: {names[:10]}; " + detail, "exit_code": EXIT_FAILED}
             code = EXIT_FAILED
         elif cleanup_errors or leaks:
-            base["failure"] = {"reason": "cleanup", "detail": "; ".join(cleanup_errors) or f"{len(leaks)} live processes reference the lane state root", "exit_code": EXIT_FAILED}
+            base["failure"] = {"reason": "cleanup", "detail": "; ".join(cleanup_errors) or describe_leaks(leaks), "exit_code": EXIT_FAILED}
             code = EXIT_FAILED
         elif summary["FAIL"]:
             base["failure"] = {"reason": "assertion", "detail": detail, "exit_code": EXIT_FAILED}

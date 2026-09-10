@@ -18,6 +18,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import socket
 import signal
 import stat
 import subprocess
@@ -553,10 +554,39 @@ def daemon_artifacts(state: LaneState) -> list:
 
 
 def stray_sockets(state: LaneState) -> list:
-    """Sockets under either lane root without a daemon PID file beside them."""
-    return [root / relative for root in state.roots()
-            for relative, kind, _m, _s, _d in inventory(root)
-            if kind == "socket" and not (root / relative).with_suffix(".pid").exists()]
+    """Sockets under either lane root that something is still LISTENING on.
+
+    A socket file with no PID file beside it is the shape a leaked daemon leaves,
+    which is why they are looked for. But it is also the shape an ordinary
+    leftover file leaves, and the two are not the same thing: criterion 19's
+    migration exercise leaves `migf/.../s` and `migr/d.sock` behind on every run
+    with nothing behind either, and reporting those as leaks failed the whole
+    topology lane on cleanup -- every row it would have carried -- after all
+    nineteen real daemons had stopped gracefully.
+
+    So the question asked is the one that matters: is anything accepting
+    connections there? A daemon still serving answers; a leftover file refuses.
+    That is the same distinction the empty-PID rule draws, decided the same way,
+    by evidence rather than by the presence of an artifact.
+    """
+    listening = []
+    for root in state.roots():
+        for relative, kind, _m, _s, _d in inventory(root):
+            path = root / relative
+            if kind != "socket" or path.with_suffix(".pid").exists():
+                continue
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(2)
+            try:
+                probe.connect(str(path))
+            except OSError:
+                # Refused, absent, or unreachable: nothing is serving here, so
+                # this cannot be a daemon that outlived the sweep.
+                continue
+            finally:
+                probe.close()
+            listening.append(path)
+    return listening
 
 
 def stop_daemons(state: LaneState) -> list:
