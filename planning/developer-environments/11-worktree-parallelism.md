@@ -92,6 +92,44 @@ expressible today and is deliberately out of scope: three compose stacks in one
 Docker engine collide on container names and published ports, which is the
 problem Machines exist to avoid.
 
+## What the implementation found
+
+Recorded here because two of them contradict what this document assumed.
+
+- **The default label is a published rule, not a lookup.** Every character
+  outside `[A-Za-z0-9._-]` becomes `-`, runs collapse, truncate at 64. So
+  `feat/third-environment` addresses as `backend@feat-third-environment`, and an
+  agent can compute the address before the fork exists rather than having to
+  read it back.
+- **`vz exec --machine backend@feat-x` needed no change.** A fork's
+  `MachineInstance.name` IS `backend@feat-x`, so the existing exact-name match
+  resolves it and `UNIQUE(environment_id, name)` makes it unambiguous by
+  construction. The `@` is spelling, not a second lookup dimension.
+- **Only one file is copied.** A Developer Linux Machine has no root disk -- it
+  boots kernel plus initramfs -- so the warm state IS the Docker data disk, at
+  `<store>/data/docker-machines/<sha256(stack_id)>/data.img`. And because
+  `stack_id` derives from `(project, environment, machine_id)`, the fork's disk
+  lands at its own path with no rename step.
+- **"`delete` already provides the discard half" was wrong**, and not by a
+  wiring gap. Every teardown primitive is fenced on a persisted
+  `EnvironmentLifecycleOperation` whose structure check requires one machine
+  step per Machine in the Environment, so a fork-scoped Delete is refused by
+  that invariant. Reclaiming one fork needs a machine-scoped lifecycle
+  operation, which is real work in `vz-stack` and is tracked separately. Until
+  it lands `vz delete --machine` refuses rather than half-reclaiming: a partial
+  teardown leaks a host Docker context and a runtime store while the ownership
+  rows claim reclamation, which is the exact unaccounted state the ownership
+  design exists to prevent.
+- **The directory-tree clone already existed.** `clone_path` in
+  `vz-macos-provision` has wrapped `clonefile(2)` for trees, with tests for
+  recursion, symlinks and inode separation, since before this work started. The
+  `OwnedResourceKind::MachineFork` variant was still needed, but for a different
+  reason than assumed: it marks a Machine as runtime-minted rather than
+  declared, which is what exempts it from reconciliation.
+- **Fork of a fork is refused**, so one label is one address; forking is
+  Linux-only, because macOS Machines are shared by design; and the parent must
+  have booted once, because seeding needs its Docker disk to exist.
+
 ## Naming, so an agent can target an instance
 
 Forks are addressed as `<machine>@<label>`, where the label is caller-supplied
@@ -167,6 +205,26 @@ Two findings that change how the criterion must be written:
   filesystems immediately before the clone -- quiescing without stopping -- and
   the criterion should say which of the two consistencies it proves.
 
+## Endpoints: a fork publishes none
+
+The design was silent here and it cannot stay silent. Endpoint, host-export and
+host-import names are `UNIQUE(environment_id, name)`, and a host export owns a
+host port. Two forks of `backend` cannot both publish `api` on 8080, so either
+forking mints new names -- which an agent then cannot predict -- or it mints
+none.
+
+**A fork mints no endpoints, no host exports and no host imports.** It is
+reachable at its own derived fabric address and addressable as
+`<machine>@<label>` through `exec`; it does not answer the parent's declared
+names. This is the same reasoning the section above already applies to three
+Compose stacks in one Docker engine, carried to its conclusion: the declared
+names belong to the declared topology, and a runtime object does not get to
+claim them.
+
+The consequence to accept is that a fork is for work an agent drives -- build,
+test, exec -- rather than for serving the Environment's public-like ingress. A
+worktree that needs its own ingress needs its own Environment.
+
 ## Ownership and reconciliation
 
 - **Forks are owned resources.** `OwnedResourceKind` carries them so Delete
@@ -184,10 +242,14 @@ Two findings that change how the criterion must be written:
 
 ## Open questions
 
-1. ~~**Can a running Machine's disk be cloned?**~~ **Answered above: yes, in
-   milliseconds, for kilobytes, without stopping the parent.** What remains is
-   the narrower question of quiescing the guest before the clone so the fork is
-   application-consistent rather than merely crash-consistent.
+1. ~~**Can a running Machine's disk be cloned?**~~ ~~**What remains is the
+   narrower question of quiescing the guest before the clone.**~~ **Both
+   answered.** The clone is milliseconds and kilobytes and does not stop the
+   parent, and the fork now runs `/bin/sync` in the parent guest through the
+   agent channel immediately before cloning, bounded at 30 seconds, so the fork
+   is application-consistent. A parent that is not running has nothing in
+   flight; a sync that fails proceeds crash-consistent and says so rather than
+   hanging.
 2. **What seeds the first Machine of a project?** Cloning a running sibling is
    implicit and surprising; a declared baseline is explicit but needs a way to
    promote a warmed Machine, which is imperative and wants a verb the CLI
