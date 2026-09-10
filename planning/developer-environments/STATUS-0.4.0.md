@@ -14,7 +14,29 @@ The **harness is finished** and **four more topology criteria closed on
 template the gate host does not provision, a pinned v0.3.20 daemon that is not
 committed, and one destination policy.
 
-## What the hardware runs proved on 2026-09-10
+## Full topology lane: 15 of 17 sub-checks pass
+
+Two independent full-lane clean-provision runs against `0.4.0-rc19`, identical
+result, `leaks [] cleanup_errors []` on both:
+
+```
+PASS  bare_help, legacy_rejection, clean_up_refuses, bootstrap_read_only,
+      bootstrap_creates_default, help_surface_exact, error_envelope_agreement,
+      status_json_field_set, grpc_api_live_agreement,
+      three_concurrent_no_collision, public_like_ingress,
+      host_import_export_boundaries, workspace_storage_policy,
+      install_upgrade_rollback_uninstall, machine_fork
+FAIL  private_topology_paths
+n/i   mixed_profile_topology_status
+```
+
+Both remaining rows are criterion 2 and criterion 5. Criterion 2 is
+`not_implemented` for a candidate-build reason -- this candidate registers no
+Developer macOS target, so no macOS Machine could be declared. Criterion 5's
+Linux half PASSES on its own and fails only inside a full lane; that is a real
+defect and it is item 2 of "Still open" below.
+
+## What the individual hardware runs proved on 2026-09-10
 
 Each measured against candidate `0.4.0-rc19` unless noted, with
 `leaks [] cleanup_errors []` on every run.
@@ -197,12 +219,36 @@ instructive than the fixes.
    increment; the design is
    [NETWORK-INCREMENT-PLAN.md](NETWORK-INCREMENT-PLAN.md) step 5's second half.
 
-2. **A criterion 6 flake** (P1). One run in three of this session's sample read
-   `machine-0`'s fabric address as `None` immediately after Up returned, while
-   its sibling and the edge read fine. The probe samples once with no deadline,
-   and an all-or-nothing lane cannot carry an unpolled read: a single `None`
-   stamps every one of the eighteen rows MISSING. The fix is the shape the
-   check's other readiness reads already use.
+2. **Under full-lane load a Machine reaches ready with NO fabric NIC**
+   (P0, `vz-9x6`). This is now the only thing between the lane and a pass.
+   Isolated across four runs on one host:
+
+   | Criterion 5 | Candidate | Result |
+   |---|---|---|
+   | full lane | rc19 | FAIL |
+   | full lane | rc19 | FAIL |
+   | `--only` | rc19 | PASS |
+   | `--only` | rc18 (older guest bundle) | PASS |
+
+   Not the candidate, not the guest bundle (rc18 and rc19 share a
+   `sha256_vmlinux` and differ only in initramfs), not the egress change
+   (present in both). It is load: the same check passes alone and fails twice
+   running when it comes after nine other sub-checks.
+
+   The failing run's guest had the derived address on the cmdline and no NIC to
+   put it on -- `interfaces [{'name': 'docker0', ...}]` and nothing else.
+   `docker0` is created late by the Docker engine, so this is not an early
+   read: the Machine had reached ready and started Docker, and the only network
+   its definition declared still did not exist.
+
+   Egress enforcement did not cause this; it removed what was hiding it. With a
+   NAT NIC always present, a missing fabric NIC left `eth0` there and the check
+   reported an address MISMATCH; now the fabric NIC is the Machine's only one,
+   so the same failure reports as an empty list.
+
+   The probe should also poll to a declared deadline, but that is diagnosis.
+   The fix is that Up must not report `ready` for a Machine whose declared
+   attachment produced no NIC.
 
 3. **There is no reconciliation** (P0). `vz up` refuses every ProjectDefinition
    change before admission -- `project definition drift`. No plan, no durable
