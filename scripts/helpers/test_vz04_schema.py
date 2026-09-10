@@ -75,17 +75,6 @@ class SchemaTests(unittest.TestCase):
         summary["developer_overrides"] = ["dry_lanes"]
         self.assertTrue(schema.validate("summary", summary))
 
-    def test_sleep_wake_observed_requires_bindings(self):
-        value = {"schema_version": 1, "kind": "vz-0.4-sleep-wake", "run_id": "gate-test-run-1", "minimum_sleep_seconds": 20,
-                 "observed": False, "reason": "dry_lanes", "checkpoint": None, "wake": None,
-                 "ack": {"state": "not_attempted", "channel": None, "waited_seconds": 0.0, "detail": "dry"}}
-        self.assertEqual(schema.validate("sleep-wake", value), [])
-        value["reason"] = "not_observed_step1"
-        self.assertTrue(schema.validate("sleep-wake", value))
-        value["reason"] = "dry_lanes"
-        value["observed"] = True
-        self.assertTrue(schema.validate("sleep-wake", value))
-
     def test_receipt_not_executed_rules(self):
         receipt = {"schema_version": 1, "kind": "vz-0.4-receipt", "run_id": "gate-test-run-1", "index": 1, "label": "cargo-fmt",
                    "argv": ["cargo", "fmt"], "executable": "cargo", "cwd": "/repo", "timeout_seconds": 10, "state": "not_executed",

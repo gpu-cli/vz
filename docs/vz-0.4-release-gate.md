@@ -4,7 +4,7 @@ Status: **build-order steps 2–3, host side (DEV)**. The gate runs today and
 fails honestly: every one of the 85 required scenarios is `MISSING`, three
 acceptance lanes are explicit `not_implemented` stubs, and the sandbox lane is
 translated from its `summary.txt`. Host inventories, the leak diff, client
-provenance and the hardware sleep/wake checkpoint are real; the lanes are not.
+provenance is real; the lanes are not.
 Nothing here is release evidence until the verdict is `PASS` from a clean
 checkout against a `developer-id-notarized` release.
 
@@ -18,7 +18,7 @@ Implementation plan: [`RELEASE-GATE-PLAN.md`](../planning/developer-environments
 scripts/build-vz-0.4-release-candidate.sh --output <new dir> --version <x.y.z[-pre]>   # builder (separate doc)
 scripts/run-vz-0.4-release-gate.sh --suite all --release-dir <dir> --run-id <id> \
     --docker <path> --compose-plugin <path> --buildx-plugin <path> --tmux <path> \
-    [--evidence-root <dir>] [--state-root <dir>] [--linux-docker-context <name>] [--sleep-wake-ack-file <path>]
+    [--evidence-root <dir>] [--state-root <dir>] [--linux-docker-context <name>]
 scripts/validate-vz-0.4-evidence.sh .artifacts/vz-0.4-e2e/<run-id>/manifest.json
 ```
 
@@ -115,36 +115,34 @@ reported version (`docker version --format '{{.Client.Version}}'`,
    loopback/non-loopback listeners attributable to unrelated processes are
    counted but are not survivors. Any survivor is a FAIL finding.
 
-### Hardware sleep/wake (`vz04_sleepwake.py`)
+### Hardware sleep/wake: removed
 
-Between the `pre-sleep` and `post-wake` invocations the gate writes
-`phases/persisted-recovery/sleep-wake-checkpoint.json`: run-id, a 32-byte hex
-nonce, `kern.bootsessionuuid`, `kern.boottime`, `CLOCK_MONOTONIC`,
-`CLOCK_UPTIME_RAW`, wall clock (UTC) and the SHA-256 of `pmset -g log`. It then
-blocks for the operator: Enter on the controlling TTY (`/dev/tty`) or the
-appearance of `--sleep-wake-ack-file` containing the nonce, within
-`deadlines_seconds.operator_ack` (1800 s). No TTY and no ack file is
-`operator_ack_missing`; an ack file without the nonce is `nonce_mismatch`.
+There is no sleep/wake checkpoint between the `pre-sleep` and `post-wake`
+invocations, and no operator acknowledgement anywhere in a gate run.
 
-After the ack the checkpoint is re-read from disk, the clocks are captured
-again, the Sleep/Wake/DarkWake rows of `pmset -g log` and the powerd/kernel
-sleep-wake messages of `log show --style json --start … --end … --predicate
-'subsystem == "com.apple.powerd" OR process == "kernel"'` inside the window are
-collected (bounded to 300 s and 64 MiB; a timeout, truncation or error is
-recorded as `unified_log.state` and is a FAIL finding, never silent), and
-`discontinuity_ns = ΔMONOTONIC − ΔUPTIME_RAW` is computed: on macOS
-`CLOCK_MONOTONIC` keeps counting across sleep while `CLOCK_UPTIME_RAW` stops.
-`observed: true` requires the same boot session, the nonce echoed from disk, a
-pmset `Sleep` row followed by a `Wake`/`DarkWake` row inside the window, and a
-discontinuity of at least `sleep_wake.minimum_sleep_seconds` (20 s); otherwise
-`reason` names the first failed binding. Under `--dry-lanes` the checkpoint is
-written but no ack is awaited (`reason: dry_lanes`); there is no other bypass.
+There was, and the machinery worked: a nonce plus `kern.bootsessionuuid`,
+`kern.boottime`, `CLOCK_MONOTONIC`, `CLOCK_UPTIME_RAW` and the digest of
+`pmset -g log` written to disk; a block on `/dev/tty` or an ack file for up to
+1800 s; then Sleep/Wake rows from `pmset -g log`, powerd/kernel messages from
+`log show`, and `discontinuity_ns = ΔMONOTONIC − ΔUPTIME_RAW`, which on macOS
+is positive exactly because `CLOCK_MONOTONIC` keeps counting across sleep
+while `CLOCK_UPTIME_RAW` stops.
 
-Empirically on the development Mac (macOS 26.3.1, `/usr/bin/python3` 3.9.6):
-both `time.CLOCK_MONOTONIC` and `time.CLOCK_UPTIME_RAW` are available and
-already differ by the accumulated sleep since boot; `pmset -g log` is readable
-unprivileged (~108k rows); `log show` over a one-minute window returns in
-about 1–2.5 s.
+It was removed because of what it required, not because it did not work. No
+harness can sleep the machine it runs on, so the only way to prove a real
+sleep was to stop and ask a person -- and a release gate that cannot finish
+unattended is not a release gate. It also blocked two rows that have nothing
+to do with sleeping: criterion 18's secrets and criterion 20's denial matrix
+ran in that phase only because they reuse the Environments `pre-sleep` leaves
+running, so a gate run could not reach their evidence without an operator.
+
+Recovery across sleep/wake is still a product claim; it is exercised by hand
+rather than certified by a gate run. See GOAL-0.4.0.md criterion 10.
+
+The phase names `pre-sleep` and `post-wake` are unchanged, because the
+lane-result schema and every retained evidence tree already use them. They now
+name an establish/recover boundary with nothing in between.
+
 6. **Verdict.** `vz04_validate.evaluate` recomputes findings and scenario
    accounting; `summary.json`, `summary.txt`, the final `manifest.json`, the
    index verdict and `checksums.sha256` are written; then `validate_root` runs on
@@ -162,8 +160,6 @@ about 1–2.5 s.
 ├── prerequisites/NNN-<label>.{intent,result}.json      vz-0.4-receipt (+ .stdout/.stderr)
 ├── host/{before,after}.json                            vz-0.4-host-inventory
 ├── phases/clean-provision/state-handoff.<sha256>.json  vz-0.4-state-handoff
-├── phases/persisted-recovery/sleep-wake-checkpoint.json vz-0.4-sleep-wake-checkpoint (written before the ack)
-├── phases/persisted-recovery/sleep-wake.json           vz-0.4-sleep-wake
 ├── phases/final-cleanup/leak-diff.json                 vz-0.4-leak-diff
 └── <lane>/<lane phase>/lane-result.json                vz-0.4-lane-result (+ invocation.json, lane.stdout, lane.stderr)
 ```
@@ -236,8 +232,7 @@ process-start, undeclared readiness poll and prohibited runtime checks; both
 host inventories present, schema-valid, bound to the run (run-id, moment, state
 root) and `captured`; the leak diff present, equal to the manifest's
 `leak_diff`, recomputed from the two inventories (`cleanup.leak_diff_mismatch`
-otherwise) and empty (`cleanup.survivors` otherwise); the sleep/wake record
-judged by `vz04_sleepwake.verify` with the persisted checkpoint matching;
+otherwise) and empty (`cleanup.survivors` otherwise);
 client provenance recorded for all three clients with the resolved binary's
 digest unchanged. `PASS` only with zero findings.
 
@@ -267,8 +262,7 @@ scripts/validate-vz-0.4-evidence.sh .artifacts/vz-0.4-e2e/gate-dry-smoke-2/manif
 
 The dry smoke on the development Mac reports `findings=109` (113 before the
 host inventories, leak diff and client provenance landed) with both
-inventories `captured`, an empty leak diff and `sleep_wake.not_observed:
-dry_lanes`.
+inventories `captured` and an empty leak diff.
 
 ## GA parity in `release.yml`
 

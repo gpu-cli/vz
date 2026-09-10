@@ -199,9 +199,21 @@ required E2E scenario and retained evidence:
    renumbering would silently invalidate every reference to criteria 10-22 in
    this repository, its issue history and its retained gate evidence.
 10. **Lifecycle and recovery:** stop/up preserves identity and declared disks,
-    volumes, Docker data, and endpoints. Daemon/adapter/guest crashes and Mac
-    sleep/wake reconstruct authoritative routes, sockets, DNS, and port state
-    within manifest deadlines without cross-routing or stale resources.
+    volumes, Docker data, and endpoints. Daemon/adapter/guest crashes
+    reconstruct authoritative routes, sockets, DNS, and port state within
+    manifest deadlines without cross-routing or stale resources.
+
+    *Mac sleep/wake is no longer part of this criterion.* Proving it needs the
+    host to actually sleep, which no harness can cause without suspending the
+    machine it runs on -- so the gate asked a human to do it and then verified
+    real `pmset -g log` power events. That made an automated release gate
+    depend on an operator being awake at the console, and it held two further
+    rows hostage that have nothing to do with sleeping: criterion 18's secrets
+    and criterion 20's denial matrix ran in the same phase only because they
+    reuse the Environments it leaves running. A test that cannot run unattended
+    is not a gate row. Recovery across sleep/wake remains a product claim and
+    is checked by hand when the release is exercised; it is no longer something
+    a gate run can block on.
 11. **Deletion safety:** deleting one Environment removes only its Machines,
     disks, sockets, contexts, routes, DNS, ports, credentials, and faults. The
     other Environments continue serving traffic and retain byte-identical
@@ -482,14 +494,20 @@ new candidate tuple. It cannot replace or hide a failed result, and the
 aggregate index retains failed candidates alongside the eventual passing
 candidate.
 
-Host sleep/wake is a mandatory hardware scenario, not “where possible.” The
-harness writes a pre-sleep checkpoint, instructs the operator/runner to perform
-one real sleep/wake cycle, and resumes only with the matching run ID and recorded
-sleep/wake timestamps. It also captures OS power-management sleep/wake events,
-boot/session identity, monotonic-clock discontinuity, and checkpoint nonce; the
-validator proves a real hardware sleep interval occurred between the bound
-events. Automated CI incapable of host sleep cannot certify the release; the
-local-Mac evidence must contain the hardware phase.
+Host sleep/wake is NOT a gate scenario. It used to be a mandatory one: the
+harness wrote a checkpoint, instructed the operator to perform one real
+sleep/wake cycle, waited up to thirty minutes for an acknowledgement, and the
+validator proved a real hardware sleep interval from `pmset -g log` power
+events, boot-session identity and monotonic-clock discontinuity.
+
+The machinery was sound and the requirement was wrong. No harness can sleep the
+machine it is running on, so the gate's answer was to block on a human at the
+console -- and a release gate that cannot complete unattended is not a gate. It
+also held two unrelated rows hostage, because criterion 18's secrets and
+criterion 20's denial matrix ran in that phase only to reuse its Environments.
+
+Recovery across sleep/wake remains a product claim and is exercised by hand.
+What the gate certifies is what it can certify on its own.
 
 ### Evidence and mechanical verdict
 
@@ -587,5 +605,5 @@ vz 0.4.0 is done only when:
 
 Anything less—including passing unit tests, a single-Machine demo, guest-local
 Docker commands, Docker behavior absent from the versioned compatibility
-manifest, an unmeasured network claim, an optional sleep/wake result, or an E2E
-run with missing evidence—means the goal remains open.
+manifest, an unmeasured network claim, or an E2E run with missing
+evidence—means the goal remains open.

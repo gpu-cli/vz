@@ -2,7 +2,7 @@
 
     vz04_gate.py --suite all --release-dir <dir> --run-id <id> [--evidence-root]
                  [--state-root] [--docker] [--compose-plugin] [--buildx-plugin] [--tmux] [--uv]
-                 [--linux-docker-context] [--sleep-wake-ack-file] [--dry-lanes]
+                 [--linux-docker-context] [--dry-lanes]
 
 Only `--suite all` is accepted; anything else exits 2 before touching state.
 Admission never mutates inputs. The index entry is written before any phase
@@ -71,7 +71,6 @@ def parse_args(argv):
     parser.add_argument("--tmux", default=None)
     parser.add_argument("--run-inputs-cache", default=None, type=Path)
     parser.add_argument("--uv", default=None)
-    parser.add_argument("--sleep-wake-ack-file", default=None)
     parser.add_argument("--dry-lanes", action="store_true", help="DEV ONLY: substitute lanes with not_implemented results")
     return parser.parse_args(argv)
 
@@ -271,7 +270,7 @@ def run(args) -> int:
             print(f"==> {phase}: {lane} {lane_phase} -> {result['outcome']}{reason}", flush=True)
 
         outcome = phases.run_phases(root, contract, ctx, dry=args.dry_lanes, scope=scope, before_inventory=manifest["inventories"]["before"],
-                                    ack_file=args.sleep_wake_ack_file, observer=observer)
+                                    observer=observer)
         manifest["phases"] = outcome["phases"]
         manifest["inventories"]["after"] = outcome["after_inventory"]
         manifest["leak_diff"] = outcome["leak_diff"]

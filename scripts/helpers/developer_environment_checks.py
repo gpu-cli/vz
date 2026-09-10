@@ -1984,17 +1984,21 @@ RECOVERY_UNEXERCISED = (
 
 
 def check_lifecycle_recovery(ctx: CheckContext, top: str, established: dict) -> SubCheck:
-    """The Environments pre-sleep left are the same ones, still serving.
+    """The Environments the establish phase left are the same ones, still serving.
 
-    Criterion 10 claims stop/up preserves identity and declared state, and that
-    a sleep/wake reconstructs routes, sockets and port state. What is proven
-    here is the part that has a subject: each Environment pre-sleep established
-    is found again with the identity it had, answers an exec (so it is serving,
-    not merely recorded ready), returns its sentinel bytes unchanged, and keeps
-    all of that across an explicit stop/up. Identity is read from the record
-    written before the checkpoint, so a Machine silently recreated during the
-    wake would read as a new incarnation and fail here rather than pass as a
-    Machine that "came back".
+    Criterion 10 claims stop/up preserves identity and declared state. Each
+    Environment established in the previous phase is found again with the
+    identity it had, answers an exec (so it is serving, not merely recorded
+    ready), returns its sentinel bytes unchanged, and keeps all of that across
+    an explicit stop/up. Identity is read from the record written in that
+    phase, so a Machine silently recreated in between reads as a new
+    incarnation and fails here rather than passing as one that "came back".
+
+    Mac sleep/wake used to be part of this criterion and is not any more.
+    Proving it needed the host to actually sleep, which no harness can cause
+    without suspending itself, so the gate asked a human and waited -- and a
+    gate that cannot finish unattended is not a gate. It also held criteria 18
+    and 20 behind a step neither of them tests. See GOAL-0.4.0.md criterion 10.
     """
     check = SubCheck(top, "lifecycle_recovery")
     expected = established.get("environments") or []

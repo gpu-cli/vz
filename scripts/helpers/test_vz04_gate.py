@@ -51,7 +51,7 @@ class GateDryRunTests(unittest.TestCase):
         self.assertEqual(len(lane_rows), 1 + 3 * 4)
         self.assertTrue(all(row["failure_reason"] == "not_implemented" for row in lane_rows))
         codes = {row["code"] for row in summary["findings"]}
-        for code in ("gate.developer_override", "sleep_wake.not_observed", "clients.unrecorded",
+        for code in ("gate.developer_override", "clients.unrecorded",
                      "prerequisites.not_executed", "input.draft", "release.signing_class", "scenario.missing", "handoff.incomplete"):
             self.assertIn(code, codes)
         for code in ("cleanup.leak_diff_not_performed", "cleanup.leak_diff_missing", "inventory.not_captured", "inventory.partial",
@@ -77,15 +77,21 @@ class GateDryRunTests(unittest.TestCase):
         self.assertGreater(manifest["host"]["state_root_free_disk_bytes"], 0)
         self.assertRegex(manifest["toolchain"]["gate_requirements_sha256"], r"^[0-9a-f]{64}$")
 
-    def test_dry_sleep_wake_writes_checkpoint_without_ack(self):
-        record = common.load_json(self.run_root / "phases" / "persisted-recovery" / "sleep-wake.json")
-        self.assertFalse(record["observed"])
-        self.assertEqual(record["reason"], "dry_lanes")
-        self.assertEqual(record["ack"]["state"], "not_attempted")
-        self.assertRegex(record["checkpoint"]["nonce"], r"^[0-9a-f]{64}$")
-        stored = common.load_json(self.run_root / "phases" / "persisted-recovery" / "sleep-wake-checkpoint.json")
-        self.assertEqual(stored["checkpoint"], record["checkpoint"])
-        self.assertIsNone(record["wake"])
+    def test_no_sleep_wake_checkpoint_is_written_or_required(self):
+        """The gate finishes without a human at the console.
+
+        It used to write a checkpoint here, ask an operator to sleep the Mac
+        and wait up to half an hour for an acknowledgement. Removing that is
+        the point: a release gate that cannot complete unattended is not a
+        gate, and the checkpoint also stood between criteria 18 and 20 and
+        their evidence for no reason of their own.
+        """
+        phase = self.run_root / "phases" / "persisted-recovery"
+        for absent in ("sleep-wake.json", "sleep-wake-checkpoint.json"):
+            self.assertFalse((phase / absent).exists(), absent)
+        row = next(r for r in common.load_json(self.run_root / "manifest.json")["phases"]
+                   if r["name"] == "persisted-recovery")
+        self.assertNotIn("sleep_wake_path", row)
 
     def test_summary_txt_lists_every_unmet_requirement(self):
         text = (self.run_root / "summary.txt").read_text()

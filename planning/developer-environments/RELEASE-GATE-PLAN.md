@@ -65,7 +65,7 @@ Entry points: `scripts/build-vz-0.4-release-candidate.sh` (real logic),
 
 Python (`scripts/helpers/`): `vz04_common.py`, `vz04_schema.py`,
 `vz04_contract.py`, `vz04_candidate.py`, `vz04_source_tree.py`,
-`vz04_decisions.py`, `vz04_lanes.py`, `vz04_phases.py`, `vz04_sleepwake.py`,
+`vz04_decisions.py`, `vz04_lanes.py`, `vz04_phases.py`,
 `vz04_host.py`, `vz04_gate.py`, `vz04_validate.py`, with `test_vz04_*.py`.
 
 Config: `config/vz-0.4-e2e-contract.json`, `config/vz-0.4-migration-barriers.json`,
@@ -75,7 +75,7 @@ Config: `config/vz-0.4-e2e-contract.json`, `config/vz-0.4-migration-barriers.jso
 Schemas (`schemas/`): inputs `vz-0.4-e2e-contract`, `vz-0.4-migration-barriers`,
 `vz-0.4-decisions`, `vz-0.4-decision-authorities`, `host-target-capabilities-v0.4`;
 evidence `vz-0.4-release-manifest`, `vz-0.4-gate-manifest`, `vz-0.4-lane-result`,
-`vz-0.4-summary`, `vz-0.4-state-handoff`, `vz-0.4-sleep-wake`,
+`vz-0.4-summary`, `vz-0.4-state-handoff`,
 `vz-0.4-connectivity-matrix`, `vz-0.4-runtime-provenance`,
 `vz-0.4-resource-inventory`, `vz-0.4-receipt`, `vz-0.4-run-index`. All evidence
 schemas use `additionalProperties: false`, `const` schema versions,
@@ -122,7 +122,7 @@ GA parity prerequisite: `release.yml` must also record pre-signing digests.
 
 `scripts/run-vz-0.4-release-gate.sh --suite all --release-dir <dir> --run-id <id>
 [--evidence-root] [--state-root] --docker --compose-plugin --buildx-plugin
-[--sleep-wake-ack-file]`. Only `--suite all` is accepted; anything else exits 2
+`. Only `--suite all` is accepted; anything else exits 2
 before touching state.
 
 1. Admit inputs without mutation: run-id regex, fresh evidence dir, canonical
@@ -179,13 +179,14 @@ translated from `summary.txt` until it emits a native result; the contract flag
 
 1. `clean-provision`: assert no run-id resources; invoke lanes; assemble a
    content-addressed `state-handoff.<sha256>.json`; no cleanup.
-2. `persisted-recovery`: `pre-sleep` lane invocations, then the sleep/wake
-   checkpoint (`run_id`, nonce, `kern.bootsessionuuid`, `kern.boottime`,
-   `CLOCK_MONOTONIC`, `CLOCK_UPTIME_RAW`, wall clock, `pmset -g log` digest),
-   operator ack with a contract deadline, wake capture (`pmset -g log` and
-   unified log sleep/wake events inside the window, clock discontinuity
-   `ΔMONOTONIC − ΔUPTIME_RAW ≥ minimum_sleep_seconds`, same boot session, nonce
-   echoed), then `post-wake` lane invocations with the handoff.
+2. `persisted-recovery`: `pre-sleep` lane invocations, then `post-wake` lane
+   invocations with the handoff. Nothing happens between them. There used to be
+   a hardware sleep/wake checkpoint and an operator acknowledgement there;
+   removing it is what lets a gate run finish unattended, and it also freed
+   criteria 18 and 20, which ran in that phase only to reuse its Environments.
+   The two phase names are kept because the lane-result schema and every
+   retained evidence tree use them; they now name an establish/recover
+   boundary.
 3. `final-cleanup`: lanes delete only run-id-owned resources; the orchestrator
    diffs listeners, processes, sockets, Docker contexts against the before
    inventory and fails on any survivor.
@@ -209,7 +210,7 @@ tuple absent from the index.
 activation/removal/revocation 5, stop 120, up 600, operator ack 1800),
 `network_tolerances` (latency 100 ms ±30 over 100 requests; bandwidth 10 MiB/s
 ±20%; loss/partition 0 of 100 connections in 30 s with 0 probe failures),
-`pressure` (20 containers 60 s, 4 pulls, 4 builds, 8 execs), `sleep_wake`,
+`pressure` (20 containers 60 s, 4 pulls, 4 builds, 8 execs),
 `readiness_polls` (only declared polls may appear), `listener_checks`,
 `cleanup_rules`, `canaries` (deterministic prefix `vz04-canary-`), `lanes`,
 `harness.files`, `fixtures.required_dirs`, `docker_contract`, `scenarios`.

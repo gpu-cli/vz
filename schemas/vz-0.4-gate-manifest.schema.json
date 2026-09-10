@@ -584,7 +584,6 @@
           "lanes",
           "leak_diff_path",
           "name",
-          "sleep_wake_path",
           "started_at_utc"
         ],
         "properties": {
@@ -668,13 +667,6 @@
             }
           },
           "handoff_path": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
-          },
-          "sleep_wake_path": {
             "type": [
               "string",
               "null"

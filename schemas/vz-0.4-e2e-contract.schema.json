@@ -28,7 +28,6 @@
     "resources",
     "scenarios",
     "schema_version",
-    "sleep_wake",
     "target_release"
   ],
   "properties": {
@@ -438,7 +437,6 @@
         "cold_topology_up",
         "fault_activation",
         "fault_removal",
-        "operator_ack",
         "peer_revocation",
         "stop",
         "up",
@@ -470,10 +468,6 @@
           "minimum": 1
         },
         "up": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "operator_ack": {
           "type": "integer",
           "minimum": 1
         }
@@ -593,58 +587,6 @@
         "concurrent_execs": {
           "type": "integer",
           "minimum": 1
-        }
-      }
-    },
-    "sleep_wake": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "boot_session_keys",
-        "clock_sources",
-        "minimum_sleep_seconds",
-        "operator_ack_deadline_seconds",
-        "power_log_sources",
-        "required"
-      ],
-      "properties": {
-        "required": {
-          "const": true
-        },
-        "minimum_sleep_seconds": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "operator_ack_deadline_seconds": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "clock_sources": {
-          "type": "array",
-          "uniqueItems": true,
-          "minItems": 1,
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "power_log_sources": {
-          "type": "array",
-          "uniqueItems": true,
-          "minItems": 1,
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "boot_session_keys": {
-          "type": "array",
-          "uniqueItems": true,
-          "minItems": 1,
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
         }
       }
     },
@@ -924,7 +866,8 @@
     },
     "scenarios": {
       "type": "array",
-      "minItems": 22, "maxItems": 22,
+      "minItems": 22,
+      "maxItems": 22,
       "items": {
         "type": "object",
         "additionalProperties": false,

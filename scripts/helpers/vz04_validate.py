@@ -4,7 +4,7 @@
 validation of every evidence file, `checksums.sha256` coverage, frozen-input /
 release / tuple / index recomputation, required-scenario accounting, summary
 versus raw recomputation, canary scan, and the retry / duplicate process-start
-/ undeclared readiness poll / prohibited runtime / leak / sleep-wake checks.
+/ undeclared readiness poll / prohibited runtime / leak checks.
 PASS only with zero findings. The gate itself calls `evaluate` on the same
 code path and then re-runs `validate_root` to prove it reproduces.
 """
@@ -22,15 +22,14 @@ import vz04_decisions as decisions
 import vz04_host as host
 import vz04_lanes as lanes
 import vz04_schema as schema
-import vz04_sleepwake as sleepwake
 from vz04_common import (CANARY_PREFIX, REPO_ROOT, GateError, canonical_digest, canonical_path, digest_file, load_json,
                          read_regular, tree_entries, verify_checksums)
 
 KIND_TO_SCHEMA = {
     "vz-0.4-gate-manifest": "gate-manifest", "vz-0.4-lane-result": "lane-result", "vz-0.4-summary": "summary",
-    "vz-0.4-state-handoff": "state-handoff", "vz-0.4-sleep-wake": "sleep-wake", "vz-0.4-connectivity-matrix": "connectivity-matrix",
+    "vz-0.4-state-handoff": "state-handoff", "vz-0.4-connectivity-matrix": "connectivity-matrix",
     "vz-0.4-runtime-provenance": "runtime-provenance", "vz-0.4-host-inventory": "host-inventory", "vz-0.4-leak-diff": "leak-diff",
-    "vz-0.4-sleep-wake-checkpoint": "sleep-wake-checkpoint", "vz-0.4-receipt": "receipt", "vz-0.4-run-index": "run-index",
+    "vz-0.4-receipt": "receipt", "vz-0.4-run-index": "run-index",
 }
 UNKINDED_ALLOWED = frozenset(("invocation.json", "lane-result.rejected.json"))
 MAX_SCAN = 512 * 1024 * 1024
@@ -266,16 +265,6 @@ def evaluate(root: Path, manifest: dict, *, repo_root: Path = REPO_ROOT, codesig
                     findings.add("handoff.address", phase["handoff_path"], "handoff filename digest differs from content")
                 if not handoff["complete"]:
                     findings.add("handoff.incomplete", phase["handoff_path"], "clean-provision produced no complete persistence handoff")
-        if phase["name"] == "persisted-recovery":
-            sleep = _load_evidence(root, phase["sleep_wake_path"], "sleep-wake", findings, "sleep-wake")
-            if sleep is not None:
-                findings.extend(sleepwake.verify(sleep, contract["sleep_wake"]["minimum_sleep_seconds"]))
-                if sleep["minimum_sleep_seconds"] != contract["sleep_wake"]["minimum_sleep_seconds"]:
-                    findings.add("sleep_wake.contract", phase["sleep_wake_path"], "recorded minimum_sleep_seconds differs from the contract")
-                if sleep["checkpoint"] is not None:
-                    stored = _load_evidence(root, str(sleepwake.checkpoint_path(root).relative_to(root)), "sleep-wake-checkpoint", findings, "sleep-wake-checkpoint")
-                    if stored is not None and stored["checkpoint"] != sleep["checkpoint"]:
-                        findings.add("sleep_wake.checkpoint", phase["sleep_wake_path"], "persisted checkpoint differs from the sleep-wake record")
         if phase["name"] == "final-cleanup":
             diff = _load_evidence(root, phase["leak_diff_path"], "leak-diff", findings, "leak-diff")
             if diff is not None:

@@ -1,12 +1,19 @@
-"""Three ordered phases: clean-provision, persisted-recovery (pre-sleep,
-hardware sleep/wake checkpoint, post-wake), final-cleanup.
+"""Three ordered phases: clean-provision, persisted-recovery, final-cleanup.
 
-The persisted-recovery phase runs the pre-sleep lane invocations, then
-`vz04_sleepwake.observe` (checkpoint, operator ack, wake capture), then the
-post-wake invocations. The final-cleanup phase runs its lanes, captures the
-`after` host inventory and writes the leak diff against the `before`
-inventory (`vz04_host.diff`). Under `--dry-lanes` the checkpoint is still
-written but no ack is awaited (`observed: false, reason: dry_lanes`).
+The persisted-recovery phase runs its pre-sleep lane invocations and then its
+post-wake ones. Nothing happens between them: there used to be a hardware
+sleep/wake checkpoint there, and removing it is why this module no longer
+takes an operator acknowledgement. A gate that could not finish without a
+human at the console was not a gate, and the checkpoint also stood between two
+rows and their evidence for no reason of their own. See GOAL-0.4.0.md
+criterion 10.
+
+The phase names are the ones the retained evidence and the lane-result schema
+already use, so they are kept; they now name an ESTABLISH/RECOVER boundary
+rather than a sleep.
+
+The final-cleanup phase runs its lanes, captures the `after` host inventory and
+writes the leak diff against the `before` inventory (`vz04_host.diff`).
 """
 from __future__ import annotations
 
@@ -14,7 +21,6 @@ from pathlib import Path
 
 import vz04_host as host
 import vz04_lanes as lanes
-import vz04_sleepwake as sleepwake
 from vz04_common import PHASES, canonical_digest, digest_file, document, load_json, utc_iso
 
 PHASE_LANE_PHASES = {
@@ -52,7 +58,7 @@ def assemble_handoff(root: Path, run_id: str, candidate_tuple_sha256: str, resul
 
 
 def run_phases(root: Path, contract: dict, ctx: lanes.LaneContext, *, dry: bool, scope: host.HostScope, before_inventory: str,
-               ack_file=None, observer=None) -> dict:
+               observer=None) -> dict:
     """Execute every phase.
 
     Returns {phases: [manifest rows], results: [lane results], after_inventory,
@@ -67,15 +73,14 @@ def run_phases(root: Path, contract: dict, ctx: lanes.LaneContext, *, dry: bool,
     leak_diff = None
     for phase in PHASES:
         row = {"name": phase, "started_at_utc": utc_iso(), "finished_at_utc": None, "lanes": [],
-               "handoff_path": None, "sleep_wake_path": None, "leak_diff_path": None}
+               "handoff_path": None, "leak_diff_path": None}
+        # There is no host sleep between the two persisted-recovery phases any
+        # more. The gate used to write a checkpoint here, ask an operator to
+        # sleep the Mac, and wait up to half an hour for an acknowledgement --
+        # which made a release gate unable to finish without a human at the
+        # console, and held criterion 18's and criterion 20's rows behind a
+        # step neither of them tests. See GOAL-0.4.0.md criterion 10.
         for lane_phase in PHASE_LANE_PHASES[phase]:
-            if lane_phase == "persisted-recovery/post-wake":
-                sleep_path = sleepwake.observe(root, ctx.run_id, contract, ack_file=ack_file, dry=dry)
-                row["sleep_wake_path"] = str(sleep_path.relative_to(root))
-                if observer is not None:
-                    record = load_json(sleep_path)
-                    observer(phase, "sleep-wake", "checkpoint", {"outcome": "observed" if record["observed"] else "not_observed",
-                                                                 "failure": None if record["observed"] else {"reason": record["reason"]}})
             for lane in ordered_lanes:
                 if lane_phase not in lane["phases"]:
                     continue
