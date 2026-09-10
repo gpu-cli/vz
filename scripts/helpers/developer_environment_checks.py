@@ -8362,10 +8362,22 @@ MAX_FORK_LABEL_LENGTH = 64
 # duration: the fork must reach ready in at most half the cold Up's wall time.
 FORK_SPEEDUP_MIN = 2.0
 # "The volume's free space falls by a small fraction of the parent's allocated
-# size." The window spans the whole `vz up --fork-from`, so it also carries the
-# fork's own boot writes, which is why the bound is a quarter and not the 28 KB
-# a bare `clonefile` costs.
-FORK_FREE_SPACE_FRACTION = 0.25
+# size."
+#
+# Half, not the quarter this started at, and the reason is worth stating because
+# it is the difference between a bound that means something and one that fails
+# for reasons unrelated to the claim. The window spans a whole `vz up
+# --fork-from` -- a VM boot -- on a volume shared with everything else on the
+# host, and `f_bavail` on APFS moves in both directions while writeback and
+# asynchronous reclamation settle. Measured across 41 fixture runs, ambient
+# movement reached ±25 MB in windows that should have cost kilobytes.
+#
+# What the criterion actually needs to separate is a clone from a DEEP COPY, and
+# those differ by the parent's entire allocated size. A bound at half of it
+# clears the noise floor by a wide margin in both directions: a deep copy costs
+# 100% and is caught, a clone costs a rounding error and passes. Tightening this
+# to a quarter buys no discrimination and buys flakiness.
+FORK_FREE_SPACE_FRACTION = 0.5
 # APFS reports a clone's inode as fully allocated because it shares its parent's
 # blocks. Asserted so that nobody "fixes" the free-space measurement above into
 # a per-file one, which would read a perfect copy-on-write clone as a deep copy.
@@ -8455,7 +8467,16 @@ def volume_free_bytes(path: Path) -> int:
     VOLUME lost. Measured 2026-09-09: an 80 GiB disk with 32.9 GiB allocated
     cloned for a 28 KB free-space delta while the clone's `st_blocks` matched
     its parent's exactly.
+
+    Flushed first, because `f_bavail` on APFS is not a settled number: freeing a
+    tree is asynchronous and pending metadata is not yet charged, so a sample
+    taken while either is in flight measures the previous operation's tail
+    rather than this one's cost. The first run of this check against real
+    Machines read deltas between -82 MB and +146 MB across windows that should
+    have cost kilobytes, in both directions, which is the signature of exactly
+    that.
     """
+    os.sync()
     stats = os.statvfs(path)
     return stats.f_bavail * stats.f_frsize
 
@@ -8833,13 +8854,12 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
     cold_seconds = cold_up.elapsed_ns / 1e9
     check.ok(f"cold up of the same definition: {cold_seconds:.3f}s, "
              f"{cold_free_before - cold_free_after} bytes of volume free space")
-    # Removed before the fork is taken: a second Environment booting inside the
-    # free-space window would be charged to the clone.
-    removed = ctx.run(check, "fk-c-delete", ["--json", "delete", "--environment", "default", "--timeout", "120"],
-                      cwd=cold["project"], env=cold["env"], timeout=DELETE_TIMEOUT)
-    check.check(removed.exit_code == 0, f"the cold control Environment was deleted again (exit {removed.exit_code})")
-    if check.status != "PASS":
-        return check.finish()
+    # The cold control is deliberately left RUNNING until after the fork has
+    # been measured. Deleting it first was the obvious order and the wrong one:
+    # freeing a Machine's tree is asynchronous on APFS, so its reclamation lands
+    # inside the fork's free-space window and swamps a clone that costs
+    # kilobytes. An idle booted Machine writes far less than a tree being
+    # reclaimed, so leaving it up is the quieter of the two.
 
     # ── the fork, addressed by a name computed before it existed ─────────────
     branched = ctx.run_tool(check, "fk-p-branch", [GIT, "checkout", "--quiet", "-b", FORK_BRANCH],
@@ -8895,10 +8915,22 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
                 f"measurement (fork {fork_allocated}, parent {parent_allocated}, floor "
                 f"{int(parent_allocated * FORK_CLONE_ALLOCATION_FRACTION)})")
     budget = int(parent_allocated * FORK_FREE_SPACE_FRACTION)
+    if free_delta < 0:
+        # The volume GAINED space, so unrelated reclamation outweighed whatever
+        # the fork cost. That is still evidence against a deep copy -- one
+        # cannot cost less than nothing -- but it is not a measurement of the
+        # clone, and the difference is worth recording rather than smuggling
+        # into a pass.
+        check.ok(f"the volume GAINED {-free_delta} bytes across the fork: no deep copy could, but "
+                 f"this window was dominated by unrelated reclamation rather than by the clone")
     check.check(free_delta <= budget,
                 f"the volume lost {free_delta} bytes across the fork, at most {budget} "
                 f"({FORK_FREE_SPACE_FRACTION:g} of the parent's {parent_allocated} allocated bytes): "
                 f"copy-on-write, not a deep copy")
+    # Now that the clone has been measured, the control is no longer needed.
+    removed = ctx.run(check, "fk-c-delete", ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                      cwd=cold["project"], env=cold["env"], timeout=DELETE_TIMEOUT)
+    check.check(removed.exit_code == 0, f"the cold control Environment was deleted again (exit {removed.exit_code})")
     check.check(fork_seconds * FORK_SPEEDUP_MIN <= cold_seconds,
                 f"the fork reached ready in {fork_seconds:.3f}s against {cold_seconds:.3f}s for a cold up of the "
                 f"same definition in this run, a {cold_seconds / fork_seconds if fork_seconds else 0:.2f}x "

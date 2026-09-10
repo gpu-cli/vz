@@ -2908,7 +2908,12 @@ def build_agent_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path
 
 # One Machine disk, big enough that a byte copy of it is unmistakable against
 # the noise of a `statvfs` window and small enough to write in milliseconds.
-FORK_DISK_BYTES = 32 * 1024 * 1024
+#
+# 128 MiB, raised from 32 MiB after the first full-suite run: ambient volume
+# movement on this host reached ±25 MB, which at 32 MiB is the same order as the
+# signal, so the cost assertion decided nothing and failed at random. At 128 MiB
+# a deep copy is five times the noise floor and a clone is a thousandth of it.
+FORK_DISK_BYTES = 128 * 1024 * 1024
 # The disk's first block is its engine's image and volume list. Rewritten in
 # place, so recording an image does not change what the file allocates.
 FORK_DISK_HEADER = 4096
@@ -3213,7 +3218,17 @@ def disk_path(machine):
 
 
 def create_disk(machine):
-    """A Machine disk with real bytes, so cloning it is measurable."""
+    """A Machine disk with real bytes, so cloning it is measurable.
+
+    fsync'd before returning, and this is load-bearing rather than tidy. The
+    check measures the VOLUME's free space across the fork, and unflushed writes
+    are not charged to the volume until writeback runs -- so a disk written here
+    and left dirty is charged to whatever window happens to be open when the
+    kernel gets round to it, which is the fork's. Leaving 64 MiB of these in
+    flight made the fork appear to cost between 24 MB and 280 MB of a 32 MiB
+    parent. Flushing here charges each disk to its own creation, where it
+    belongs.
+    """
     path = disk_path(machine)
     path.parent.mkdir(parents=True, exist_ok=True)
     chunk = os.urandom(1024 * 1024)
@@ -3223,6 +3238,8 @@ def create_disk(machine):
         while written < DISK_BYTES:
             stream.write(chunk[:min(len(chunk), DISK_BYTES - written)])
             written += len(chunk)
+        stream.flush()
+        os.fsync(stream.fileno())
     write_engine_state(machine, {"images": {}, "volumes": []})
 
 
@@ -3237,6 +3254,8 @@ def write_engine_state(machine, state):
     payload = json.dumps(state, sort_keys=True).encode("utf-8")
     with open(disk_path(machine), "r+b") as stream:
         stream.write(payload + b"\0" * (HEADER - len(payload)))
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def clone_disk(parent, machine):
