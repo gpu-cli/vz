@@ -422,12 +422,25 @@ class TopologyLaneTests(unittest.TestCase):
             self.assertFalse(list(root.rglob("*.sock")), root)
 
     def test_unattributable_pid_file_is_a_cleanup_failure(self):
+        """Still a failure, and now it says how much of the sweep survived it.
+
+        The sweep used to raise on the first artifact it could not attribute, so
+        it stopped nothing; it now stops everything it can and reports the rest.
+        The claim under test is unchanged -- an unattributable PID file fails
+        cleanup -- but the message must carry both counts, because "0 stopped"
+        and "4 stopped" are different situations and the old wording could not
+        tell them apart.
+        """
         self.set_mode("bogus_pid")
         evidence = self.evidence()
         code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
         self.assertEqual((code, result["failure"]["reason"]), (1, "cleanup"))
         self.assertTrue(result["cleanup_errors"])
-        self.assertIn("no positively identified daemon", result["cleanup_errors"][0])
+        message = result["cleanup_errors"][0]
+        self.assertIn("not attributed and stopped positively", message)
+        self.assertIn("daemon(s) stopped", message)
+        # Every unattributable artifact is named, not just the first one reached.
+        self.assertGreaterEqual(message.count(".pid: "), 1, message)
 
     # -- later phases -----------------------------------------------------------------
     def test_persisted_recovery_provisions_and_recovers_across_the_checkpoint(self):

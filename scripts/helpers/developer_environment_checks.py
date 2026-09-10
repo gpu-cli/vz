@@ -1473,9 +1473,14 @@ ENVIRONMENT_FIELDS = {"environment_id", "name", "state", "definition_digest", "l
 ENVIRONMENT_OPTIONAL_FIELDS: set[str] = set()
 MACHINE_FIELDS = {"machine_id", "name", "state", "profile", "target", "requested_capabilities",
                   "negotiated_capabilities", "health", "backend", "incarnation_id", "incarnation_generation",
-                  "docker_context", "docker_context_availability"}
+                  "docker_context", "docker_context_availability", "fork"}
+# `fork` is present exactly when this Machine is a fork of another in the same
+# Environment, carrying the parent's id and name and the fork's label. It is how
+# an agent tells "a fork of the Machine I wanted" from "a Machine whose name
+# happens to contain an @", so the lineage is reported rather than only the
+# composed name.
 MACHINE_OPTIONAL_FIELDS = {"backend", "incarnation_id", "incarnation_generation", "docker_context",
-                           "docker_context_availability"}
+                           "docker_context_availability", "fork"}
 NETWORK_FIELDS = {"network_id", "name", "kind", "cidr"}
 NETWORK_OPTIONAL_FIELDS = {"cidr"}
 ATTACHMENT_FIELDS = {"attachment_id", "machine_id", "network_id"}
