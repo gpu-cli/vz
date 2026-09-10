@@ -1472,3 +1472,409 @@ def build_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path = Non
     for path in root.rglob("*"):
         path.chmod(stat.S_IMODE(path.lstat().st_mode) & ~0o222)
     return root
+
+
+# ------------------------------------------------------------------ criterion 18
+#
+# A second, self-contained stand-in release. `FAKE_VZ` deliberately models no
+# SecretBinding and no capability negotiation -- neither exists in the shipped
+# definition schema or the runtime contract -- so against it the criterion-18
+# checks report `not_implemented`, which is the honest verdict and exactly what
+# the lane test asserts. These fixtures exist so the checks are FALSIFIABLE
+# anyway: they model a runtime that does implement both, and each mode below
+# breaks exactly one claim so the check has to notice.
+#
+# Modes: "" (conformant), leak_status_json / leak_status_human / leak_daemon_log
+# / leak_exec_stderr / leak_state_root (the value reaches one swept artifact),
+# no_audit (using the binding records nothing), audit_leaks_value (the record
+# carries the value), audit_wrong_machine (the record names the sibling),
+# sibling_machine_reads (the Machine that declared nothing gets the value too),
+# foreign_env_reads (every Environment's Machines get it), cross_env_empty (a
+# cross-Environment binding request comes up with an empty result instead of
+# failing closed), cross_env_unstructured (it fails without a machine-readable
+# code), snapshot_granted (an unadvertised capability is negotiated), and
+# snapshot_silent (a requested capability is neither granted nor accounted),
+# snapshot_refuse / snapshot_refuse_generic (Up refuses, structured or not),
+# drop_request (the Machine's declared request is not projected at all),
+# restore_noop (restore reports success and rewinds nothing).
+
+SECRET_VZ = r'''#!/usr/bin/env python3
+"""UNIT-TEST-ONLY `vz` stand-in with SecretBinding and capability semantics."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+MODE_FILE = Path(__MODE_FILE__)
+MODE = MODE_FILE.read_text().strip() if MODE_FILE.is_file() else ""
+RUNTIME = Path(os.environ["VZ_RUNTIME_DATA_DIR"])
+TOPOLOGY = RUNTIME / "topology.json"
+AUDIT = RUNTIME / "audit.jsonl"
+LOG = RUNTIME / "d.log"
+SOURCE_ENV = "VZ_GATE_SECRET_VALUE"
+SECRET = os.environ.get(SOURCE_ENV, "")
+BUSYBOX = str(Path(sys.argv[0]).resolve().parent / "busybox-secret-shim")
+
+
+def refuse(code, message):
+    sys.stderr.write(json.dumps({"schema_version": 1, "error": {"code": code, "message": message}}) + "\n")
+    raise SystemExit(1)
+
+
+def parse(argv):
+    verb, machine, environment, tail, want = None, None, None, [], None
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == "--":
+            tail = argv[index + 1:]
+            break
+        if want:
+            if want == "machine":
+                machine = item
+            elif want == "environment":
+                environment = item
+            want = None
+        elif item in ("--machine", "--environment", "--timeout"):
+            want = item[2:] if item != "--timeout" else "timeout"
+        elif item in ("up", "status", "exec", "stop", "delete") and verb is None:
+            verb = item
+        index += 1
+    return verb, machine, environment, tail
+
+
+def machine_id(suffix, name):
+    return "mch_%s_%s" % (suffix, name)
+
+
+def do_up():
+    definition = json.loads(Path("vz.json").read_text())
+    declaration = definition["environment"]
+    machines = declaration["machines"]
+    suffix = hashlib.sha256(definition["project_id"].encode()).hexdigest()[:16]
+    environment_id = "env_" + suffix
+    bindings = list(declaration.get("secret_bindings") or [])
+    kept = []
+    for binding in bindings:
+        foreign = binding.get("from_environment")
+        if foreign and foreign != environment_id:
+            if MODE == "cross_env_empty":
+                continue
+            if MODE == "cross_env_unstructured":
+                sys.stderr.write("cross-environment secret request denied\n")
+                raise SystemExit(1)
+            refuse("cross_environment_denied",
+                   "SecretBinding %r names Environment %s, which is not this Environment; cross-Environment "
+                   "access requires an explicit directional grant" % (binding.get("name"), foreign))
+        kept.append(binding)
+    rows = []
+    for entry in machines:
+        requested = list(((entry.get("requested_capabilities") or {}).get("capabilities")) or ["posix_exec"])
+        reported = ["posix_exec"] if MODE == "drop_request" else requested
+        granted, unsupported = [c for c in reported if c != "snapshot"], {}
+        if "snapshot" in reported:
+            if "snapshot_granted" in MODE:
+                granted = list(reported)
+            elif MODE == "snapshot_silent":
+                pass
+            elif MODE == "snapshot_refuse":
+                refuse("unsupported_capability",
+                       "this backend cannot provide the snapshot capability this Machine requested")
+            elif MODE == "snapshot_refuse_generic":
+                sys.stderr.write("up failed\n")
+                raise SystemExit(1)
+            else:
+                unsupported["snapshot"] = ("the macos_virtualization_linux backend implements no Machine "
+                                           "snapshot")
+        rows.append({"name": entry["name"], "machine_id": machine_id(suffix, entry["name"]),
+                     "requested": reported, "granted": granted, "unsupported": unsupported})
+    guest = RUNTIME / "guest"
+    for entry in machines:
+        (guest / entry["name"] / "run").mkdir(parents=True, exist_ok=True)
+    for binding in kept:
+        holders = [binding["machine"]]
+        if MODE == "sibling_machine_reads":
+            holders = [entry["name"] for entry in machines]
+        for name in holders:
+            target = guest / name / binding["target_path"].lstrip("/")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(os.environ.get(binding.get("source_env", ""), ""))
+    if MODE == "foreign_env_reads" and SECRET:
+        for entry in machines:
+            target = guest / entry["name"] / "run/vz-secrets/gate-secret"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(SECRET)
+    TOPOLOGY.write_text(json.dumps({
+        "project_id": definition["project_id"], "suffix": suffix, "environment_id": environment_id,
+        "state": "ready", "machines": rows,
+        "bindings": [{"name": b["name"], "machine": b["machine"], "target_path": b["target_path"]} for b in kept]}))
+    log = "vz-runtimed stand-in: %s ready with %d Machine(s)\n" % (environment_id, len(rows))
+    if MODE == "leak_daemon_log":
+        log += "secret material %s\n" % SECRET
+    LOG.write_text(log)
+    state = "stand-in state store for %s\n" % environment_id
+    if MODE == "leak_state_root":
+        state += "secret material %s\n" % SECRET
+    Path(os.environ["VZ_RUNTIME_STATE_DB"]).write_text(state)
+    sys.stdout.write(json.dumps({"schema_version": 1, "progress": {"completion": {}}}) + "\n")
+    return 0
+
+
+def topology():
+    if not TOPOLOGY.is_file():
+        refuse("daemon_unavailable", "no compatible runtime daemon is listening on the configured socket")
+    return json.loads(TOPOLOGY.read_text())
+
+
+def status_payload(state):
+    suffix = state["suffix"]
+    machines = []
+    for row in state["machines"]:
+        negotiated = {"capabilities": row["granted"]}
+        if row["unsupported"]:
+            negotiated["unsupported"] = row["unsupported"]
+        machines.append({"name": row["name"], "machine_id": row["machine_id"], "state": "ready",
+                         "profile": "developer", "target": {"os": "linux", "arch": "aarch64", "image": "vz-linux"},
+                         "requested_capabilities": {"capabilities": row["requested"]},
+                         "negotiated_capabilities": negotiated,
+                         "incarnation_id": "inc_%s_%s" % (suffix, row["name"]), "incarnation_generation": 1})
+    payload = {"schema_version": 1, "request_id": "req-" + suffix, "topology_state_source": "persisted",
+               "definition_path": str(Path.cwd() / "vz.json"), "project_id": state["project_id"],
+               "persisted_definition_digest": "sha256:" + suffix * 4,
+               "environments": [{"environment_id": state["environment_id"], "name": "default", "state": "ready",
+                                 "lifecycle_generation": 1, "machines": machines}]}
+    if MODE == "leak_status_json":
+        payload["secret_material"] = SECRET
+    return payload
+
+
+def do_status(as_json):
+    state = topology()
+    if as_json:
+        sys.stdout.write(json.dumps(status_payload(state), indent=1) + "\n")
+        return 0
+    lines = ["Environment %s (default) ready" % state["environment_id"]]
+    for row in state["machines"]:
+        lines.append("  Machine %s (%s) ready caps=%s" % (row["name"], row["machine_id"], ",".join(row["granted"])))
+    for binding in state["bindings"]:
+        value = SECRET if MODE == "leak_status_human" else "<redacted>"
+        lines.append("  SecretBinding %s -> %s on %s = %s"
+                     % (binding["name"], binding["target_path"], binding["machine"], value))
+    sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+def record_use(state, name, binding):
+    if MODE == "no_audit":
+        return
+    rows = {row["name"]: row for row in state["machines"]}
+    identity = rows[name]["machine_id"]
+    if MODE == "audit_wrong_machine":
+        other = [row for row in state["machines"] if row["name"] != name]
+        if other:
+            identity = other[0]["machine_id"]
+    record = {"event": "secret_binding_used", "environment_id": state["environment_id"],
+              "machine_id": identity, "machine": name, "binding": binding["name"],
+              "binding_id": "sbn_" + hashlib.sha256(binding["name"].encode()).hexdigest()[:16],
+              "unix_ns": time.time_ns()}
+    if MODE == "audit_leaks_value":
+        record["value"] = SECRET
+    with open(AUDIT, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record) + "\n")
+
+
+def do_exec(name, tail):
+    state = topology()
+    rows = {row["name"]: row for row in state["machines"]}
+    if name is None:
+        if len(rows) != 1:
+            refuse("validation_error", "Machine selection is ambiguous; specify --machine")
+        name = sorted(rows)[0]
+    if name not in rows:
+        refuse("machine_not_found", "no Machine named %s in this Environment" % name)
+    guest = RUNTIME / "guest" / name
+    guest.mkdir(parents=True, exist_ok=True)
+    rewritten = [item.replace("/bin/busybox", BUSYBOX).replace("/run/", str(guest) + "/run/") for item in tail]
+    completed = subprocess.run(rewritten, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    sys.stdout.buffer.write(completed.stdout)
+    sys.stderr.buffer.write(completed.stderr)
+    if MODE == "leak_exec_stderr":
+        sys.stderr.write("secret material %s\n" % SECRET)
+    joined = " ".join(tail)
+    for binding in state["bindings"]:
+        if binding["target_path"] in joined and (guest / binding["target_path"].lstrip("/")).is_file():
+            record_use(state, name, binding)
+    return completed.returncode
+
+
+def do_delete():
+    if TOPOLOGY.is_file():
+        TOPOLOGY.unlink()
+    shutil.rmtree(RUNTIME / "guest", ignore_errors=True)
+    sys.stdout.write(json.dumps({"schema_version": 1, "deleted": ["default"]}) + "\n")
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    as_json = "--json" in argv
+    verb, machine, _environment, tail = parse(argv)
+    if verb == "up":
+        return do_up()
+    if verb == "status":
+        return do_status(as_json)
+    if verb == "exec":
+        return do_exec(machine, tail)
+    if verb == "delete":
+        return do_delete()
+    if verb == "stop":
+        sys.stdout.write(json.dumps({"schema_version": 1, "stopped": ["default"]}) + "\n")
+        return 0
+    refuse("definition_not_found", "no vz.json project definition found at or above %s" % Path.cwd())
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+# The typed client the snapshot/restore clause is reached through: snapshot and
+# restore are not among the five public lifecycle verbs, so the contract puts
+# them on the typed API, and criterion 15 already reads the daemon this way.
+SECRET_PROBE = r'''#!/usr/bin/env python3
+"""UNIT-TEST-ONLY `vz-runtime-probe` stand-in: Machine snapshot and restore."""
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+
+MODE_FILE = Path(__MODE_FILE__)
+MODE = MODE_FILE.read_text().strip() if MODE_FILE.is_file() else ""
+
+
+def main():
+    argv = sys.argv[1:]
+    operation = argv[0] if argv else ""
+    options, index = {}, 1
+    while index < len(argv):
+        if argv[index].startswith("--") and index + 1 < len(argv):
+            options[argv[index][2:]] = argv[index + 1]
+            index += 2
+        else:
+            index += 1
+    runtime = Path(options.get("socket", "/nonexistent")).parent
+    guest = runtime / "guest" / options.get("machine", "machine-0")
+    snapshots = runtime / "snapshots"
+    if operation == "snapshot":
+        identity = "snp_" + os.urandom(8).hex()
+        snapshots.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(guest, snapshots / identity)
+        sys.stdout.write(json.dumps({"schema_version": 1, "kind": "vz-runtime-probe-snapshot",
+                                     "snapshot_id": identity}) + "\n")
+        return 0
+    if operation == "restore":
+        identity = options.get("snapshot-id", "")
+        source = snapshots / identity
+        if not source.is_dir():
+            sys.stdout.write(json.dumps({"schema_version": 1, "kind": "vz-runtime-probe-error",
+                                         "reason": "snapshot_not_found", "detail": identity}) + "\n")
+            return 1
+        if "restore_noop" not in MODE:
+            shutil.rmtree(guest, ignore_errors=True)
+            shutil.copytree(source, guest)
+        sys.stdout.write(json.dumps({"schema_version": 1, "kind": "vz-runtime-probe-restore",
+                                     "snapshot_id": identity}) + "\n")
+        return 0
+    sys.stdout.write(json.dumps({"schema_version": 1, "kind": "vz-runtime-probe-error",
+                                 "reason": "invalid_arguments", "detail": operation}) + "\n")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+BUSYBOX_SECRET_SHIM = r'''#!/bin/sh
+# The guest BusyBox applets criterion 18's probes use, and nothing else: a probe
+# whose applet is missing must fail loudly rather than look like a denial.
+applet=$1
+shift
+case "$applet" in
+  sh) exec /bin/sh "$@" ;;
+  sha256sum) exec /usr/bin/shasum -a 256 "$@" ;;
+  cat) exec /bin/cat "$@" ;;
+  *) echo "applet not found: $applet" >&2; exit 127 ;;
+esac
+'''
+
+# One SecretBinding declaration surface, added to a copy of the shipped schema.
+# The shipped one declares none, which is why the check reports the criterion
+# not implemented against the real repository; these tests give it the surface
+# so every claim below it can be exercised and broken.
+SECRET_BINDING_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "required": ["schema_version", "name", "machine", "target_path", "source_env"],
+    "properties": {
+        "schema_version": {"const": 1},
+        "name": {"$ref": "#/$defs/name"},
+        "machine": {"$ref": "#/$defs/name"},
+        "target_path": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^/"},
+        "source_env": {"type": "string", "minLength": 1, "maxLength": 128},
+        "from_environment": {"anyOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+    },
+}
+
+
+def build_secret_release(root: Path, *, mode_file: Path) -> Path:
+    """A release directory whose `vz` and typed probe model criterion 18.
+
+    Not a signed candidate: these tests call the checks directly rather than
+    through lane admission, because the claim under test is what the check
+    asserts about a runtime, not how the lane admits a release.
+    """
+    binaries = root / "bin"
+    binaries.mkdir(mode=0o700, parents=True)
+    for name, text in (("vz", SECRET_VZ), ("vz-runtime-probe", SECRET_PROBE)):
+        path = binaries / name
+        path.write_text(text.replace("__MODE_FILE__", json.dumps(str(mode_file))))
+        path.chmod(0o755)
+    (binaries / "busybox-secret-shim").write_text(BUSYBOX_SECRET_SHIM)
+    (binaries / "busybox-secret-shim").chmod(0o755)
+    # `ctx.isolated(provision=True)` points VZ at this as the daemon it may
+    # spawn; the stand-in CLI never spawns one, so it only has to exist.
+    (binaries / "vz-runtimed").write_text("#!/bin/sh\nexit 0\n")
+    (binaries / "vz-runtimed").chmod(0o755)
+    (root / "machine-target-catalog.json").write_bytes(json.dumps(CATALOG, indent=2, sort_keys=True).encode() + b"\n")
+    return root
+
+
+def build_secret_repo_root(root: Path, *, secret_status: str = "DEV", snapshot_status: str = "PLANNED",
+                           schema_secrets: bool = True) -> Path:
+    """A repository root carrying the two versioned inputs criterion 18 reads.
+
+    Both are copies of the checked-in files with one field changed, so a test
+    that advertises a capability is testing the real matrix shape rather than an
+    invented one, and a schema without the SecretBinding surface is the shipped
+    schema exactly.
+    """
+    (root / "config").mkdir(mode=0o700, parents=True)
+    (root / "schemas").mkdir(mode=0o700, parents=True)
+    matrix = json.loads(read_regular(REPO_ROOT / "config/host-target-capabilities-v0.4.json").decode())
+    for pair in matrix["pairs"]:
+        pair["topology_capabilities"]["secret_bindings"]["status"] = secret_status
+        pair["machine_capabilities"]["snapshot"]["status"] = snapshot_status
+    (root / "config/host-target-capabilities-v0.4.json").write_bytes(
+        json.dumps(matrix, indent=2, sort_keys=True).encode() + b"\n")
+    schema = json.loads(read_regular(REPO_ROOT / "schemas/vz-project-definition-v1.schema.json").decode())
+    if schema_secrets:
+        schema["$defs"]["secretBinding"] = json.loads(json.dumps(SECRET_BINDING_SCHEMA))
+        schema["$defs"]["environment"]["properties"]["secret_bindings"] = {
+            "type": "array", "items": {"$ref": "#/$defs/secretBinding"}}
+    (root / "schemas/vz-project-definition-v1.schema.json").write_bytes(
+        json.dumps(schema, indent=2, sort_keys=True).encode() + b"\n")
+    return root

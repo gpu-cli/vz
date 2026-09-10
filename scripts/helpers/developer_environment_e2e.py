@@ -57,6 +57,7 @@ CRITERION_7 = "gate.host.import_export_boundaries"
 CRITERION_10 = "gate.lifecycle.recovery_including_sleep_wake"
 CRITERION_17 = "gate.storage.workspace_projection_policy"
 CRITERION_19 = "gate.migration.install_upgrade_rollback_uninstall"
+CRITERION_18 = "gate.secrets.snapshots_scoped_redacted"
 HANDOFF_SENTINEL = "state-handoff-sentinel.txt"
 # Run one named sub-check instead of the phase's whole set. A single-claim test
 # otherwise runs every other criterion's checks to assert one thing, which is
@@ -378,9 +379,11 @@ class Lane:
         document(self.evidence_dir / RECOVERY_RECORD, established)
         recorder = Recorder(self.evidence_dir, self.ctx.run_id)
         ctx = self.check_context(state, recorder)
-        subchecks, crash = {CRITERION_10: []}, None
+        subchecks, crash = {CRITERION_10: [], CRITERION_18: []}, None
         try:
             subchecks[CRITERION_10].append(checks.check_lifecycle_recovery(ctx, CRITERION_10, established))
+            subchecks[CRITERION_18].append(checks.check_secret_bindings_scoped_redacted(ctx, CRITERION_18))
+            subchecks[CRITERION_18].append(checks.check_snapshot_restore_capability(ctx, CRITERION_18))
         except Exception:  # noqa: BLE001 - recorded as a crash, never swallowed
             crash = traceback.format_exc()
             write_exclusive(self.evidence_dir / "crash.txt", crash.encode())
