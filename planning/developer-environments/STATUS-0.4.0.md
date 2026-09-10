@@ -71,7 +71,34 @@ instructive than the fixes.
   left the artifact -- not only the one the gate exercised. Minting and
   publishing are now separate, with the publish after admission.
 - **`vz up --fork-from` could not succeed against any Environment that had
-  finished coming up** (P0, found the first time the fork check reached real
+  finished coming up.** Eight distinct refusals, found one at a time by running
+  the installed binary against real Machines and fixing what it hit. They are
+  one bug wearing eight faces: forking introduced the first Machine that is a
+  *runtime* object rather than a *declared* one, and every layer of the Up path
+  had encoded "Machine ⇒ declared in `vz.json` ⇒ present since the Environment
+  was created". Each layer answered a per-Machine question with an
+  Environment-wide fact, or looked a fork up in a definition it is never in.
+
+  | # | What it said | What it was |
+  |---|---|---|
+  | 1 | `Ready requires every Machine to be Ready` | `validate` counted forks as declared |
+  | 2 | `cannot reconstruct an unknown previously active Machine` | "never started" read off the Environment's generation |
+  | 3 | `owned resource machine_runtime_store... not found` | reserve-or-require decided per Environment |
+  | 4 | `unexpected state change during Machine reservation` | expected snapshot rebuilt only when fresh |
+  | 5 | *(pre-empted by a sweep)* | store opened not created, and no digest to create it with |
+  | 6 | `persisted Machine specification is missing` | the declaration looked up under a name no fork has |
+  | 7 | `Machine artifact pin is missing` | recovery refuses to create; a fork must inherit its parent's |
+  | 8 | `Machine absent from operation` | no step in a generation the fork did not exist in |
+
+  **3288 workspace tests agreed forking worked throughout**, because every fork
+  fixture forks an Environment from `instantiate_environment` — `Creating`, with
+  all Machines `Creating`, the one lifecycle state a real fork is never taken in.
+  The fixture chose the state that made the code pass. `ready_fixture` closes
+  that gap. This is the argument for AGENTS.md's installed-evidence rule,
+  demonstrated eight times in one night.
+
+  The detail below is the first of the eight, kept because it is the one that
+  decided the rule the other seven followed. (P0, found the first time the fork check reached real
   Machines). `Ready` demanded that *every* Machine be Ready; a fork is minted
   `Creating` because it has not booted; `fork_machine_in_environment` validates
   `before + plan` inside the transaction. So a warm parent -- the only kind worth
@@ -93,34 +120,53 @@ instructive than the fixes.
 
 ### Still open
 
-1. **There is no reconciliation** (P0). `vz up` refuses every ProjectDefinition
+1. **A fork cannot join a running Environment's fabric** (P0, `vz-5v8.6`). The
+   ninth refusal, and the first that is architectural rather than a scoping
+   mistake: `install_environment_fabric` admits an Environment with no switches
+   and nothing running, or one whose switches are up and *every* attached
+   Machine already running. A fork is exactly the excluded middle — the parent
+   is running and holding its port, the fork needs a new one on the same switch
+   — and `NetworkSwitch` builds every port in `start`, moving the fabric and its
+   readers into the forwarding task. A switch cannot gain a port after
+   construction. Hot-add is bounded work, but `start` drops its sender so the
+   channel closes when the last reader exits, which is *how the switch shuts
+   down*; retaining one changes that, and a switch that never stops means leaked
+   daemons on this host. *Blocks criterion 23, and it is the only thing left
+   blocking it.*
+
+2. **There is no reconciliation** (P0). `vz up` refuses every ProjectDefinition
    change before admission -- `project definition drift`. No plan, no durable
    claim, and a mutable change gets the same code as an immutable one. Neither
    of criterion 22's normative sub-documents has an implementation subject:
    `admit_reconcile_round`, `ReconcileInputSnapshot` and `effective_digest` exist
    nowhere in `crates/`. *Blocks criterion 22 entirely.*
 
-2. **Legacy sandbox migration fabricates negotiated capabilities** (P1) for eight
+3. **Legacy sandbox migration fabricates negotiated capabilities** (P1) for eight
    capabilities, four of which the matrix marks PLANNED. Same false claim as the
    capability fix above, on a different surface -- and it bears on criterion 19's
    "legacy records do not acquire Docker defaults", which PASSES on hardware
    today, so its check does not cover it.
 
-3. **A guest RPC was added without bumping `AGENT_PROTOCOL_REVISION`** (P1). See
+4. **A guest RPC was added without bumping `AGENT_PROTOCOL_REVISION`** (P1). See
    the next section: this one defect produced two false product findings in a
    single night.
 
-4. **No `SecretBinding` exists** (P1) -- not in the project schema, not in
+5. **No `SecretBinding` exists** (P1) -- not in the project schema, not in
    `vz-runtime-contract`. The gate check is written and waiting.
    *Blocks criterion 18's secrets clause.*
 
-5. **A minted-but-never-booted fork cannot be reclaimed** (P2), because its
-   ownership lacks the two runtime reservations Up takes. Consistent with the
-   Environment path's behaviour for a partially-provisioned aggregate, so it was
-   left consistent rather than made laxer -- but it is real if
-   `vz up --fork-from` ever fails between minting and reserving.
+6. **A minted-but-never-booted fork cannot be reclaimed** (P2, `vz-5v8.5`).
+   Mechanism now confirmed and it is the same one as the eight above:
+   `prepare_delete_absence` has two never-started branches and both are keyed on
+   the Environment (`lifecycle_generation == 0`, `prior.generation == 1`). A fork
+   is minted at whatever generation its Environment has reached, so neither can
+   ever fire for one. The authority it needs already exists —
+   `require_machine_admission_fence`, added for the Up path in this same
+   situation — so the fix is concrete. Left out of this branch deliberately:
+   delete governs reclaiming real resources and wants its own hardware evidence,
+   which the Up path's does not provide.
 
-6. **A stuck scoped operation has no supersede path** (P2). It blocks every new
+7. **A stuck scoped operation has no supersede path** (P2). It blocks every new
    lifecycle operation on its Environment until replayed with its own request and
    idempotency IDs, which the CLI prints on every run.
 
@@ -155,6 +201,16 @@ only, and the `nc` shim returning the denial the check wanted rather than what
 the real tool does.
 
 ## What the gate will not tell you yet
+
+- **The fork measurement has still never completed**, and now for one reason
+  rather than a list: everything up to `vz up --fork-from` passes end to end on
+  real Machines — parent up (cold, ~32 s), Docker context resolved out of the
+  Machine's private config, engine answering on the first poll sample, sentinel
+  round-tripped, warm image imported and resolving to a digest, the label rule
+  mapping this worktree's branch before any fork exists, the parent's one
+  clonable disk identified — and the fork itself is refused by the fabric. Two
+  bounds a first complete run will settle: `FORK_SPEEDUP_MIN = 2.0` and
+  `FORK_FREE_SPACE_FRACTION = 0.5`.
 
 - **The fork check now reaches the fork against real VMs.** Its setup passes end
   to end: parent Environment up (cold, 34.8 s), identities recorded, sentinel
@@ -199,6 +255,20 @@ before sampling, and the bound is half the parent's allocated size -- what the
 criterion separates is a clone from a deep copy, and those differ by the parent's
 *entire* allocated size, so half clears the noise floor in both directions where
 a quarter only bought flakiness.
+
+A fourth measurement lesson, from three flaky assertions fixed in one night:
+**volume free space is a global observable, so an absolute bound on it cannot be
+asserted anywhere else may be writing.** All three passed run alone and failed
+under load — a 32 MiB parent appearing to cost 127 MB while neighbours wrote.
+A gate lane may assert it, because the lane owns its volume; a parallel test
+suite may not. The Rust test now observes copy-on-write *directly* through
+`vz_macos_provision::clone::first_physical_extent`: two files sharing blocks
+report the same device offset, one holding its own bytes reports a different one.
+That is what free space was only ever a proxy for. Two traps came with it — a
+deep-copy control built from `std::fs::copy` is not one, because on macOS it
+reaches for `fclonefileat` and reported a cost of **zero**, a control that was
+secretly the thing under test; and the driver test asserting EPERM from `killpg`
+was encoding a platform assumption that measurement disproved.
 
 The last row is the one that keeps being rediscovered. A per-file allocated-size
 comparison reads a *correct* copy-on-write clone as a deep copy. Criterion 23 was
