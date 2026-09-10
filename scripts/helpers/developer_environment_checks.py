@@ -6185,3 +6185,903 @@ def check_snapshot_restore_capability(ctx: CheckContext, top: str) -> SubCheck:
             except OSError as error:
                 check.fail(f"snap-a: could not be deleted: {type(error).__name__}: {error}")
     return check.finish()
+
+
+# --------------------------------------------------------------------- criterion 20
+#
+# `gate.network.exhaustive_denial_matrix`: one machine-readable
+# source x destination x protocol x port matrix, enumerated BEFORE anything is
+# probed, executed cell by cell, then compared cell by cell against the
+# expectation each cell was declared with.
+#
+# This criterion is different in kind from its neighbours. Their deliverable is
+# a set of claims; this one's deliverable is an artifact -- a table whose row
+# count, destination classes and protocols are declared up front, so a probe
+# loop that quietly produced nothing cannot pass as a matrix that found nothing
+# wrong. Every row is emitted into the lane evidence as
+# `connectivity-matrix.json` under the checked-in
+# `schemas/vz-0.4-connectivity-matrix.schema.json` -- the schema the gate's
+# "Versioned gate inputs" section already requires and that
+# `vz04_schema.EVIDENCE_SCHEMAS` already loads -- so the aggregate validator
+# re-reads and re-validates the same table this check graded.
+#
+# The grading is deliberately asymmetric, exactly as the criterion states it:
+#
+#   * a cell declared `deny` that was observed `allow` is an UNEXPECTED SUCCESS
+#     and fails the gate, naming the cell;
+#   * a cell declared `allow` that was not observed `allow` is a failure too,
+#     but a different one, and is reported separately so the evidence says which
+#     kind happened;
+#   * a cell that answered without carrying its destination's own token is
+#     INDETERMINATE -- neither reached nor refused -- and is reported as a third
+#     kind rather than rounded into either.
+#
+# A cell whose Environment, address or guest tool does not exist is not dropped
+# from the table. It is recorded `error` with the reason its resource was
+# unavailable, and the check reports `not_implemented` in the runtime's own
+# words. Shrinking the matrix to the cells that happen to work on this runtime
+# would turn the artifact into a description of the runtime instead of a
+# description of the criterion.
+DENIAL_MATRIX_EVIDENCE = "connectivity-matrix.json"
+DENIAL_MATRIX_KIND = "vz-0.4-connectivity-matrix"
+DENIAL_MATRIX_SCHEMA = "schemas/vz-0.4-connectivity-matrix.schema.json"
+# 1.1.1.1 and 8.8.8.8 rather than a documentation range: "offline" has to mean
+# the real Internet, not an address that would have failed anyway.
+MATRIX_INTERNET_ADDRESSES = ("1.1.1.1", "8.8.8.8")
+MATRIX_INTERNET_PORTS = (443, 80)
+MATRIX_INTERNET_NAME = "vz04-egress-probe.invalid"
+# RFC 5737 documentation ranges: one inside the CIDR a CIDR policy would allow
+# and one outside it, so the policy's own boundary is what decides the cell.
+MATRIX_CIDR_ALLOW = "203.0.113.0/24"
+MATRIX_CIDR_INSIDE = "203.0.113.10"
+MATRIX_CIDR_OUTSIDE = "198.51.100.10"
+MATRIX_DOMAIN_ALLOWED = "allowed.one.test"
+MATRIX_DOMAIN_BLOCKED = "blocked.two.test"
+# The control plane, addressed the way a Machine would have to address it. vz's
+# daemon and every Machine's Docker endpoint are AF_UNIX sockets, so the only
+# control-plane surface a guest could name over IP is a Docker Engine on TCP --
+# which the contract forbids outright ("no Environment-wide/global socket or
+# fallback daemon"). Both the plaintext and the TLS port are probed, on the host
+# loopback the guest sees and on the shared NAT gateway alias.
+MATRIX_CONTROL_PLANE_PORTS = (2375, 2376)
+MATRIX_PROBE_TIMEOUT = 300
+MATRIX_HOST_PROBE_TIMEOUT = 60
+# The guest applet each probe kind needs. A Machine whose image lacks one
+# reports those cells unexercised instead of reporting a missing applet's exit
+# status as a routing fact -- the confusion criterion 7's `nc` clause already
+# had to name.
+MATRIX_PROBE_APPLETS = {"tcp": "wget", "udp": "nc", "icmp": "ping", "dns": "nslookup"}
+# Every destination class the criterion enumerates, plus the two clauses it
+# states separately (egress-attachment cross-talk, and ICMP where the runtime
+# exposes it). Compared as a set against the classes the built matrix actually
+# carries, so a class that silently stopped being enumerated fails the check.
+DENIAL_MATRIX_CLASSES = (
+    "control_plane",
+    "egress_attachment_crosstalk",
+    "host_export_declared",
+    "host_export_undeclared",
+    "host_import_declared",
+    "host_import_undeclared",
+    "icmp_unsolicited",
+    "internet_allowed",
+    "internet_cidr",
+    "internet_domain",
+    "internet_offline",
+    "lan",
+    "private_cross_environment",
+    "private_in_environment",
+    "public_like_cross_environment",
+    "public_like_ingress",
+    "public_like_undeclared",
+)
+# The row count of the enumeration on a host reporting no non-loopback address
+# of its own. Each such address adds cells, so this is a floor rather than an
+# equality -- but a floor with teeth: an enumeration that lost a whole class, or
+# a source, drops below it.
+DENIAL_MATRIX_MINIMUM_ROWS = 104
+# The exact `detail` a cell still carries when nothing ran it. Compared rather
+# than inferred from `observed == "error"`, because a cell that DID run and
+# answered without its destination's token is also `error` and must not be
+# counted as unexercised.
+MATRIX_NOT_EXECUTED = "not executed"
+
+
+class MatrixCell:
+    """One declared source x destination x protocol x port cell.
+
+    `expected` is fixed at enumeration time from the set of DECLARED
+    authorizations and never from what was observed. `observed` starts at
+    `error` and is only ever moved by a probe that ran, so a cell nothing
+    executed cannot read as a denial that held.
+    """
+
+    def __init__(self, klass, source, destination, protocol, port, expected, *, phase, probe, target,
+                 token=None, requires=(), ca_file=None):
+        self.klass = klass
+        self.source = source
+        self.destination = destination
+        self.protocol = protocol
+        self.port = port
+        self.expected = expected
+        self.phase = phase
+        self.probe = probe
+        self.target = target
+        self.token = token
+        self.requires = tuple(requires)
+        self.ca_file = ca_file
+        self.index = None
+        self.observed = "error"
+        self.detail = MATRIX_NOT_EXECUTED
+
+    @property
+    def key(self) -> tuple:
+        return (self.source, self.destination, self.protocol, self.port)
+
+    def row(self) -> dict:
+        """Exactly the seven fields the connectivity-matrix schema declares."""
+        return {"source": self.source, "destination": self.destination, "protocol": self.protocol,
+                "port": self.port, "expected": self.expected, "observed": self.observed,
+                "match": self.observed == self.expected}
+
+    def label(self) -> str:
+        port = "-" if self.port is None else self.port
+        return (f"cell ({self.source} -> {self.destination}, {self.protocol}/{port}) expected "
+                f"{self.expected}, observed {self.observed} ({self.detail})")
+
+
+def matrix_source_parts(source: str) -> tuple:
+    isolate, _, machine = source.partition("/")
+    return isolate, machine
+
+
+def enumerate_denial_matrix(plan: dict) -> list:
+    """The whole declared matrix, as data, before a single probe has run.
+
+    Built as a cartesian product per destination class rather than as a list of
+    interesting paths. The host-import block is the clearest case: it is every
+    (source, host loopback port, protocol) triple this check can form, and
+    `expected` is `allow` for exactly the tuples in `plan["grants"]` and `deny`
+    for everything else -- so the denials are not chosen one by one, they are
+    what is left once the declared grants are removed from the product.
+    """
+    cells = []
+    grants = set(plan["grants"])
+
+    def add(klass, source, destination, protocol, port, expected, **kwargs):
+        cells.append(MatrixCell(klass, source, destination, protocol, port, expected, **kwargs))
+
+    private_dst = f"{plan['private_endpoint']}@{plan['private_address'] or 'unresolved'}"
+    # 1. Private in-Environment paths, and the very same address from outside.
+    for source in plan["grant_machines"]:
+        add("private_in_environment", source, private_dst, "tcp", PRIVATE_PORT, "allow",
+            phase="served", probe="tcp", target=plan["private_address"], token=plan["private_token"],
+            requires=("src:" + matrix_source_parts(source)[0], "dst:private"))
+    for source in plan["foreign_machines"]:
+        add("private_cross_environment", source, private_dst, "tcp", PRIVATE_PORT, "deny",
+            phase="served", probe="tcp", target=plan["private_address"], token=plan["private_token"],
+            requires=("src:" + matrix_source_parts(source)[0], "dst:private"))
+
+    # 2. Public-like ingress: the declared name, an undeclared name on the same
+    #    edge, and the declared name from three foreign Environments.
+    for name, klass, sources, expected in (
+            (plan["edge_name"], "public_like_ingress", plan["edge_machines"], "allow"),
+            (plan["edge_undeclared_name"], "public_like_undeclared", plan["edge_machines"], "deny"),
+            (plan["edge_name"], "public_like_cross_environment", plan["foreign_machines"], "deny")):
+        for source in sources:
+            for protocol, port, probe in (("dns", 53, "dns"), ("https", 443, "https")):
+                add(klass, source, f"edge:{name}", protocol, port, expected,
+                    phase="edge", probe=probe, target=name,
+                    token=None if probe == "dns" else plan["edge_token"],
+                    requires=("src:" + matrix_source_parts(source)[0], "dst:edge"),
+                    ca_file=plan["edge_anchors"].get(source) if probe == "https" else None)
+
+    # 3. Host imports. Every source x every host loopback port x every protocol;
+    #    `allow` only where a declared grant names that exact tuple.
+    for source in plan["import_machines"]:
+        for destination, port, token in plan["host_ports"]:
+            for protocol in ("tcp", "udp"):
+                expected = "allow" if (source, destination, protocol, port) in grants else "deny"
+                klass = "host_import_declared" if expected == "allow" else "host_import_undeclared"
+                add(klass, source, destination, protocol, port, expected,
+                    phase="open", probe=protocol, target="127.0.0.1", token=token,
+                    requires=("src:" + matrix_source_parts(source)[0], "dst:host-import"))
+
+    # 4. Host exports, probed from the host: the declared loopback port, an
+    #    undeclared loopback port, and the declared port on every non-loopback
+    #    address this host holds -- "exports never expose the LAN by accident".
+    add("host_export_declared", "host", "host-export:127.0.0.1", "tcp", plan["export_host_port"], "allow",
+        phase="served", probe="host_tcp", target="127.0.0.1", token=plan["private_token"],
+        requires=("dst:host-export",))
+    add("host_export_undeclared", "host", "host-export:127.0.0.1", "tcp", plan["undeclared_export_port"], "deny",
+        phase="served", probe="host_tcp", target="127.0.0.1", token=plan["private_token"],
+        requires=("dst:host-export",))
+    for address in plan["lan_addresses"]:
+        add("host_export_undeclared", "host", f"host-export:{address}", "tcp", plan["export_host_port"], "deny",
+            phase="served", probe="host_tcp", target=address, token=plan["private_token"],
+            requires=("dst:host-export",))
+
+    # 5. Internet under offline policy. Every Machine here declares `offline`,
+    #    and none of them may reach anything off this host.
+    for source in plan["offline_machines"]:
+        for address in MATRIX_INTERNET_ADDRESSES:
+            for port in MATRIX_INTERNET_PORTS:
+                add("internet_offline", source, f"internet:{address}", "tcp", port, "deny",
+                    phase="open", probe="tcp", target=address,
+                    requires=("src:" + matrix_source_parts(source)[0],))
+        add("internet_offline", source, f"internet:{MATRIX_INTERNET_NAME}", "dns", 53, "deny",
+            phase="open", probe="dns", target=MATRIX_INTERNET_NAME,
+            requires=("src:" + matrix_source_parts(source)[0],))
+
+    # 6. Internet under allowed / CIDR / domain policy, and the criterion's
+    #    separate clause: two Machines of ONE Environment on DIFFERENT egress
+    #    attachments, neither governing the other's policy or host import.
+    permissive, restricted = plan["egress_machines"]
+    add("internet_allowed", permissive, f"internet:{MATRIX_INTERNET_ADDRESSES[0]}", "tcp", 443, "allow",
+        phase="open", probe="tcp", target=MATRIX_INTERNET_ADDRESSES[0], requires=("src:dm-egress",))
+    add("egress_attachment_crosstalk", restricted, f"internet:{MATRIX_INTERNET_ADDRESSES[0]}", "tcp", 443, "deny",
+        phase="open", probe="tcp", target=MATRIX_INTERNET_ADDRESSES[0], requires=("src:dm-egress",))
+    add("egress_attachment_crosstalk", permissive, f"host-loopback:{GRANTED_GUEST_PORT}", "tcp",
+        GRANTED_GUEST_PORT, "allow", phase="open", probe="tcp", target="127.0.0.1",
+        token=plan["host_service_token"], requires=("src:dm-egress",))
+    add("egress_attachment_crosstalk", restricted, f"host-loopback:{GRANTED_GUEST_PORT}", "tcp",
+        GRANTED_GUEST_PORT, "deny", phase="open", probe="tcp", target="127.0.0.1",
+        token=plan["host_service_token"], requires=("src:dm-egress",))
+    for address, expected in ((MATRIX_CIDR_INSIDE, "allow"), (MATRIX_CIDR_OUTSIDE, "deny")):
+        add("internet_cidr", plan["cidr_machine"], f"internet:{address}", "tcp", 443, expected,
+            phase="open", probe="tcp", target=address, requires=("src:dm-cidr",))
+    for name, expected in ((MATRIX_DOMAIN_ALLOWED, "allow"), (MATRIX_DOMAIN_BLOCKED, "deny")):
+        for protocol, port, probe in (("dns", 53, "dns"), ("https", 443, "https")):
+            add("internet_domain", plan["domain_machine"], f"internet:{name}", protocol, port, expected,
+                phase="open", probe=probe, target=name, requires=("src:dm-domain",))
+
+    # 7. LAN. The NAT alias the contract names explicitly, plus every
+    #    non-loopback address this host actually holds, on the two host ports
+    #    this check put in play. Probed while the export listener is LIVE, so a
+    #    cell that succeeded is a real leak and not an absent listener.
+    for source in plan["lan_machines"]:
+        for address in (NAT_GATEWAY_ADDRESS, *plan["lan_addresses"]):
+            for port, token in ((plan["host_service_port"], plan["host_service_token"]),
+                                (plan["export_host_port"], plan["private_token"])):
+                add("lan", source, f"lan:{address}", "tcp", port, "deny",
+                    phase="served", probe="tcp", target=address, token=token,
+                    requires=("src:" + matrix_source_parts(source)[0], "dst:host-export"))
+
+    # 8. Control plane, and unsolicited ICMP.
+    for source in plan["lan_machines"]:
+        for address in ("127.0.0.1", NAT_GATEWAY_ADDRESS):
+            for port in MATRIX_CONTROL_PLANE_PORTS:
+                add("control_plane", source, f"control-plane:{address}", "tcp", port, "deny",
+                    phase="open", probe="tcp", target=address,
+                    requires=("src:" + matrix_source_parts(source)[0],))
+        for address in (NAT_GATEWAY_ADDRESS, MATRIX_INTERNET_ADDRESSES[0]):
+            add("icmp_unsolicited", source, f"icmp:{address}", "icmp", None, "deny",
+                phase="open", probe="icmp", target=address,
+                requires=("src:" + matrix_source_parts(source)[0],))
+    for index, cell in enumerate(cells):
+        cell.index = index
+    return cells
+
+
+def matrix_probe_command(cell: MatrixCell) -> str:
+    """The one command this cell is, inside the Machine (or the URL, on the host)."""
+    if cell.probe == "host_tcp":
+        return f"http://{cell.target}:{cell.port}/"
+    if cell.probe == "tcp":
+        return f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - http://{cell.target}:{cell.port}/"
+    if cell.probe == "udp":
+        return f"printf probe | /bin/busybox nc -u -w 2 {cell.target} {cell.port}"
+    if cell.probe == "icmp":
+        return f"/bin/busybox ping -c 1 -W 2 {cell.target}"
+    if cell.probe == "dns":
+        return f"/bin/busybox nslookup {cell.target}"
+    anchor = f" --ca-file {cell.ca_file}" if cell.ca_file else ""
+    return (f"{GUEST_FETCH} get --url https://{cell.target}/{anchor} "
+            f"--timeout-millis {FETCH_TIMEOUT_MILLIS}")
+
+
+# Read from each Machine before any of its cells is graded. A clause needing an
+# applet this image lacks has to be able to see that it lacks it: the exit
+# status of a missing applet says "denied" and means nothing.
+MATRIX_PREFLIGHT = ('/bin/busybox --list | /bin/busybox awk \'{print "APPLET", $0}\'; '
+                    f'if [ -x {GUEST_FETCH} ]; then printf "FETCH yes\\n"; else printf "FETCH no\\n"; fi')
+
+
+def parse_matrix_preflight(receipt) -> tuple:
+    """(the applets this BusyBox carries, whether the HTTPS client is present)."""
+    applets, fetch = set(), False
+    for line in receipt.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split()
+        if fields[:1] == ["APPLET"] and len(fields) == 2:
+            applets.add(fields[1])
+        elif fields[:2] == ["FETCH", "yes"]:
+            fetch = True
+    return applets, fetch
+
+
+def matrix_probe_script(cells: list) -> str:
+    """One script running every cell of one (phase, source), reporting each.
+
+    Batched per source rather than one `vz exec` per cell: a hundred-cell matrix
+    is otherwise a hundred Machine invocations, and the invocation is not what
+    is under test. Each cell is still its own separate command inside the guest
+    and still reports its own exit status and its own bytes, which is all the
+    grading reads.
+    """
+    lines = []
+    for cell in cells:
+        lines.append(f'o=$({matrix_probe_command(cell)} 2>/dev/null); c=$?; '
+                     f'printf "CELL {cell.index} %s " "$c"; '
+                     'printf "%s" "$o" | /bin/busybox awk \'{printf "%s ", substr($0, 1, 120)}\'; '
+                     'printf "\\n"')
+    return "\n".join(lines)
+
+
+def parse_matrix_probe(receipt) -> dict:
+    """{cell index: (exit status, the bytes that cell was answered with)}."""
+    results = {}
+    for line in receipt.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split(" ", 3)
+        if fields[:1] != ["CELL"] or len(fields) < 3 or not fields[1].isdigit():
+            continue
+        status = fields[2].strip()
+        if not status.lstrip("-").isdigit():
+            continue
+        results[int(fields[1])] = (int(status), fields[3] if len(fields) > 3 else "")
+    return results
+
+
+def observe_matrix_cell(cell: MatrixCell, status, output: str) -> tuple:
+    """(observed, detail) for one cell, from that cell's own two streams.
+
+    Three outcomes, not two. A nonzero status is a refusal. A zero status
+    carrying the destination's own token is a reach. A zero status WITHOUT that
+    token is neither: something answered and it was not the destination this
+    cell names. That is recorded `error` rather than rounded into `allow` (it
+    would manufacture an unexpected success) or into `deny` (it would hide one)
+    -- the same distinction criterion 7's `denied` makes, kept as a third value
+    instead of folded away.
+    """
+    if status is None:
+        return "error", "the probe reported no exit status"
+    if status != 0:
+        return "deny", f"exit {status}"
+    if cell.token is None:
+        return "allow", f"exit 0, answered {output.strip()[:80]!r}"
+    if cell.token in output:
+        return "allow", f"exit 0 carrying {cell.token}"
+    return "error", (f"exit 0 without the destination's token {cell.token} "
+                     f"(answered {output.strip()[:80]!r})")
+
+
+def denial_matrix_findings(cells: list) -> dict:
+    """The three kinds of disagreement, kept apart.
+
+    `unexpected_success` is the criterion's own hard failure and is listed
+    first; `unmet_allow` is the opposite direction and is a different fact about
+    the runtime; `indeterminate` is a cell whose probe answered without proving
+    who answered it. Pure, so a test can hand it a wrong observation directly
+    and read the finding back.
+    """
+    executed = [cell for cell in cells if cell.detail != MATRIX_NOT_EXECUTED]
+    return {
+        "executed": executed,
+        "unexecuted": [cell for cell in cells if cell.detail == MATRIX_NOT_EXECUTED],
+        "unexpected_success": [cell for cell in executed if cell.expected == "deny" and cell.observed == "allow"],
+        "unmet_allow": [cell for cell in executed if cell.expected == "allow" and cell.observed == "deny"],
+        "indeterminate": [cell for cell in executed if cell.observed == "error"],
+    }
+
+
+def egress_attachment_findings(cells: list) -> list:
+    """The criterion's separate egress-attachment claim, as compared values.
+
+    Two Machines of ONE Environment on DIFFERENT egress attachments: the
+    permissive Machine's Internet policy must not govern its sibling, and the
+    permissive Machine's host import must not be reachable from that sibling.
+    Both are stated as a comparison between two observed values rather than as
+    "both probes did something": two Machines that both reached the Internet and
+    two that both failed are indistinguishable under a per-probe test, and it is
+    exactly that difference the clause exists to establish.
+    """
+    relevant = {(cell.source, cell.destination): cell for cell in cells
+                if cell.klass in ("internet_allowed", "egress_attachment_crosstalk")}
+    sources = sorted({source for source, _destination in relevant})
+    if len(sources) != 2:
+        return [f"the egress-attachment clause needs exactly two Machines of one Environment "
+                f"(the matrix carries {sources})"]
+    permissive, restricted = sources
+    findings = []
+    for what, destination, want_permissive, want_restricted in (
+            ("Internet policy", f"internet:{MATRIX_INTERNET_ADDRESSES[0]}", "allow", "deny"),
+            ("host import", f"host-loopback:{GRANTED_GUEST_PORT}", "allow", "deny")):
+        first = relevant.get((permissive, destination))
+        second = relevant.get((restricted, destination))
+        if first is None or second is None:
+            findings.append(f"the {what} cell is missing for {permissive} or for {restricted}")
+            continue
+        if (first.observed, second.observed) != (want_permissive, want_restricted):
+            findings.append(
+                f"{what} at {destination}: {permissive} observed {first.observed} and {restricted} observed "
+                f"{second.observed} (expected {want_permissive} and {want_restricted}); one Machine's egress "
+                "attachment governs the other's")
+    return findings
+
+
+def denial_matrix_document(run_id: str, scenario_id: str, cells: list) -> dict:
+    return {"schema_version": 1, "kind": DENIAL_MATRIX_KIND, "run_id": run_id, "scenario_id": scenario_id,
+            "rows": [cell.row() for cell in cells]}
+
+
+def matrix_definition(release_dir: Path, *, host_port: int, export_host_port: int) -> dict:
+    """The Environment the private, host-import and host-export cells measure.
+
+    Two Developer Linux Machines on one declared private network, with the
+    import and the export granted to the FIRST Machine only. The second exists
+    so "the wrong Machine is denied" is a claim about a real sibling in the same
+    Environment rather than about a Machine that does not exist.
+    """
+    definition = two_machine_definition(release_dir)
+    environment = definition["environment"]
+    first = environment["machines"][0]
+    environment["host_imports"] = [{
+        "schema_version": 1, "name": "hostsvc", "machine": first["name"], "protocol": "tcp",
+        "host_port": host_port, "guest_port": GRANTED_GUEST_PORT}]
+    environment["host_exports"] = [{
+        "schema_version": 1, "name": "api", "machine": first["name"], "protocol": "tcp",
+        "machine_port": EXPORT_MACHINE_PORT, "host_port": export_host_port}]
+    return definition
+
+
+def egress_definition(release_dir: Path, *, host_port: int, policy: str) -> dict:
+    """Two Machines of one Environment on DIFFERENT egress attachments.
+
+    machine-0 takes the permissive attachment and the one host import;
+    machine-1 stays offline and is granted nothing. `policy` is `allowed` for
+    the enum the shipped project schema declares, and the CIDR/domain spellings
+    for the two the criterion names and the schema does not -- those definitions
+    are built anyway, so the reason a CIDR or domain Internet policy cannot be
+    exercised is the SCHEMA's own words rather than this check's opinion.
+    """
+    definition = minimal_definition(release_dir)
+    environment = definition["environment"]
+    first = environment["machines"][0]
+    second = copy.deepcopy(first)
+    second["name"] = "machine-1"
+    second["egress"] = "offline"
+    if policy == "allowed":
+        first["egress"] = "allowed"
+    elif policy == "cidr":
+        first["egress"] = {"policy": "cidr", "allow": [MATRIX_CIDR_ALLOW]}
+    else:
+        first["egress"] = {"policy": "domain", "allow": [MATRIX_DOMAIN_ALLOWED]}
+    environment["machines"] = [first, second]
+    environment["host_imports"] = [{
+        "schema_version": 1, "name": "hostsvc", "machine": first["name"], "protocol": "tcp",
+        "host_port": host_port, "guest_port": GRANTED_GUEST_PORT}]
+    return definition
+
+
+def matrix_tool_requirement(cell: MatrixCell):
+    """The resource id for the guest tool this cell needs, or None on the host."""
+    if cell.probe == "host_tcp":
+        return None
+    return f"tool:{cell.source}:{MATRIX_PROBE_APPLETS.get(cell.probe, GUEST_FETCH)}"
+
+
+def check_exhaustive_denial_matrix(ctx: CheckContext, top: str, established: dict) -> SubCheck:
+    """Criterion 20: the whole declared matrix, executed and graded cell by cell.
+
+    The order is: declare, then build the subjects, then probe, then compare.
+    Declaring first is the point -- the enumeration's length, its destination
+    classes and its protocols are asserted BEFORE any probe runs, so a runtime
+    that refused everything cannot pass by producing an empty table, and a probe
+    loop that silently emitted no rows cannot pass by producing a table with
+    nothing to disagree with.
+
+    The subjects are: the three Environments pre-sleep left running (used as
+    foreign sources, which is what makes every cross-Environment denial a claim
+    about a live Environment rather than an absent one), one Environment with a
+    declared private path plus a declared host import and export, one with a
+    public-like edge, and three that declare the allowed/CIDR/domain egress
+    policies the criterion names. Whatever this runtime refuses is recorded as
+    unexercised in the refusing component's own words -- the runtime's for a
+    refused Up, the shipped project schema's for a declaration it cannot express
+    -- and the cells stay in the table as `error` rather than being dropped.
+    """
+    from vz04_common import GateError
+
+    check = SubCheck(top, "exhaustive_denial_matrix")
+    granted_service = foil_service = None
+    try:
+        granted_service = LoopbackHostService("vzmtxsvc-" + uuid.uuid4().hex[:16])
+        # Never declared to anybody, so "the guest cannot choose a host
+        # destination" is measured against a service that really is listening.
+        foil_service = LoopbackHostService("vzmtxfoil-" + uuid.uuid4().hex[:16])
+    except OSError as error:
+        if granted_service is not None:
+            granted_service.close()
+        check.fail(f"cannot bind a loopback host service for the matrix to terminate against: {error}")
+        return check.finish()
+
+    export_host_port, undeclared_export_port = free_host_port(), free_host_port()
+    private_token = "vzmtxpriv-" + uuid.uuid4().hex[:16]
+    edge_token = "vzmtxedge-" + uuid.uuid4().hex[:16]
+    unavailable, instances, provisioned = {}, {}, []
+    schema_path = ctx.repo_root / PROJECT_DEFINITION_SCHEMA
+    matrix_path = ctx.repo_root / DENIAL_MATRIX_SCHEMA
+
+    def refuse(reason: str, *resources) -> None:
+        for resource in resources:
+            unavailable.setdefault(resource, reason)
+
+    def invalid(definition: dict):
+        """The shipped project schema's own first complaint, or None."""
+        if not schema_path.is_file():
+            return None
+        problems = sorted(Draft202012Validator(load_json(schema_path)).iter_errors(definition),
+                          key=lambda error: list(map(str, error.absolute_path)))
+        return problems[0].message[:220] if problems else None
+
+    try:
+        # -- the subjects -------------------------------------------------------
+        # 1. The Environments pre-sleep left running. Foreign sources for every
+        #    cross-Environment cell, and offline sources for the Internet cells.
+        for entry in established.get("environments") or []:
+            name = entry["isolate"]
+            try:
+                instances[name] = ctx.reattach(name)
+            except ReattachError as error:
+                refuse(str(error)[:220], "src:" + name)
+        recovered = sorted(instances)
+        check.check(len(recovered) == 3,
+                    f"the three Environments pre-sleep left running are addressable as matrix sources "
+                    f"(observed {recovered})")
+
+        # 2. The granted Environment: a declared private path, one declared host
+        #    import on machine-0, one declared host export on machine-0.
+        grant_definition = matrix_definition(ctx.release_dir, host_port=granted_service.port,
+                                             export_host_port=export_host_port)
+        problem = invalid(grant_definition)
+        if problem:
+            refuse("the shipped project schema rejects the granted-Environment definition: " + problem,
+                   "src:dm-grant", "dst:private", "dst:host-import", "dst:host-export")
+        else:
+            grant = provision(ctx, check, "dm-grant", grant_definition)
+            instances["dm-grant"] = grant
+            if grant.get("unsupported") or grant["status"] is None:
+                refuse("this runtime does not apply the declared private network, host import and host export "
+                       "the granted Environment declares: " + (grant.get("unsupported") or "vz up left no status")[:220],
+                       "src:dm-grant", "dst:private", "dst:host-import", "dst:host-export")
+            else:
+                provisioned.append("dm-grant")
+
+        # 3. The public-like edge.
+        edge_definition = public_like_definition(ctx.release_dir, PUBLIC_NAMES[0])
+        problem = invalid(edge_definition)
+        if problem:
+            refuse("the shipped project schema rejects the public-like definition: " + problem,
+                   "src:dm-edge", "dst:edge")
+        else:
+            edge = provision(ctx, check, "dm-edge", edge_definition)
+            instances["dm-edge"] = edge
+            if edge.get("unsupported") or edge["status"] is None:
+                refuse("this runtime does not apply the declared public-like network: " +
+                       (edge.get("unsupported") or "vz up left no status")[:220], "src:dm-edge", "dst:edge")
+            else:
+                provisioned.append("dm-edge")
+
+        # 4. The three egress policies the criterion names. `allowed` is in the
+        #    shipped enum, so its refusal (if any) is the runtime's; `cidr` and
+        #    `domain` are not, so their refusal is the schema's. Both are
+        #    recorded verbatim -- the criterion asks for these cells, and the
+        #    honest answer to "why is this cell blank" is whose rule blanked it.
+        for isolate, policy in (("dm-egress", "allowed"), ("dm-cidr", "cidr"), ("dm-domain", "domain")):
+            definition = egress_definition(ctx.release_dir, host_port=granted_service.port, policy=policy)
+            problem = invalid(definition)
+            if problem:
+                refuse(f"the shipped project schema cannot express a {policy} Internet policy: " + problem,
+                       "src:" + isolate)
+                continue
+            attempt = attempt_up(ctx, check, isolate, definition, timeout=DELETE_TIMEOUT)
+            instances[isolate] = attempt
+            if attempt["exit_code"] != 0 or attempt["status"] is None:
+                refuse(f"this runtime refuses a Machine with a {policy} egress attachment: " +
+                       (attempt["message"] or "vz up failed without naming a reason")[:220], "src:" + isolate)
+            else:
+                provisioned.append(isolate)
+
+        # -- the addresses the cells name --------------------------------------
+        private_address = None
+        if "dst:private" not in unavailable:
+            probed = machine_exec(ctx, check, "dm-grant-fabric", instances["dm-grant"], "machine-0", FABRIC_PROBE)
+            port = FabricState(probed).port()
+            private_address = port["address"] if port else None
+            if private_address is None:
+                refuse("the granted Environment's machine-0 carries no fabric address the host derived "
+                       f"({FabricState(probed).evidence()[:200]})", "dst:private")
+        lan_addresses = [a for a in host_non_loopback_addresses(ctx, check) if a != NAT_GATEWAY_ADDRESS][:2]
+        check.ok(f"non-loopback host addresses the LAN and export cells name: {lan_addresses}")
+
+        edge_anchors = {}
+        if "dst:edge" not in unavailable:
+            published = edge_anchor(instances["dm-edge"])
+            if len(published) != 1:
+                refuse(f"the public-like Environment published {len(published)} authorities, not one", "dst:edge")
+            else:
+                pem = read_regular(published[0])
+                for machine in ("machine-0", "machine-1"):
+                    edge_anchors[f"dm-edge/{machine}"] = install_anchor(
+                        ctx, check, f"dm-edge-anchor-{machine}", instances["dm-edge"], machine, "own.pem", pem)
+
+        # -- the declaration ----------------------------------------------------
+        grant_machines = ["dm-grant/machine-0", "dm-grant/machine-1"]
+        foreign_machines = [f"{name}/machine-0" for name in ("rec-a", "rec-b", "rec-c")]
+        plan = {
+            "grants": {("dm-grant/machine-0", f"host-loopback:{GRANTED_GUEST_PORT}", "tcp", GRANTED_GUEST_PORT)},
+            "grant_machines": grant_machines,
+            "foreign_machines": foreign_machines,
+            "edge_machines": ["dm-edge/machine-0", "dm-edge/machine-1"],
+            "egress_machines": ["dm-egress/machine-0", "dm-egress/machine-1"],
+            "cidr_machine": "dm-cidr/machine-0",
+            "domain_machine": "dm-domain/machine-0",
+            "import_machines": [*grant_machines, "rec-a/machine-0"],
+            "offline_machines": [*foreign_machines, *grant_machines],
+            "lan_machines": ["rec-a/machine-0", *grant_machines],
+            "private_endpoint": "dm-grant/machine-0:probe",
+            "private_address": private_address,
+            "private_token": private_token,
+            "host_ports": [(f"host-loopback:{GRANTED_GUEST_PORT}", GRANTED_GUEST_PORT, granted_service.token),
+                           (f"host-loopback:{UNDECLARED_GUEST_PORT}", UNDECLARED_GUEST_PORT, None),
+                           (f"host-service:{granted_service.port}", granted_service.port, granted_service.token),
+                           (f"host-foil:{foil_service.port}", foil_service.port, foil_service.token)],
+            "host_service_port": granted_service.port,
+            "host_service_token": granted_service.token,
+            "export_host_port": export_host_port,
+            "undeclared_export_port": undeclared_export_port,
+            "lan_addresses": lan_addresses,
+            "edge_name": PUBLIC_NAMES[0],
+            "edge_undeclared_name": UNDECLARED_NAME,
+            "edge_token": edge_token,
+            "edge_anchors": edge_anchors,
+        }
+        cells = enumerate_denial_matrix(plan)
+        declared = len(cells)
+        keys = [cell.key for cell in cells]
+        classes = sorted({cell.klass for cell in cells})
+        protocols = sorted({cell.protocol for cell in cells})
+        expectations = sorted({cell.expected for cell in cells})
+        check.check(declared >= DENIAL_MATRIX_MINIMUM_ROWS,
+                    f"the declared matrix enumerates {declared} rows (floor {DENIAL_MATRIX_MINIMUM_ROWS})")
+        check.check(len(set(keys)) == declared,
+                    f"every declared cell is a distinct source x destination x protocol x port "
+                    f"({len(set(keys))} distinct of {declared})")
+        check.check(classes == sorted(DENIAL_MATRIX_CLASSES),
+                    f"the matrix enumerates every destination class the criterion names (observed {classes}, "
+                    f"declared {sorted(DENIAL_MATRIX_CLASSES)})")
+        check.check({"tcp", "udp"} <= set(protocols),
+                    f"the matrix enumerates at least TCP and UDP (observed {protocols})")
+        check.check(expectations == ["allow", "deny"],
+                    f"the matrix declares both expectations (observed {expectations})")
+
+        # -- the probes ---------------------------------------------------------
+        def blocked(cell):
+            """The first resource this cell needs and does not have, or None."""
+            for resource in (*cell.requires, matrix_tool_requirement(cell)):
+                if resource is not None and resource in unavailable:
+                    return resource
+            return None
+
+        def preflight(source: str) -> None:
+            isolate, machine = matrix_source_parts(source)
+            receipt = machine_exec(ctx, check, f"dm-preflight-{isolate}-{machine}", instances[isolate], machine,
+                                   MATRIX_PREFLIGHT, timeout=HOST_BOUNDARY_TIMEOUT)
+            applets, fetch = parse_matrix_preflight(receipt)
+            if not applets:
+                refuse(f"{source} could not report the applets its BusyBox carries "
+                       f"(exit {receipt.exit_code})", *[f"tool:{source}:{a}" for a in MATRIX_PROBE_APPLETS.values()])
+                return
+            # The reason names the applet and not the Machine, so the
+            # not_implemented text below groups every Machine that lacks it into
+            # one sentence instead of repeating one fact about the image once
+            # per source until it crowds the other reasons out.
+            for applet in sorted(set(MATRIX_PROBE_APPLETS.values())):
+                if applet not in applets:
+                    refuse(f"this image's BusyBox carries no `{applet}` applet, so every cell needing it was "
+                           "not exercised", f"tool:{source}:{applet}")
+            if not fetch:
+                refuse(f"this image does not carry {GUEST_FETCH}, so its HTTPS cells were not exercised",
+                       f"tool:{source}:{GUEST_FETCH}")
+
+        for source in sorted({cell.source for cell in cells if cell.source != "host"}):
+            isolate = matrix_source_parts(source)[0]
+            if "src:" + isolate in unavailable or isolate not in instances:
+                refuse(unavailable.get("src:" + isolate, f"{isolate} was never provisioned"), "src:" + isolate)
+                continue
+            preflight(source)
+
+        attempted = []
+
+        def run_guest_phase(phase: str) -> None:
+            for source in sorted({cell.source for cell in cells
+                                  if cell.phase == phase and cell.source != "host"}):
+                isolate, machine = matrix_source_parts(source)
+                runnable = [cell for cell in cells
+                            if cell.phase == phase and cell.source == source and blocked(cell) is None]
+                if not runnable:
+                    continue
+                receipt = machine_exec(ctx, check, f"dm-{phase}-{isolate}-{machine}", instances[isolate], machine,
+                                       matrix_probe_script(runnable), timeout=MATRIX_PROBE_TIMEOUT)
+                results = parse_matrix_probe(receipt)
+                for cell in runnable:
+                    if cell.index not in results:
+                        # Left exactly as it was declared. A cell the probe loop
+                        # did not report is NOT an observation of anything, and
+                        # writing a value here would be the matrix analogue of a
+                        # sub-check that branches on a variable nobody set.
+                        continue
+                    status, output = results[cell.index]
+                    cell.observed, cell.detail = observe_matrix_cell(cell, status, output)
+                    attempted.append(cell)
+
+        def run_host_cell(cell, attempts: int) -> None:
+            status, output = None, ""
+            for attempt in range(1, attempts + 1):
+                receipt = ctx.run_tool(check, f"dm-host-{cell.port}-{attempt}",
+                                       ["/usr/bin/curl", "--silent", "--show-error", "--max-time", str(WGET_TIMEOUT),
+                                        matrix_probe_command(cell)],
+                                       cwd=ctx.state.root, env=ctx.state.env(), timeout=MATRIX_HOST_PROBE_TIMEOUT)
+                status, output = receipt.exit_code, receipt.stdout.decode("utf-8", "replace")
+                if status == 0 and (cell.token is None or cell.token in output):
+                    break
+                if attempt < attempts:
+                    time.sleep(LISTENER_INTERVAL)
+            cell.observed, cell.detail = observe_matrix_cell(cell, status, output)
+            attempted.append(cell)
+
+        held = None
+        try:
+            if "dm-grant" in instances and ("dst:private" not in unavailable
+                                            or "dst:host-export" not in unavailable):
+                held = hold_machine_exec(ctx, check, "dm-served-origin", instances["dm-grant"], "machine-0",
+                                         origin_script(private_token))
+            # The declared export is the readiness signal for this whole phase:
+            # it is the host's own view of the listener every `served` cell
+            # depends on, and it is the phase's one expected-allow host cell.
+            ready = next((cell for cell in cells
+                          if cell.klass == "host_export_declared" and blocked(cell) is None), None)
+            if ready is not None:
+                run_host_cell(ready, LISTENER_ATTEMPTS)
+            run_guest_phase("served")
+            for cell in cells:
+                if cell.source == "host" and cell is not ready and blocked(cell) is None:
+                    run_host_cell(cell, 1)
+        finally:
+            if held is not None:
+                released = ctx.release(check, held)
+                check.check(released.exit_code is not None,
+                            f"the granted Environment's held origin was released (exit {released.exit_code})")
+
+        held = None
+        try:
+            if "dst:edge" not in unavailable:
+                held = hold_machine_exec(ctx, check, "dm-edge-origin", instances["dm-edge"], "machine-0",
+                                         origin_script(edge_token))
+                first = next((cell for cell in cells
+                              if cell.klass == "public_like_ingress" and cell.protocol == "https"
+                              and blocked(cell) is None), None)
+                for attempt in range(1, LISTENER_ATTEMPTS + 1):
+                    if first is None:
+                        break
+                    isolate, machine = matrix_source_parts(first.source)
+                    receipt = machine_exec(ctx, check, f"dm-edge-ready-{attempt}", instances[isolate], machine,
+                                           matrix_probe_script([first]), timeout=MATRIX_PROBE_TIMEOUT)
+                    status, output = parse_matrix_probe(receipt).get(first.index, (None, ""))
+                    if observe_matrix_cell(first, status, output)[0] == "allow":
+                        break
+                    if attempt < LISTENER_ATTEMPTS:
+                        time.sleep(LISTENER_INTERVAL)
+            run_guest_phase("edge")
+        finally:
+            if held is not None:
+                released = ctx.release(check, held)
+                check.check(released.exit_code is not None,
+                            f"the public-like Environment's held origin was released (exit {released.exit_code})")
+
+        # Nothing is held for the `open` phase, deliberately: a Machine with a
+        # live loopback listener of its own answers its OWN loopback on any
+        # port, and every host-import, control-plane and Internet cell is
+        # addressed at loopback or off-host. Probing them while a local listener
+        # was up would read that listener as a host destination having answered.
+        run_guest_phase("open")
+
+        # -- the comparison -----------------------------------------------------
+        findings = denial_matrix_findings(cells)
+        runnable_total = len([cell for cell in cells if blocked(cell) is None])
+        check.check(len(attempted) == runnable_total,
+                    f"every cell whose subject exists was probed and reported a result of its own "
+                    f"({len(attempted)} reported of {runnable_total} runnable)")
+        orphans = [cell for cell in findings["unexecuted"] if blocked(cell) is None]
+        check.check(not orphans,
+                    "every unexercised cell names the resource this runtime does not have; a blank cell with no "
+                    f"reason is a hole in the matrix (observed {[cell.label() for cell in orphans[:6]]})")
+        check.check(not findings["unexpected_success"],
+                    "no cell declared deny was observed allow; unexpected success is what fails this criterion "
+                    f"(observed {[cell.label() for cell in findings['unexpected_success'][:6]]})")
+        check.check(not findings["unmet_allow"],
+                    "every cell declared allow was observed allow; a declared path that did not serve is a "
+                    "different failure from an unexpected success and is reported as one "
+                    f"(observed {[cell.label() for cell in findings['unmet_allow'][:6]]})")
+        check.check(not findings["indeterminate"],
+                    "no cell was answered by something that could not name itself; a reply without the "
+                    "destination's own token is neither reached nor refused "
+                    f"(observed {[cell.label() for cell in findings['indeterminate'][:6]]})")
+        if "src:dm-egress" in unavailable:
+            check.ok("the egress-attachment clause was not exercised: " + unavailable["src:dm-egress"][:200])
+        else:
+            crosstalk = egress_attachment_findings(cells)
+            check.check(not crosstalk,
+                        "two Machines of one Environment on different egress attachments neither share an "
+                        f"Internet policy nor a host import ({crosstalk[:4]})")
+
+        # -- the artifact -------------------------------------------------------
+        payload = denial_matrix_document(ctx.recorder.run_id, top, cells)
+        write_exclusive(ctx.evidence_dir / DENIAL_MATRIX_EVIDENCE,
+                        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False,
+                                   allow_nan=False).encode("utf-8") + b"\n")
+        check.evidence.append(DENIAL_MATRIX_EVIDENCE)
+        # Read back from the file the gate will validate, not from the object
+        # that was just serialised: the artifact IS this criterion's deliverable,
+        # and comparing the object against itself would prove nothing about the
+        # table anyone else reads. Both the count and the identity of every cell
+        # are compared, so a serialiser that dropped or merged rows is caught.
+        written = load_json(ctx.evidence_dir / DENIAL_MATRIX_EVIDENCE)
+        rows = written.get("rows") if isinstance(written, dict) else None
+        check.check(isinstance(rows, list) and len(rows) == declared and declared > 0,
+                    f"{DENIAL_MATRIX_EVIDENCE} carries one row per declared cell "
+                    f"({len(rows) if isinstance(rows, list) else rows} rows of {declared} declared)")
+        recorded = {(row.get("source"), row.get("destination"), row.get("protocol"), row.get("port"))
+                    for row in rows} if isinstance(rows, list) else set()
+        check.check(recorded == set(keys),
+                    f"{DENIAL_MATRIX_EVIDENCE} names exactly the declared cells "
+                    f"(missing {sorted(set(keys) - recorded)[:4]}, unexpected {sorted(recorded - set(keys))[:4]})")
+        if matrix_path.is_file():
+            problems = sorted(Draft202012Validator(load_json(matrix_path)).iter_errors(written),
+                              key=lambda error: list(map(str, error.absolute_path)))
+            check.check(not problems,
+                        f"{DENIAL_MATRIX_EVIDENCE} validates against {DENIAL_MATRIX_SCHEMA}" if not problems
+                        else f"{DENIAL_MATRIX_EVIDENCE} is not schema-valid: {problems[0].message[:200]}")
+        else:
+            check.fail(f"the connectivity-matrix schema is absent: {DENIAL_MATRIX_SCHEMA}")
+        check.ok(f"matrix rows: {declared}; executed {len(findings['executed'])}; "
+                 f"unexercised {len(findings['unexecuted'])}; classes {len(classes)}; protocols {protocols}")
+        if unavailable:
+            # Deduplicated by reason: a missing applet is one fact about the
+            # image, and repeating it once per Machine buries the other reasons.
+            grouped = {}
+            for resource, reason in sorted(unavailable.items()):
+                grouped.setdefault(reason, []).append(resource)
+            reasons = "; ".join(f"{sorted(resources)}: {reason}" for reason, resources in sorted(grouped.items()))
+            check.not_implemented = (
+                f"{len(findings['unexecuted'])} of the {declared} declared cells were not exercised, so the "
+                "matrix is complete as a declaration and partial as a measurement. Every cell that DID run is "
+                "graded above. Unexercised, in the refusing component's own words: " + reasons[:2400])
+    except (OSError, GateError) as error:
+        check.fail(f"the denial-matrix check could not complete: {type(error).__name__}: {error}")
+    finally:
+        granted_service.close()
+        foil_service.close()
+        # Only what this check created. The `rec-*` Environments belong to
+        # criterion 10 and to the phase, and deleting one here would remove the
+        # subject of the check that ran before this one.
+        for name in provisioned:
+            instance = instances.get(name)
+            if instance is None or instance.get("status") is None:
+                continue
+            try:
+                removed = ctx.run(check, name + "-delete",
+                                  ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                                  cwd=instance["project"], env=instance["env"], timeout=DELETE_TIMEOUT)
+                check.check(removed.exit_code == 0, f"{name}: deleted (exit {removed.exit_code})")
+            except OSError as error:
+                check.fail(f"{name}: could not be deleted: {type(error).__name__}: {error}")
+    return check.finish()
