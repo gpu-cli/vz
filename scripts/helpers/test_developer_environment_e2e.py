@@ -1344,3 +1344,237 @@ class PeerAddressTests(unittest.TestCase):
         """The clause it serves is `origin peer == edge` and `!= client`."""
         self.assertNotEqual(checks.peer_address("[::ffff:10.31.71.1]"),
                             checks.peer_address("[::ffff:10.31.71.200]"))
+
+
+TOP22 = e2e.CRITERION_22
+CRITERION_22_SLUGS = ("definition_change_plan_determinism", "immutable_change_refused_before_mutation",
+                      "concurrent_stale_reconcile_fail_closed", "effective_input_snapshot_identity")
+
+
+class DefinitionReconciliationFencingTests(unittest.TestCase):
+    """Criterion 22, against a stand-in that models the definition-digest surface.
+
+    These call the check functions directly rather than through the lane. The
+    criterion is assigned to `persisted-recovery/pre-sleep`, which has no
+    `--only`, so driving one falsifying value through the whole phase would
+    provision three Environments through the OTHER stand-in for every assertion
+    proved here. `test_persisted_recovery_provisions_and_recovers_across_the_checkpoint`
+    remains the test that runs the real phase end to end.
+
+    Every mode below makes the stand-in produce exactly one wrong value, and the
+    test names the sub-check and the failure text that has to notice it. A check
+    whose assertion is inert would pass all of them, which is the failure mode
+    this whole class exists to rule out.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vztl-recon-", dir="/private/tmp"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.mode_file = self.tmp / "mode"
+        self.mode_file.write_text("")
+        self.release = support.build_reconcile_release(self.tmp / "release", mode_file=self.mode_file)
+        self.state_root = self.tmp / DEEP_STATE_ROOT_PADDING / "state"
+        self.state_root.mkdir(parents=True)
+        self.socket_root = recorder.socket_root_for(self.state_root)
+        self.addCleanup(shutil.rmtree, self.socket_root, ignore_errors=True)
+
+    def run_criterion_22(self, mode: str = ""):
+        """Establish three Environments through the stand-in, then run all four."""
+        self.mode_file.write_text(mode)
+        state = recorder.LaneState(self.state_root, self.release / "bin")
+        state.create()
+        evidence = self.tmp / "evidence"
+        evidence.mkdir()
+        ctx = checks.CheckContext(repo_root=common.REPO_ROOT, release_dir=self.release, state=state,
+                                  recorder=recorder.Recorder(evidence, RUN_ID), evidence_dir=evidence,
+                                  cli_removal={})
+        established = support.establish_reconcile_environments(ctx, e2e.RECOVERY_ISOLATES)
+        recorded = [dict(entry) for entry in established["environments"]]
+        subs = {sub.slug: sub for sub in
+                checks.check_definition_reconciliation_fencing(ctx, TOP22, established)}
+        self.assertEqual(sorted(subs), sorted(CRITERION_22_SLUGS))
+        return subs, established, recorded
+
+    def assert_falsified(self, mode: str, slug: str, needle: str):
+        """One wrong value; the named sub-check must report it as a FAILURE."""
+        subs, _established, _recorded = self.run_criterion_22(mode)
+        sub = subs[slug]
+        self.assertEqual(sub.status, "FAIL", (mode, slug))
+        self.assertTrue(any(needle in text for text in sub.failures),
+                        (mode, slug, needle, sub.failures, sub.assertions))
+        return subs
+
+    # -- the runtime as it is today -----------------------------------------------------
+    def test_todays_runtime_proves_what_it_can_and_names_the_rest(self):
+        """Every definition change is refused before admission, and it says so.
+
+        The installed runtime refuses any changed ProjectDefinition in
+        `resolve_or_reserve_environment_for_up_in_transaction`, so the
+        deterministic-plan, durable-claim and effective-input clauses have no
+        subject. Each sub-check must therefore prove the half that does have one
+        -- identity preserved, nothing mutated, everything fails closed -- and
+        report the rest as `not_implemented`, naming the sub-document clause and
+        quoting the runtime.
+        """
+        subs, established, recorded = self.run_criterion_22("")
+        for slug, sub in sorted(subs.items()):
+            self.assertTrue(sub.not_implemented, slug)
+            self.assertEqual(sub.status, "FAIL", slug)
+            self.assertTrue(sub.evidence, slug)
+        # Exactly one clause of the criterion is reported as a failed assertion
+        # rather than as an unexercisable contract: this runtime refuses a
+        # mutable and an immutable change with one code, so the classification
+        # the criterion requires did not happen. Everything else it was asked
+        # for, it did.
+        self.assertEqual([slug for slug, sub in sorted(subs.items()) if sub.failures],
+                         ["immutable_change_refused_before_mutation"])
+        self.assertEqual(len(subs["immutable_change_refused_before_mutation"].failures), 1)
+        self.assertIn("classified apart from the mutable one",
+                      subs["immutable_change_refused_before_mutation"].failures[0])
+        plan = subs["definition_change_plan_determinism"]
+        self.assertIn(checks.RECONCILE_INPUTS_DOC, plan.not_implemented)
+        self.assertIn(checks.RECONCILE_FENCING_DOC, plan.not_implemented)
+        self.assertIn("project definition drift", plan.not_implemented)
+        self.assertTrue(any("produced the same plan twice" in text for text in plan.assertions), plan.assertions)
+        self.assertTrue(any("consumed no lifecycle generation" in text for text in plan.assertions), plan.assertions)
+        refusal = subs["immutable_change_refused_before_mutation"]
+        self.assertIn("same 'validation_error' refusal", refusal.not_implemented)
+        self.assertTrue(any("byte-identical across the refused Up" in text for text in refusal.assertions),
+                        refusal.assertions)
+        self.assertTrue(any("names the exact precondition" in text for text in refusal.assertions),
+                        refusal.assertions)
+        fencing = subs["concurrent_stale_reconcile_fail_closed"]
+        self.assertIn(checks.RECONCILE_FENCING_DOC, fencing.not_implemented)
+        self.assertIn("start_reconcile_batch", fencing.not_implemented)
+        for needle in ("no mixed-version topology", "no cross-owner adoption", "no orphaned resources",
+                       "stale client replaying request"):
+            self.assertTrue(any(needle in text for text in fencing.assertions), (needle, fencing.assertions))
+        inputs = subs["effective_input_snapshot_identity"]
+        self.assertIn("vz-effective-service-input-v1", inputs.not_implemented)
+        self.assertIn("vz-reconcile-input-manifest-v1", inputs.not_implemented)
+        self.assertIn(checks.PROJECT_DEFINITION_SCHEMA, inputs.not_implemented)
+        # Nothing here may consume a lifecycle generation: post-wake compares
+        # against exactly the value pre-sleep recorded.
+        self.assertEqual([entry["lifecycle_generation"] for entry in established["environments"]],
+                         [entry["lifecycle_generation"] for entry in recorded])
+
+    # -- the runtime the criterion describes --------------------------------------------
+    def test_a_reconciling_runtime_passes_the_three_reconcile_sub_checks(self):
+        """`recon_reconciles` accepts mutable changes and classifies immutable ones.
+
+        Without this the whole criterion could be satisfied by a check that only
+        knows how to report `not_implemented`. Here the accepting path is
+        exercised: the plan is compared across two accepted Ups, identity is
+        compared across a real reconcile, the immutable change is refused with
+        its own code, and the concurrent pair converges on one version.
+        """
+        subs, established, recorded = self.run_criterion_22("recon_reconciles")
+        for slug in ("definition_change_plan_determinism", "immutable_change_refused_before_mutation",
+                     "concurrent_stale_reconcile_fail_closed"):
+            self.assertFalse(subs[slug].failures, (slug, subs[slug].failures))
+            self.assertIsNone(subs[slug].not_implemented, (slug, subs[slug].not_implemented))
+            self.assertEqual(subs[slug].status, "PASS", slug)
+        refusal = subs["immutable_change_refused_before_mutation"]
+        self.assertTrue(any("classified apart from the mutable one" in text and "immutable_field_change" in text
+                            for text in refusal.assertions), refusal.assertions)
+        self.assertTrue(any("an accepted reconcile persisted the definition it planned from" in text
+                            for text in subs["definition_change_plan_determinism"].assertions))
+        # The effective-input snapshot is still unimplemented even here: the
+        # definition declares no services to digest.
+        self.assertTrue(subs["effective_input_snapshot_identity"].not_implemented)
+        # A runtime that accepts changes needs its Environments reconciled back
+        # and pre-sleep's record refreshed, or post-wake compares against a
+        # generation this criterion consumed.
+        self.assertTrue(any("reconciled back to the definition pre-sleep recorded" in text
+                            for text in subs["definition_change_plan_determinism"].assertions))
+        self.assertGreater(established["environments"][0]["lifecycle_generation"],
+                           recorded[0]["lifecycle_generation"])
+
+    # -- one wrong value each -----------------------------------------------------------
+    def test_a_nondeterministic_plan_fails_the_determinism_sub_check(self):
+        self.assert_falsified("recon_nondeterministic", "definition_change_plan_determinism",
+                              "the two plans differ")
+
+    def test_a_desired_digest_that_ignores_the_definition_is_named_not_implemented(self):
+        """The `FAKE_VZ` shape: a digest derived from the project id alone.
+
+        Every clause after it would be asserted against a value the definition
+        cannot influence, so the sub-check has to say so instead of comparing.
+        """
+        subs = self.assert_falsified("recon_digest_ignores_value", "definition_change_plan_determinism",
+                                     "the desired definition digest must follow")
+        sub = subs["definition_change_plan_determinism"]
+        self.assertIn("no desired-input identity for planning to consume", sub.not_implemented)
+
+    def test_an_identity_that_moves_under_a_refusal_fails_the_pre_mutation_sub_check(self):
+        subs = self.assert_falsified("recon_identity_drift", "immutable_change_refused_before_mutation",
+                                     "identities changed despite the refusal")
+        self.assertTrue(any("changed pre-sleep's recorded identity" in text
+                            for text in subs["immutable_change_refused_before_mutation"].failures))
+
+    def test_a_refusal_that_writes_state_fails_the_pre_mutation_sub_check(self):
+        self.assert_falsified("recon_mutates_on_refusal", "immutable_change_refused_before_mutation",
+                              "the refused Up mutated the state root")
+
+    def test_an_accepted_immutable_change_fails_the_pre_mutation_sub_check(self):
+        """The half of the clause that is not about mutation: it must fail at all."""
+        self.assert_falsified("recon_accepts_immutable", "immutable_change_refused_before_mutation",
+                              "was refused (exit 0, expected non-zero)")
+
+    def test_a_refusal_without_a_code_fails_the_structured_explanation_assertion(self):
+        self.assert_falsified("recon_no_code", "immutable_change_refused_before_mutation",
+                              "the refusal carries a machine-readable code")
+
+    def test_an_activation_digest_planning_never_recorded_is_caught(self):
+        """`reconcile-effective-inputs.md`'s central claim, in its public form.
+
+        Planning and activation must consume one snapshot. If the Environment
+        reports a definition digest the project never persisted, the two are not
+        reading the same inputs and the sub-check must say so.
+        """
+        subs = self.assert_falsified("recon_activation_digest_differs", "effective_input_snapshot_identity",
+                                     "planning and activation name one desired-input identity")
+        self.assertTrue(any("one definition version across the project and the Environment" in text
+                            for text in subs["concurrent_stale_reconcile_fail_closed"].failures),
+                        subs["concurrent_stale_reconcile_fail_closed"].failures)
+
+    def test_a_refusal_that_names_no_precondition_fails_the_fencing_assertion(self):
+        self.assert_falsified("recon_incidental_refusal", "immutable_change_refused_before_mutation",
+                              "names the exact precondition it was decided against")
+
+    def test_a_consumed_generation_under_a_refusal_is_caught(self):
+        subs = self.assert_falsified("recon_consumes_generation", "definition_change_plan_determinism",
+                                     "a refused reconcile consumed no lifecycle generation")
+        self.assertTrue(any("the refused pair consumed no lifecycle generation" in text
+                            for text in subs["concurrent_stale_reconcile_fail_closed"].failures),
+                        subs["concurrent_stale_reconcile_fail_closed"].failures)
+
+    def test_a_silently_replaced_machine_incarnation_is_mixed_version_topology(self):
+        self.assert_falsified("recon_bumps_incarnation", "concurrent_stale_reconcile_fail_closed",
+                              "no mixed-version topology")
+
+    def test_an_accepted_stale_replay_fails_the_stale_client_sub_check(self):
+        self.assert_falsified("recon_accepts_stale_replay", "concurrent_stale_reconcile_fail_closed",
+                              "that moved again is refused (exit 0")
+
+    def test_a_resource_that_appears_under_a_refusal_is_an_orphan(self):
+        self.assert_falsified("recon_orphan", "concurrent_stale_reconcile_fail_closed",
+                              "orphaned/extra resources")
+
+    def test_one_resource_id_claimed_by_two_environments_is_cross_owner_adoption(self):
+        self.assert_falsified("recon_cross_owner", "concurrent_stale_reconcile_fail_closed",
+                              "cross-owner adoption:")
+
+    def test_a_digest_over_the_file_bytes_is_not_a_canonical_input_identity(self):
+        self.assert_falsified("recon_digest_over_bytes", "effective_input_snapshot_identity",
+                              "reserializing the same definition does not change its digest")
+
+    def test_a_published_snapshot_key_is_no_longer_an_absence_to_report(self):
+        """The absence assertion must be a comparison, not a formality.
+
+        `reconcile-effective-inputs.md`'s clauses are reported unexercisable
+        because no snapshot identity reaches a public interface. If one did, the
+        sub-check must stop claiming the absence rather than keep reporting it.
+        """
+        self.assert_falsified("recon_publishes_snapshot_keys", "effective_input_snapshot_identity",
+                              "the public surface publishes ['manifest_digest']")

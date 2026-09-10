@@ -1472,3 +1472,407 @@ def build_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path = Non
     for path in root.rglob("*"):
         path.chmod(stat.S_IMODE(path.lstat().st_mode) & ~0o222)
     return root
+
+
+# --------------------------------------------------------------------- criterion 22
+#
+# A second, purpose-built stand-in for `vz`, used ONLY by the criterion-22 tests.
+# `FAKE_VZ` above models a CLI whose definition digest is derived from the
+# project id, so editing `vz.json` never moves it and there is no reconciliation
+# decision to observe. Rather than teach that stand-in a second job -- five
+# criteria's checks depend on its exact current behaviour -- this one models the
+# one surface criterion 22 reads and nothing else: the desired/persisted
+# definition digests, `definition_drift`, and what `vz up` does when they differ.
+#
+# Its default behaviour is the installed runtime's: every ProjectDefinition
+# change is refused before admission with a `validation_error` naming both
+# digests (`resolve_or_reserve_environment_for_up_in_transaction` in
+# crates/vz-stack/src/state_store/topology.rs). Each named mode below produces
+# exactly one wrong value so one assertion of one sub-check has to notice it, and
+# `recon_reconciles` models the runtime the criterion describes -- one that
+# reconciles mutable changes and classifies immutable ones -- so the checks are
+# exercised on the accepting path too.
+RECONCILE_MODES = ("", "recon_reconciles", "recon_identity_drift", "recon_nondeterministic",
+                   "recon_mutates_on_refusal", "recon_incidental_refusal", "recon_no_code",
+                   "recon_accepts_stale_replay", "recon_orphan", "recon_cross_owner",
+                   "recon_consumes_generation", "recon_bumps_incarnation", "recon_accepts_immutable",
+                   "recon_activation_digest_differs", "recon_digest_ignores_value",
+                   "recon_digest_over_bytes", "recon_publishes_snapshot_keys")
+
+RECONCILE_VZ = r'''#!/usr/bin/python3
+"""UNIT-TEST-ONLY stand-in for `vz`: the definition-digest surface only."""
+import hashlib
+import json
+import os
+import sys
+import uuid
+
+MODE_FILE = __MODE_FILE__
+SHARED_NETWORK = "net_adopted_shared"
+
+
+def mode():
+    try:
+        with open(MODE_FILE, encoding="utf-8") as stream:
+            return stream.read().strip()
+    except OSError:
+        return ""
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def state_path():
+    return os.path.join(os.environ["VZ_RUNTIME_DATA_DIR"], "recon-state.json")
+
+
+def load_state():
+    try:
+        with open(state_path(), encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(state):
+    # Atomic: the concurrent-Up sub-check runs two of these at once, and a
+    # reader that saw a truncated file would decide there is no topology at all
+    # and mint a second Environment.
+    os.makedirs(os.path.dirname(state_path()), exist_ok=True)
+    temporary = state_path() + ".%d.tmp" % os.getpid()
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(state, stream, sort_keys=True)
+    os.replace(temporary, state_path())
+
+
+def key_path(key):
+    """One file per idempotency key, so two concurrent Ups cannot lose one."""
+    return os.path.join(os.environ["VZ_RUNTIME_DATA_DIR"],
+                        "recon-key-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16] + ".txt")
+
+
+def seen_key(key):
+    try:
+        with open(key_path(key), encoding="utf-8") as stream:
+            return stream.read().strip()
+    except OSError:
+        return None
+
+
+def remember_key(key, digest):
+    with open(key_path(key), "w", encoding="utf-8") as stream:
+        stream.write(digest)
+
+
+def read_definition():
+    with open("vz.json", "rb") as stream:
+        raw = stream.read()
+    return raw, json.loads(raw.decode("utf-8"))
+
+
+def desired_digest(raw, definition):
+    """The identity planning consumes. Canonical over the VALUE by default."""
+    if mode() == "recon_digest_ignores_value":
+        return "sha256:" + hashlib.sha256(definition["project_id"].encode()).hexdigest()
+    if mode() == "recon_digest_over_bytes":
+        return "sha256:" + hashlib.sha256(raw).hexdigest()
+    return "sha256:" + hashlib.sha256(canonical(definition)).hexdigest()
+
+
+def persisted_digest(state):
+    """The identity activation was admitted under, spelled the same way."""
+    if mode() == "recon_digest_ignores_value":
+        return "sha256:" + hashlib.sha256(state["definition"]["project_id"].encode()).hexdigest()
+    if mode() == "recon_digest_over_bytes":
+        return "sha256:" + hashlib.sha256(state["raw"].encode("utf-8")).hexdigest()
+    return "sha256:" + hashlib.sha256(canonical(state["definition"])).hexdigest()
+
+
+def create(raw, definition):
+    suffix = uuid.uuid4().hex[:12]
+    return {
+        "definition": definition,
+        "raw": raw.decode("utf-8"),
+        "environment_id": "env_" + suffix,
+        "name": "default",
+        "lifecycle_generation": 1,
+        "machines": [{"machine_id": "mch_%s_%s" % (suffix, machine["name"]),
+                      "name": machine["name"], "profile": machine["profile"],
+                      "target": machine["target"],
+                      "incarnation_id": "inc_%s_%s" % (suffix, machine["name"]),
+                      "incarnation_generation": 1}
+                     for machine in definition["environment"]["machines"]],
+        "networks": [{"network_id": "net_%s_%s" % (suffix, index), "name": network["name"],
+                      "kind": network.get("kind", "private"), "cidr": "10.85.0.0/24"}
+                     for index, network in enumerate(definition["environment"].get("networks") or [])],
+        "ups": 0,
+    }
+
+
+def networks_of(state):
+    rows = list(state["networks"])
+    if mode() == "recon_cross_owner":
+        # One id every Environment claims: two owners for one resource.
+        rows.append({"network_id": SHARED_NETWORK, "name": "shared", "kind": "private", "cidr": "10.99.0.0/24"})
+    return rows
+
+
+def status_document(state, raw, definition):
+    desired = desired_digest(raw, definition)
+    persisted = persisted_digest(state)
+    machines = []
+    for machine in state["machines"]:
+        machines.append({
+            "machine_id": machine["machine_id"], "name": machine["name"], "state": "ready",
+            "profile": machine["profile"], "target": machine["target"], "health": "supervised",
+            "requested_capabilities": {"capabilities": ["posix_exec"]},
+            "negotiated_capabilities": {"capabilities": ["posix_exec"]},
+            "backend": "macos_virtualization_linux",
+            "incarnation_id": machine["incarnation_id"],
+            "incarnation_generation": machine["incarnation_generation"],
+            "docker_context": {"name": "vzr1-ctx-" + machine["machine_id"],
+                               "endpoint": "unix:///tmp/" + machine["machine_id"] + ".sock",
+                               "engine_id": "eng-" + machine["machine_id"],
+                               "owner": {"project_id": state["definition"]["project_id"],
+                                         "environment_id": state["environment_id"],
+                                         "machine_id": machine["machine_id"]}},
+            "docker_context_availability": "persisted_ready_not_live_probed"})
+    # What activation was admitted under. `recon_activation_digest_differs`
+    # makes it a digest planning never recorded.
+    activation = "sha256:" + "a" * 64 if mode() == "recon_activation_digest_differs" else persisted
+    document = {
+        "schema_version": 1, "request_id": "req-" + uuid.uuid4().hex[:12],
+        "topology_state_source": "persisted", "definition_path": os.path.join(os.getcwd(), "vz.json"),
+        "project_id": definition["project_id"], "project_name": state["definition"]["name"],
+        "host": {"os": "macos", "arch": "aarch64"},
+        "daemon": {"backend_name": "macos-vz", "version": "0.1.0"},
+        "desired_definition_digest": desired, "persisted_definition_digest": persisted,
+        "definition_drift": desired != persisted, "selection_source": "workspace",
+        "environments": [{"environment_id": state["environment_id"], "name": state["name"], "state": "ready",
+                          "definition_digest": activation,
+                          "lifecycle_generation": state["lifecycle_generation"],
+                          "machines": machines, "networks": networks_of(state),
+                          "network_attachments": [], "endpoints": []}]}
+    if mode() == "recon_publishes_snapshot_keys":
+        document["manifest_digest"] = "sha256:" + "0" * 64
+    return document
+
+
+def refuse(code, message, request_id, key):
+    envelope = {"message": message, "request_id": request_id, "idempotency_key": key,
+                "details": {"reason": message}}
+    if mode() != "recon_no_code":
+        envelope["code"] = code
+    sys.stderr.write(json.dumps({"schema_version": 1, "error": envelope}) + "\n")
+    return 2
+
+
+def admission_of(state, digest, request_id, key):
+    return {"schema_version": 1, "project_id": state["definition"]["project_id"],
+            "environment_id": state["environment_id"],
+            "machine_ids": sorted(machine["machine_id"] for machine in state["machines"]),
+            "definition_digest": digest, "request_id": request_id, "idempotency_key": key,
+            "request_hash": "sha256:" + "1" * 64, "workspace_key": "wk-fake", "created_at": 1}
+
+
+def emit(record):
+    sys.stdout.write(json.dumps(record) + "\n")
+
+
+def progress(state, digest, request_id, key, phase, completion, attempt):
+    event = {"schema_version": 1, "sequence": 1 if phase == "admitted" else 2,
+             "admission": admission_of(state, digest, request_id, key), "phase": phase,
+             "preparation": None,
+             "operation": {"operation_id": "op-" + uuid.uuid4().hex[:8], "kind": "up",
+                           "generation": state["lifecycle_generation"]},
+             "completion": completion}
+    if mode() == "recon_nondeterministic":
+        # A plan that is not a function of its inputs: two identical requests
+        # announce different work.
+        event["attempt"] = attempt
+    emit({"schema_version": 1, "record_type": "operation_progress", "progress": event})
+
+
+def accept(state, digest, request_id, key, raw, definition, attempt):
+    progress(state, digest, request_id, key, "admitted", None, attempt)
+    state["definition"] = definition
+    state["raw"] = raw.decode("utf-8")
+    state["lifecycle_generation"] += 1
+    save_state(state)
+    completion = {"admission": admission_of(state, digest, request_id, key), "error": None}
+    progress(state, digest, request_id, key, "ready", completion, attempt)
+    return 0
+
+
+def only_resources_changed(before, after):
+    """True when the two definitions differ only in Machine `resources`."""
+    def stripped(value):
+        copy = json.loads(json.dumps(value))
+        for machine in copy["environment"]["machines"]:
+            machine.pop("resources", None)
+        return canonical(copy)
+    return stripped(before) == stripped(after) and canonical(before) != canonical(after)
+
+
+def run_up(argv):
+    request_id, key = "req-" + uuid.uuid4().hex[:12], "up-" + uuid.uuid4().hex[:12]
+    for index, argument in enumerate(argv):
+        if argument == "--request-id" and index + 1 < len(argv):
+            request_id = argv[index + 1]
+        if argument == "--idempotency-key" and index + 1 < len(argv):
+            key = argv[index + 1]
+    started = {"schema_version": 1, "record_type": "request_started", "operation": "up_environment",
+               "request_id": request_id, "idempotency_key": key}
+    raw, definition = read_definition()
+    state = load_state()
+    if state is None:
+        emit(started)
+        state = create(raw, definition)
+        state["ups"] = 1
+        save_state(state)
+        return accept(state, desired_digest(raw, definition), request_id, key, raw, definition, 1)
+    state["ups"] += 1
+    save_state(state)
+    attempt = state["ups"]
+    if mode() == "recon_nondeterministic":
+        # A plan that is not a function of its inputs: two identical requests
+        # announce different work. Carried on the first record so it shows up on
+        # the refusing path too, which is the one today's runtime takes.
+        started["attempt"] = attempt
+    emit(started)
+    desired, persisted = desired_digest(raw, definition), persisted_digest(state)
+    seen = seen_key(key)
+    remember_key(key, desired)
+    if seen is not None and seen != desired and mode() == "recon_accepts_stale_replay":
+        # A stale client's request identity replayed against inputs that moved,
+        # accepted as if it were the same request.
+        return accept(state, desired, request_id, key, raw, definition, attempt)
+    if seen is not None and seen != desired:
+        return refuse("state_conflict",
+                      "Up idempotency key belongs to a different immutable request; "
+                      "persisted digest=%s, requested digest=%s" % (persisted, desired),
+                      request_id, key)
+    if desired == persisted:
+        return accept(state, desired, request_id, key, raw, definition, attempt)
+    if mode() == "recon_accepts_immutable":
+        # A change to a field the persisted instance is compared against,
+        # applied in place instead of refused.
+        return accept(state, desired, request_id, key, raw, definition, attempt)
+    if mode() == "recon_reconciles":
+        if only_resources_changed(state["definition"], definition):
+            return accept(state, desired, request_id, key, raw, definition, attempt)
+        return refuse("immutable_field_change",
+                      "Machine `%s` target differs and cannot be reconciled in place; "
+                      "persisted digest=%s, requested digest=%s"
+                      % (definition["environment"]["machines"][0]["name"], persisted, desired),
+                      request_id, key)
+    if mode() == "recon_identity_drift":
+        state["environment_id"] = "env_" + uuid.uuid4().hex[:12]
+        save_state(state)
+    if mode() == "recon_mutates_on_refusal":
+        marker = os.path.join(os.path.dirname(os.environ["VZ_RUNTIME_STATE_DB"]), "refused-marker")
+        with open(marker, "w", encoding="utf-8") as stream:
+            stream.write("a refused Up wrote this\n")
+    if mode() == "recon_orphan":
+        state["networks"].append({"network_id": "net_orphan_" + uuid.uuid4().hex[:8], "name": "orphan",
+                                  "kind": "private", "cidr": "10.77.0.0/24"})
+        save_state(state)
+    if mode() == "recon_consumes_generation":
+        state["lifecycle_generation"] += 1
+        save_state(state)
+    if mode() == "recon_bumps_incarnation":
+        state["machines"][0]["incarnation_generation"] += 1
+        save_state(state)
+    if mode() == "recon_incidental_refusal":
+        return refuse("validation_error", "reconcile failed", request_id, key)
+    return refuse("validation_error",
+                  "invalid stack spec: project definition drift for `%s`; persisted digest=%s, "
+                  "requested digest=%s" % (definition["project_id"], persisted, desired),
+                  request_id, key)
+
+
+def run_status():
+    raw, definition = read_definition()
+    state = load_state()
+    if state is None:
+        sys.stderr.write(json.dumps({"schema_version": 1, "error": {
+            "code": "daemon_unavailable", "message": "no topology has been created"}}) + "\n")
+        return 2
+    sys.stdout.write(json.dumps(status_document(state, raw, definition), indent=1) + "\n")
+    return 0
+
+
+def main(argv):
+    verb = next((argument for argument in argv if argument in ("up", "status", "stop", "delete", "exec")), None)
+    if verb == "up":
+        return run_up(argv)
+    if verb == "status":
+        return run_status()
+    sys.stderr.write(json.dumps({"schema_version": 1, "error": {
+        "code": "unsupported_operation", "message": "this stand-in serves only up and status"}}) + "\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+'''
+
+
+def build_reconcile_release(root: Path, *, mode_file: Path) -> Path:
+    """A minimal release directory whose `bin/vz` is the reconciliation stand-in.
+
+    Not `build_fake_release`: that one compiles a Mach-O daemon stand-in (so a
+    test skips where no compiler exists) and rewrites checksums for
+    `admit_release_dir`. The criterion-22 tests call the check functions directly
+    with a `CheckContext`, so neither is needed and neither should gate them.
+    `machine-target-catalog.json` is present because `minimal_definition` reads
+    it; `bin/vz-runtimed` is never executed by this stand-in and never spawned.
+    """
+    (root / "bin").mkdir(parents=True)
+    (root / "bin/vz").write_text(RECONCILE_VZ.replace("__MODE_FILE__", json.dumps(str(mode_file))))
+    (root / "bin/vz").chmod(0o755)
+    (root / "bin/vz-runtimed").write_text("#!/bin/sh\nexit 1\n")
+    (root / "bin/vz-runtimed").chmod(0o755)
+    (root / "machine-target-catalog.json").write_bytes(
+        json.dumps(CATALOG, indent=2, sort_keys=True).encode() + b"\n")
+    return root
+
+
+def establish_reconcile_environments(ctx, names) -> dict:
+    """`establish_recovery_environments`' record, over the reconciliation stand-in.
+
+    The real one writes a Machine-local sentinel through `vz exec` and commits
+    the definition to git, neither of which this stand-in serves or the
+    criterion-22 checks read. What they do read is the isolate layout, the
+    Environment/Machine identities and the persisted definition digest, and those
+    are recorded here exactly as `establish_recovery_environments` records them.
+    """
+    import uuid as _uuid
+
+    import developer_environment_checks as _checks
+
+    check = _checks.SubCheck("gate.definition.reconciliation_fencing", "establish_reconcile_environments")
+    environments = []
+    for name in names:
+        definition = _checks.minimal_definition(ctx.release_dir)
+        definition["project_id"] = "prj_" + _uuid.uuid4().hex
+        data = json.dumps(definition, indent=2, sort_keys=True).encode() + b"\n"
+        iso = ctx.isolated(name, project_files={"vz.json": data}, provision=True)
+        started = ctx.run(check, name + "-up", ["--json", "up"], cwd=iso["project"], env=iso["env"], timeout=120)
+        if started.exit_code != 0:
+            raise AssertionError(f"{name}: stand-in up exited {started.exit_code}: {started.stderr[:400]!r}")
+        payload = _checks.read_status(ctx, check, name, project=iso["project"], env=iso["env"])
+        environment = (payload.get("environments") or [{}])[0]
+        environments.append({
+            "isolate": name, "token": "vzrec-fake", "project_id": payload.get("project_id"),
+            "definition_digest": payload.get("persisted_definition_digest"),
+            "environment_id": environment.get("environment_id"), "environment_name": environment.get("name"),
+            "state": environment.get("state"), "lifecycle_generation": environment.get("lifecycle_generation"),
+            "machines": [{"name": machine.get("name"), "machine_id": machine.get("machine_id"),
+                          "incarnation_id": machine.get("incarnation_id"),
+                          "incarnation_generation": machine.get("incarnation_generation"),
+                          "state": machine.get("state"),
+                          "docker_context": (machine.get("docker_context") or {}).get("name")}
+                         for machine in environment.get("machines") or []]})
+    return {"schema_version": 1, "kind": _checks.RECOVERY_RECORD_KIND, "environments": environments}
