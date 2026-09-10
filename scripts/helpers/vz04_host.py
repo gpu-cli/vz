@@ -341,7 +341,15 @@ class HostScope:
 
 def capture(scope: HostScope, moment: str) -> dict:
     sources, errors = {}, []
-    sources["lsof"], lsof_out = run_capture([LSOF, "-nP", "-iTCP", "-sTCP:LISTEN", "-iUDP", "-F", "pcPnT"], 60)
+    # `-b` avoids the kernel calls lsof would otherwise make that can block --
+    # lstat, readlink and stat on filesystems that may hang. Without it this call
+    # measured 20.6s on a developer Mac and 0.06s with it, for byte-identical
+    # parsed output: 130 rows either way, every pid and command present. The cost
+    # is not proportional to what is returned -- TCP alone and UDP alone each took
+    # the full 20s -- so it was never enumeration, it was blocking per call.
+    # criterion 6 captures twice per lane invocation, so this dominated the gate
+    # suite's runtime by roughly half an hour.
+    sources["lsof"], lsof_out = run_capture([LSOF, "-nPb", "-iTCP", "-sTCP:LISTEN", "-iUDP", "-F", "pcPnT"], 60)
     sources["netstat"], netstat_out = run_capture([NETSTAT, "-an", "-f", "inet", "-f", "inet6"], 60)
     sources["ps"], ps_out = run_capture([PS, "-axo", "pid=,ppid=,command="], 60)
     sources["docker_context_ls"], contexts = docker_contexts(scope.clients.get("docker"), scope.docker_config)

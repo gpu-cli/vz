@@ -1155,6 +1155,12 @@ BUSYBOX_SHIM = r'''#!/bin/sh
 # this fake has (project == Environment).
 state="$VZ_RUNTIME_DATA_DIR"
 machine="${VZ_FAKE_MACHINE:-machine-0}"
+# Criterion 7's falsifying modes (import_any_port, import_any_machine,
+# export_wildcard) are read from here. The merge that brought them in kept the
+# environment pass-through but not this assignment, so `$mode` was empty and all
+# three modes were silently inert -- the check passed in every mode, which is
+# exactly the shape of a vacuity test that cannot fail.
+mode="${VZ_FAKE_MODE:-}"
 applet=$1
 shift
 . "$(dirname "$0")/fake-net.sh"
