@@ -39,7 +39,7 @@ const V0_3_20_MALFORMED_FIXTURE_SHA256: &str =
     "e99a5c6bd2a82c9ef2389ffe12fc00cd637a4f341def67e37e741e7b0b27db38";
 
 // Unit-test backend receipt, deliberately not release/runtime evidence.
-fn test_activation(incarnation: MachineIncarnation) -> MachineActivationEvidence {
+pub(super) fn test_activation(incarnation: MachineIncarnation) -> MachineActivationEvidence {
     MachineActivationEvidence {
         docker_context: None,
         schema_version: TOPOLOGY_SCHEMA_VERSION,

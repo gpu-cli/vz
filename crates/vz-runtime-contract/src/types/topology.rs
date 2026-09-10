@@ -2295,15 +2295,34 @@ impl EnvironmentInstance {
             }
         }
         match self.state {
+            // Ready is a claim about the topology the project DECLARED, so it
+            // reads `fork` like every other definition-versus-instance
+            // comparison in this file. A fork is a runtime object: it is absent
+            // from `vz.json`, reconciliation does not see it, and it publishes
+            // no endpoints. Letting one hold the Environment out of Ready would
+            // contradict all three -- reconciliation would report nothing to do
+            // while the aggregate reported not-Ready over a Machine
+            // reconciliation does not consider.
+            //
+            // It is also what makes the feature work at all. Forking exists so
+            // that N worktrees can each take a warm copy concurrently; if a
+            // booting fork moved the shared Environment off Ready, every
+            // sibling agent would see the Environment change state underneath
+            // it because someone else forked, which is precisely the
+            // interference forking is meant to remove.
+            //
+            // A fork's own state is reported per-Machine by `vz status` and
+            // addressed by its own name, so nothing is hidden by this.
             EnvironmentState::Ready
                 if self
                     .machines
                     .iter()
+                    .filter(|machine| machine.fork.is_none())
                     .any(|machine| machine.state != MachineState::Ready) =>
             {
                 return Err(TopologyValidationError::InvalidLifecycleState {
                     environment_id: self.environment_id.to_string(),
-                    reason: "Ready requires every Machine to be Ready".to_string(),
+                    reason: "Ready requires every declared Machine to be Ready".to_string(),
                 });
             }
             EnvironmentState::Stopped

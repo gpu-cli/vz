@@ -2,7 +2,9 @@
 
 use super::*;
 use vz_runtime_contract::{
-    EnvironmentSelectionContext, OwnedResourceKind, ProjectDefinition, ProjectId,
+    EnvironmentLifecycleKind, EnvironmentSelectionContext, LifecycleStepResult, MachineIncarnation,
+    MachineIncarnationId, MachineLifecycleStepAcknowledgement, MachineState, OwnedResourceKind,
+    ProjectDefinition, ProjectId, TOPOLOGY_SCHEMA_VERSION,
 };
 
 /// One Linux Machine on one private network, reachable, admitted through the
@@ -51,6 +53,113 @@ pub(super) fn fixture() -> (tempfile::TempDir, StateStore, EnvironmentInstance) 
         .unwrap()
         .unwrap();
     (root, store, environment)
+}
+
+/// The same fixture, driven all the way to `Ready` the way Up drives it.
+///
+/// This is the state a fork is actually taken in and the one the other fixtures
+/// never reach: `instantiate_environment` yields a Creating Environment whose
+/// Machines are all Creating, so every fork test that starts there exercises the
+/// one lifecycle state nobody forks from. A warm parent -- the only kind worth
+/// forking -- is by definition in a Ready Environment.
+pub(super) fn ready_fixture() -> (tempfile::TempDir, StateStore, EnvironmentInstance) {
+    let (root, store, environment) = fixture();
+    let up = store
+        .begin_environment_lifecycle(
+            environment.environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "req-ready",
+            "idem-ready",
+            "sha256:ready",
+            10,
+        )
+        .unwrap();
+    for step in up.machine_steps.clone() {
+        // A never-booted Machine has no incarnation to expect; a successful Up
+        // is exactly the event that mints its first one, which is why the step
+        // carries `expected_incarnation: None` and the acknowledgement supplies
+        // the result the backend produced.
+        let incarnation = MachineIncarnation {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            incarnation_id: MachineIncarnationId::new("inc_ready_fixture_up").unwrap(),
+            machine_id: step.machine_id.clone(),
+            generation: up.generation,
+            created_at: 10,
+        };
+        store
+            .acknowledge_environment_machine_step(
+                &MachineLifecycleStepAcknowledgement {
+                    operation_id: up.operation_id.clone(),
+                    generation: up.generation,
+                    machine_id: step.machine_id,
+                    initial_state: step.initial_state,
+                    target_state: step.target_state,
+                    expected_incarnation: step.expected_incarnation.clone(),
+                    resulting_incarnation: Some(incarnation.clone()),
+                    resulting_activation: Some(crate::state_store::tests::test_activation(
+                        incarnation,
+                    )),
+                    result: LifecycleStepResult::Succeeded,
+                },
+                10,
+            )
+            .unwrap();
+    }
+    store
+        .finish_environment_lifecycle(up.operation_id.as_str(), up.generation, 10)
+        .unwrap();
+    let environment = store
+        .load_environment_instance(environment.environment_id.as_str())
+        .unwrap()
+        .unwrap();
+    assert_eq!(environment.state, EnvironmentState::Ready);
+    (root, store, environment)
+}
+
+#[test]
+fn a_warm_ready_environment_can_be_forked() {
+    // The gate found `vz up --fork-from` refusing every Environment that had
+    // finished coming up: `Ready` demanded that EVERY Machine be Ready, and a
+    // fork is minted Creating because it has not booted. Forking was therefore
+    // impossible in the only state anyone forks from, and 3248 unit tests
+    // agreed it worked, because they all forked a Creating Environment.
+    let (_root, store, environment) = ready_fixture();
+    let parent = environment.machines[0].machine_id.clone();
+    let plan = store
+        .fork_machine_in_environment(environment.environment_id.as_str(), &parent, "feature", 11)
+        .unwrap();
+    assert_eq!(plan.machine.state, MachineState::Creating);
+    assert_eq!(plan.machine.name, "backend@feature");
+
+    // The Environment stays Ready while the fork boots. That is the point: a
+    // fork is a runtime object, absent from the definition, and sibling
+    // worktrees must not see the shared Environment leave Ready because someone
+    // else took a copy.
+    let after = store
+        .load_environment_instance(environment.environment_id.as_str())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, EnvironmentState::Ready);
+    assert_eq!(
+        forks_in(&store, environment.environment_id.as_str()),
+        vec!["backend@feature"]
+    );
+}
+
+#[test]
+fn a_declared_machine_that_is_not_ready_still_refuses_ready() {
+    // The exemption is exactly and only for forks. Scoping the invariant to
+    // declared Machines must not turn it off: `Ready` is still a claim that
+    // every Machine the project declared is up, and that claim is what makes
+    // Ready worth reporting at all.
+    let (_root, _store, environment) = ready_fixture();
+    let mut broken = environment.clone();
+    broken.machines[0].state = MachineState::Creating;
+    let error = broken.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("Ready requires every declared Machine to be Ready"),
+        "{error}"
+    );
 }
 
 fn forks_in(store: &StateStore, environment_id: &str) -> Vec<String> {

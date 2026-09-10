@@ -70,6 +70,26 @@ instructive than the fixes.
   CLI even connected to the daemon, so EVERY refusal after definition discovery
   left the artifact -- not only the one the gate exercised. Minting and
   publishing are now separate, with the publish after admission.
+- **`vz up --fork-from` could not succeed against any Environment that had
+  finished coming up** (P0, found the first time the fork check reached real
+  Machines). `Ready` demanded that *every* Machine be Ready; a fork is minted
+  `Creating` because it has not booted; `fork_machine_in_environment` validates
+  `before + plan` inside the transaction. So a warm parent -- the only kind worth
+  forking -- was refused by construction. 3248 workspace tests agreed forking
+  worked, because every fork fixture forks an Environment from
+  `instantiate_environment`, which is `Creating` with all Machines `Creating`:
+  the fixture chose the one lifecycle state a real fork is never taken in.
+
+  The fix reads the field whose own documentation already decided the question.
+  `MachineInstance.fork` is *"the field that separates a declared Machine from a
+  runtime one, and every definition-versus-instance comparison reads it"*; the
+  Ready invariant was the one comparison that did not. Ready now means every
+  **declared** Machine is Ready. Moving the Environment to `Reconciling` for the
+  duration was the obvious alternative and is worse: it announces a
+  reconciliation over a Machine reconciliation does not consider, and it
+  serialises forks through an Environment-wide state, so every sibling worktree
+  would watch the shared Environment change because someone else took a copy --
+  the exact interference forking exists to remove.
 
 ### Still open
 
@@ -136,16 +156,23 @@ the real tool does.
 
 ## What the gate will not tell you yet
 
-- **The fork check has now run against real VMs and does not yet get far enough
-  to measure.** It brings the parent Environment up, records its identities and
-  round-trips a sentinel, then fails importing a warm image into the parent's
-  own engine: `docker --context <name>` cannot resolve a context whose name
-  `vz status` itself just reported. Two bounds a first *complete* run must still
-  settle: `FORK_SPEEDUP_MIN = 2.0` and `FORK_FREE_SPACE_FRACTION = 0.25`.
-  The free-space window spans the whole `up`, so it carries the fork's own boot
-  writes. The check records the cold Up's wall time and free-space delta beside
-  the fork's so those bounds can be judged from evidence; revising them is a
-  product decision, not a repair to the measurement.
+- **The fork check now reaches the fork against real VMs.** Its setup passes end
+  to end: parent Environment up (cold, 34.8 s), identities recorded, sentinel
+  round-tripped, warm image imported into the parent's own engine. Getting there
+  cost two repairs worth naming. The Docker failure was the harness aiming
+  `docker --config` at the lane's directory; the context lives in the Machine's
+  own private config, whose path `vz status` reports as `docker_context.config_dir`
+  -- it was in the 200-byte slice the original diagnosis was truncated inside.
+  And the fork's engine is now waited on with the contract's own declared
+  `poll.docker.engine_ready`, because a dockerd still starting reports an *empty*
+  image store, which is indistinguishable from a fork that inherited nothing --
+  the warm-state claim, decided by a race.
+
+  What has still never completed is a fork measurement against a real parent.
+  Two bounds it will settle: `FORK_SPEEDUP_MIN = 2.0` and
+  `FORK_FREE_SPACE_FRACTION = 0.5`. The check records the cold Up's wall time and
+  free-space delta beside the fork's, so both can be judged from evidence;
+  revising them is a product decision, not a repair to the measurement.
 - **No aggregate run has completed.** The four-phase gate needs a real Mac sleep
   between pre-sleep and post-wake, so it is an attended run.
 - **The pinned macOS template lives in `/private/tmp`.** Rebuilding it costs an
@@ -160,6 +187,18 @@ the real tool does.
 | the same file, held open by a writer mid-`fsync` | clone exit 0 in **0.077 s** |
 | a Machine's Docker `data.img` | 64 GiB logical, **29 MB of data in 78 extents** |
 | APFS `st_blocks` of a clone versus its parent | **exactly equal** -- which is why the criterion measures free space |
+
+A free-space measurement on APFS is noisier than the numbers above suggest, and
+the fork check failed four times in both directions -- a 32 MiB parent appearing
+to cost anywhere from **-82 MB to +280 MB** -- before the noise was understood:
+freeing a tree is asynchronous, so a control deleted before the window reclaims
+inside it; `f_bavail` sampled without a sync charges earlier writes to whichever
+window is open when writeback runs; and a bound of the same order as that
+movement decides nothing. The window now excludes the control's deletion, syncs
+before sampling, and the bound is half the parent's allocated size -- what the
+criterion separates is a clone from a deep copy, and those differ by the parent's
+*entire* allocated size, so half clears the noise floor in both directions where
+a quarter only bought flakiness.
 
 The last row is the one that keeps being rediscovered. A per-file allocated-size
 comparison reads a *correct* copy-on-write clone as a deep copy. Criterion 23 was
