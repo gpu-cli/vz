@@ -589,6 +589,25 @@ def stray_sockets(state: LaneState) -> list:
     return listening
 
 
+def _departed_daemon(pidfile: Path):
+    """The PID in `pidfile` if it names no live process, else None.
+
+    Only a well-formed PID counts. An empty or malformed file is a different
+    question, answered by the vacancy rule, and a PID held by some OTHER program
+    is a real problem rather than a departure.
+    """
+    try:
+        if pidfile.is_symlink() or not pidfile.is_file() or pidfile.stat().st_size > 16:
+            return None
+        text = pidfile.read_text().strip()
+    except OSError:
+        return None
+    if re.fullmatch(r"[0-9]+", text) is None:
+        return None
+    pid = int(text)
+    return pid if pid > 1 and _proc_pidpath(pid) is None else None
+
+
 def stop_daemons(state: LaneState) -> list:
     """SIGTERM every positively identified daemon under the lane root and wait
     for socket/pid removal plus the graceful shutdown log line. Returns the
@@ -615,7 +634,20 @@ def stop_daemons(state: LaneState) -> list:
     only change is that failing one no longer excuses the rest.
     """
     stopped, problems, vacant = [], [], []
+    departed = []
     for pidfile, socket_path in daemon_artifacts(state):
+        # A PID file naming a process that no longer exists is a daemon that is
+        # GONE, which is what this sweep is for. It did not remove its own PID
+        # file, so it did not exit gracefully, and that is worth recording -- but
+        # it is not something left running, and failing the lane on it fails
+        # every row the lane carries over a process that is already dead.
+        #
+        # Distinguished from the case that matters: a PID naming a DIFFERENT
+        # live program is ambiguity or reuse, and still a problem below.
+        gone = _departed_daemon(pidfile)
+        if gone is not None:
+            departed.append(f"{pidfile}: PID {gone} exited without removing its PID file")
+            continue
         try:
             identity = daemon_fingerprint(state, pidfile, socket_path)
         except GateError as error:
@@ -640,6 +672,10 @@ def stop_daemons(state: LaneState) -> list:
             stopped.append(_stop_one_daemon(identity, pidfile, socket_path))
         except CleanupError as error:
             problems.append(str(error))
+    if departed:
+        # Reported on the receipt, never silently: an ungraceful exit is a fact
+        # about this run even when nothing survived it.
+        stopped.extend({"departed": note} for note in departed)
     if vacant:
         # One lane-wide question answers all of them: if nothing alive still
         # references this lane's roots, then no empty PID file can be concealing

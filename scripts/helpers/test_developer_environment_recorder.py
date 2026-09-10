@@ -154,8 +154,17 @@ class StopDaemonsTests(unittest.TestCase):
                 contents = ""
             elif name.startswith("bad"):
                 contents = "not-a-pid"
+            elif name.startswith("departed"):
+                # A well-formed PID that names no live process: a daemon that
+                # exited without removing its own file. 2 is init's neighbour
+                # and never this lane's daemon; what matters is that it is not
+                # running here.
+                contents = "999999"
             else:
-                contents = "4242"
+                # A RUNNING daemon's PID file names a running process. It used
+                # to name 4242, which does not exist, so every fixture daemon
+                # was indistinguishable from one that had already exited.
+                contents = str(os.getpid())
             (runtime / "d.pid").write_text(contents)
             os.mkfifo(runtime / "d.sock")   # a placeholder daemon_artifacts will pair
         return state
@@ -169,7 +178,7 @@ class StopDaemonsTests(unittest.TestCase):
             attempted.append(pidfile.parent.name)
             if not re.fullmatch(r"[0-9]+", pidfile.read_text().strip()):
                 raise GateError("invalid daemon PID")
-            return {"pid": 4242, "socket": str(socket_path)}
+            return {"pid": int(pidfile.read_text().strip()), "socket": str(socket_path)}
 
         def stop_one(identity, pidfile, _socket_path):
             stopped.append(pidfile.parent.name)
@@ -186,7 +195,7 @@ class StopDaemonsTests(unittest.TestCase):
                     subject.stop_daemons(state)
                 message = str(caught.exception)
             else:
-                subject.stop_daemons(state)
+                self.returned = subject.stop_daemons(state)
                 message = ""
         finally:
             (subject.daemon_fingerprint, subject._stop_one_daemon,
@@ -212,6 +221,24 @@ class StopDaemonsTests(unittest.TestCase):
             self.assertEqual(stopped, [])
             self.assertIn("0 daemon(s) stopped", message)
             self.assertIn("1 artifact(s) not attributed", message)
+
+    def test_a_pid_that_names_no_live_process_is_a_departure_not_a_leak(self):
+        """A daemon that died without removing its PID file is already gone.
+
+        Cleanup exists to ensure nothing outlives the lane, and a dead process
+        satisfies that. Failing on it failed every row the topology lane carries
+        over a process that no longer existed -- measured 2026-09-10, `c2/d.pid`
+        naming PID 61835 with no such process. The ungraceful exit is still
+        reported, because it is a fact about the run.
+        """
+        with tempfile.TemporaryDirectory(prefix="vz04-daemons-") as tmp:
+            state = self.lane(tmp, ["departed-c2", "mix"])
+            attempted, stopped, _ = self.sweep(state, expect_error=False)
+            self.assertEqual(attempted, ["mix"], "a departed daemon is not fingerprinted")
+            self.assertIn("mix", stopped)
+            self.assertTrue(any(isinstance(entry, dict) and "departed" in entry
+                                for entry in self.returned),
+                            self.returned)
 
     def test_an_empty_pid_file_with_nothing_alive_is_not_a_cleanup_failure(self):
         """The residue criterion 19 leaves on every run must not fail the lane.
