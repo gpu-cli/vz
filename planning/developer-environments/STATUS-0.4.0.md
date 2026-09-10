@@ -120,19 +120,25 @@ instructive than the fixes.
 
 ### Still open
 
-1. **A fork cannot join a running Environment's fabric** (P0, `vz-5v8.6`). The
-   ninth refusal, and the first that is architectural rather than a scoping
-   mistake: `install_environment_fabric` admits an Environment with no switches
-   and nothing running, or one whose switches are up and *every* attached
-   Machine already running. A fork is exactly the excluded middle — the parent
-   is running and holding its port, the fork needs a new one on the same switch
-   — and `NetworkSwitch` builds every port in `start`, moving the fabric and its
-   readers into the forwarding task. A switch cannot gain a port after
-   construction. Hot-add is bounded work, but `start` drops its sender so the
-   channel closes when the last reader exits, which is *how the switch shuts
-   down*; retaining one changes that, and a switch that never stops means leaked
-   daemons on this host. *Blocks criterion 23, and it is the only thing left
-   blocking it.*
+1. **A fork's Docker disk is cloned from a live filesystem** (P0, `vz-5v8.7`).
+   The eleventh and last refusal, and the one that matters: the fork now
+   **boots**, joins the running fabric, holds its own identity and address, and
+   is then refused inside the guest — `Docker filesystem is not positively
+   clean; automatic repair is forbidden`. `seed_forked_docker_disk` clones the
+   parent's `data.img` with no quiesce of any kind, by design ("a plain
+   filesystem operation that needs no live VM"), while the parent has that ext4
+   mounted and dirty. Admission requires `Filesystem state: clean` and no
+   `needs_recovery`, which a live-mounted filesystem never satisfies.
+
+   This is the assumption the feature rests on, and it is the one that was asked
+   to be validated. Everything around it works. The decision is a data-integrity
+   policy: the check conflates journal *recovery* — routine, safe, the reason
+   ext4 has a journal, and the designed response to the crash-consistent image a
+   `clonefile(2)` of a live file produces — with fsck *repair*, correctly
+   forbidden. The recommendation on the issue is to freeze the parent's
+   filesystem around the clone **and** permit recovery for a forked disk, keeping
+   repair and recorded-error refusal untouched. *The only thing still blocking
+   criterion 23.*
 
 2. **There is no reconciliation** (P0). `vz up` refuses every ProjectDefinition
    change before admission -- `project definition drift`. No plan, no durable
