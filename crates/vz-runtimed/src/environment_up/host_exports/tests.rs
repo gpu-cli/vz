@@ -298,13 +298,27 @@ async fn a_port_another_listener_already_holds_fails_before_any_boot() {
     let error = probe_exportable_host_ports(&resolved, &BTreeSet::new())
         .await
         .expect_err("the port is already held");
-    match error {
+    match &error {
         HostExportError::HostPortUnavailable { port, export, .. } => {
-            assert_eq!(port, taken);
+            assert_eq!(*port, taken);
             assert_eq!(export, "api");
         }
         other => panic!("expected an unavailable host port, got {other:?}"),
     }
+    // The refusal a caller reads is the error envelope, not this enum. It has
+    // to name the contended port as a field: an agent that can only match on
+    // the sentence cannot tell a port collision from any other Up refusal, and
+    // the port it must free is the whole content of the failure.
+    let details = error.details();
+    assert_eq!(details.get("host_export").map(String::as_str), Some("api"));
+    assert_eq!(
+        details.get("host_port").map(String::as_str),
+        Some(taken.to_string().as_str())
+    );
+    assert!(
+        error.to_string().contains("already held on this host"),
+        "{error}"
+    );
 
     // Paired positive one: a Machine already booted holds its own listener, so
     // its port is not probed against itself on a re-Up.

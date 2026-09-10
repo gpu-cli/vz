@@ -33,8 +33,6 @@ pub struct DevStopArgs {
 
 #[derive(Debug, Serialize)]
 pub struct StopCommandError {
-    #[serde(skip)]
-    emitted: bool,
     code: String,
     message: Box<str>,
     request_id: String,
@@ -43,9 +41,6 @@ pub struct StopCommandError {
 }
 
 impl StopCommandError {
-    pub fn already_emitted(&self) -> bool {
-        self.emitted
-    }
     pub fn to_json(&self) -> String {
         json!({"schema_version": 1, "error": self}).to_string()
     }
@@ -74,7 +69,6 @@ pub async fn cmd_dev_stop(args: DevStopArgs, json_output: bool) -> Result<(), St
         .idempotency_key
         .unwrap_or_else(|| format!("stop-environment-{token}"));
     let local_error = |code: &str, message: String| StopCommandError {
-        emitted: false,
         code: code.into(),
         message: message.into_boxed_str(),
         request_id: request_id.clone(),
@@ -82,7 +76,6 @@ pub async fn cmd_dev_stop(args: DevStopArgs, json_output: bool) -> Result<(), St
         details: BTreeMap::new(),
     };
     let original_error = |error: MachineError| StopCommandError {
-        emitted: false,
         code: error.code.as_str().into(),
         message: error.message.into_boxed_str(),
         request_id: error.request_id.unwrap_or_else(|| request_id.clone()),
@@ -195,9 +188,10 @@ pub async fn cmd_dev_stop(args: DevStopArgs, json_output: bool) -> Result<(), St
         )
     })?;
     if let Some(error) = terminal.error {
-        let mut error = original_error(error);
-        error.emitted = json_output;
-        return Err(error);
+        // Returned like every other refusal, so `main` prints the same
+        // envelope on stderr whether the failure was decided before the stream
+        // or inside its terminal receipt.
+        return Err(original_error(error));
     }
     if !json_output {
         println!(

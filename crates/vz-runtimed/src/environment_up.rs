@@ -82,11 +82,27 @@ fn failure(
     code: MachineErrorCode,
     message: impl ToString,
 ) -> MachineError {
+    failure_with_details(metadata, code, message, BTreeMap::new())
+}
+
+/// A failure whose cause has fields worth reading, not only prose.
+///
+/// `operation` is always present, so a caller can tell an Up failure from any
+/// other; `details` adds whatever the refusal itself can name — the contended
+/// host port, the declaration that wanted it — and never overwrites it.
+fn failure_with_details(
+    metadata: &RequestMetadata,
+    code: MachineErrorCode,
+    message: impl ToString,
+    details: BTreeMap<String, String>,
+) -> MachineError {
+    let mut all = details;
+    all.insert("operation".into(), "up_environment".into());
     MachineError::new(
         code,
         message.to_string().chars().take(2048).collect(),
         metadata.request_id.clone(),
-        BTreeMap::from([("operation".into(), "up_environment".into())]),
+        all,
     )
 }
 
@@ -474,10 +490,12 @@ fn validate_supported(
     if let Err(error) =
         host_exports::refuse_unsupported_host_exports(&request.definition.environment)
     {
-        return Err(failure(
+        let details = error.details();
+        return Err(failure_with_details(
             metadata,
             MachineErrorCode::UnsupportedOperation,
             error.to_string(),
+            details,
         ));
     }
     // Host IMPORTS are applied too, by the opposite mechanism. An import is a

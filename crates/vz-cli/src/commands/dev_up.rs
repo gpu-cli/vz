@@ -28,8 +28,6 @@ pub struct DevUpArgs {
 
 #[derive(Debug, Serialize)]
 pub struct UpCommandError {
-    #[serde(skip)]
-    emitted: bool,
     code: String,
     message: Box<str>,
     request_id: String,
@@ -37,9 +35,6 @@ pub struct UpCommandError {
     details: BTreeMap<String, String>,
 }
 impl UpCommandError {
-    pub fn already_emitted(&self) -> bool {
-        self.emitted
-    }
     pub fn to_json(&self) -> String {
         json!({"schema_version":1,"error":self}).to_string()
     }
@@ -66,7 +61,6 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
         .idempotency_key
         .unwrap_or_else(|| format!("up-environment-{token}"));
     let local_error = |code: &str, message: String| UpCommandError {
-        emitted: false,
         code: code.into(),
         message: message.into_boxed_str(),
         request_id: request_id.clone(),
@@ -74,7 +68,6 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
         details: BTreeMap::new(),
     };
     let original_error = |error: MachineError| UpCommandError {
-        emitted: false,
         code: error.code.as_str().into(),
         message: error.message.into_boxed_str(),
         request_id: error.request_id.unwrap_or_else(|| request_id.clone()),
@@ -232,9 +225,15 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
         )
     })?;
     if let Some(error) = completion.error {
-        let mut error = original_error(error);
-        error.emitted = json_output;
-        return Err(error);
+        // The terminal receipt's failure is returned like every other refusal,
+        // so `main` prints the same `{"schema_version":1,"error":{...}}`
+        // envelope on stderr. A caller must not have to tell a refusal decided
+        // before the stream (a gRPC status: an unsupported declaration) from one
+        // decided inside it (this receipt: a host export port a sibling
+        // Environment already holds). Both are Up failures, both carry the same
+        // code, message and details, and an agent driving `--json up` reads
+        // them from the same place.
+        return Err(original_error(error));
     }
     if !json_output {
         println!(

@@ -33,8 +33,6 @@ pub struct DevDeleteArgs {
 
 #[derive(Debug, Serialize)]
 pub struct DeleteCommandError {
-    #[serde(skip)]
-    emitted: bool,
     code: String,
     message: Box<str>,
     request_id: String,
@@ -43,9 +41,6 @@ pub struct DeleteCommandError {
 }
 
 impl DeleteCommandError {
-    pub fn already_emitted(&self) -> bool {
-        self.emitted
-    }
     pub fn to_json(&self) -> String {
         json!({"schema_version": 1, "error": self}).to_string()
     }
@@ -78,7 +73,6 @@ pub async fn cmd_dev_delete(
         .idempotency_key
         .unwrap_or_else(|| format!("delete-environment-{token}"));
     let local_error = |code: &str, message: String| DeleteCommandError {
-        emitted: false,
         code: code.into(),
         message: message.into_boxed_str(),
         request_id: request_id.clone(),
@@ -86,7 +80,6 @@ pub async fn cmd_dev_delete(
         details: BTreeMap::new(),
     };
     let original_error = |error: MachineError| DeleteCommandError {
-        emitted: false,
         code: error.code.as_str().into(),
         message: error.message.into_boxed_str(),
         request_id: error.request_id.unwrap_or_else(|| request_id.clone()),
@@ -205,9 +198,10 @@ pub async fn cmd_dev_delete(
         )
     })?;
     if let Some(error) = terminal.error {
-        let mut error = original_error(error);
-        error.emitted = json_output;
-        return Err(error);
+        // Returned like every other refusal, so `main` prints the same
+        // envelope on stderr whether the failure was decided before the stream
+        // or inside its terminal receipt.
+        return Err(original_error(error));
     }
     let tombstone = terminal.tombstone.ok_or_else(|| {
         local_error(
@@ -277,8 +271,14 @@ mod tests {
             ("daemon_unavailable", 5),
             ("state_conflict", 2),
         ] {
+            // This used to construct the error with `emitted: true` and assert
+            // `error.already_emitted()` — that a failure carried in a terminal
+            // receipt could mark itself as already reported and so keep `main`
+            // from printing its envelope on stderr. That flag was the whole
+            // defect: under `--json` it left a nonzero exit with an empty
+            // stderr, which no caller can tell from any other refusal. There is
+            // no suppression to assert any more.
             let error = DeleteCommandError {
-                emitted: true,
                 code: code.into(),
                 message: "owned cleanup unproven".into(),
                 request_id: "req-delete".into(),
@@ -286,10 +286,10 @@ mod tests {
                 details: BTreeMap::from([("machine_id".into(), "mach-owned".into())]),
             };
             assert_eq!(error.exit_code(), exit_code);
-            assert!(error.already_emitted());
             let wire: serde_json::Value =
                 serde_json::from_str(&error.to_json()).expect("error JSON");
             assert_eq!(wire["schema_version"], 1);
+            assert_eq!(wire["error"]["code"], code);
             assert_eq!(wire["error"]["request_id"], "req-delete");
             assert_eq!(wire["error"]["idempotency_key"], "idem-delete");
             assert_eq!(wire["error"]["details"]["machine_id"], "mach-owned");
