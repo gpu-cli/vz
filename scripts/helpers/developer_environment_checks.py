@@ -1173,17 +1173,27 @@ def check_private_topology_paths(ctx: CheckContext, top: str) -> SubCheck:
         check.check(foreign.exit_code == 0 and token.encode() not in foreign.stdout and
                     not foreign.stdout.strip().endswith(b":0"),
                     f"a Machine in another Environment cannot reach that address (observed {foreign.stdout[:80]!r})")
-        # The crossing runs last, on the same Environment and the same declared
-        # network the Linux half just proved, so a failure here is about the
-        # macOS Machine and not about the fabric existing.
-        if check.status == "PASS" and native is not None:
-            check_macos_crossing(ctx, check, inside, token, "machine-0", address)
     finally:
         released = ctx.release(check, server)
         # `None` is the one uncertain outcome: the invocation outlived SIGKILL,
         # so something this lane started may still be running.
         check.check(released.exit_code is not None,
                     f"the held listener was released (exit {released.exit_code})")
+    # The crossing runs last, on the same Environment and the same declared
+    # network the Linux half just proved, so a failure here is about the macOS
+    # Machine and not about the fabric existing.
+    #
+    # It runs AFTER the release, not inside the `try`, because the crossing
+    # binds its own listener on the SAME declared port -- the grant names that
+    # port, so it cannot simply use another one -- and `httpd` above was still
+    # holding it. The crossing's `nc -l` could never bind, every client reached
+    # `httpd` instead, sent no request line, and was closed on with nothing.
+    # Measured 2026-09-10: this read as `exit 0, b''` from the macOS Machine and
+    # looked exactly like a fabric that would not carry macOS-to-Linux traffic,
+    # while ICMP across that same path answered 2 of 2 at 0.3 ms and a LINUX
+    # sibling reading the same listener got the identical empty answer.
+    if check.status == "PASS" and native is not None:
+        check_macos_crossing(ctx, check, inside, token, "machine-0", address)
     if check.status == "PASS":
         for name, instance in (("net-a", inside), ("net-b", outside)):
             removed = ctx.run(check, name + "-delete",
@@ -1307,10 +1317,47 @@ def check_macos_crossing(ctx: CheckContext, check: SubCheck, inside: dict, token
             if back.exit_code == 0 and back.stdout.strip() == token.encode():
                 break
             time.sleep(LISTENER_INTERVAL)
+        # Report what the peer actually did. An exit of 0 with an empty body is
+        # a connection that succeeded and was closed without data, which is a
+        # different fault from a refusal or a timeout, and the three are
+        # indistinguishable when only stdout is printed. Measured 2026-09-10:
+        # this failed as `exit 0, b''` with no way to tell which.
+        listener = machine_exec(ctx, check, "net-cross-listener-state", inside, linux_machine,
+                                f"/bin/busybox netstat -ltn | /bin/busybox grep -c ':{PRIVATE_PORT} '")
+        # macOS `nc -w` exits 0 on a connect timeout, so "exit 0, empty" is what
+        # an unreachable peer looks like as well as a peer that said nothing.
+        # These separate the two: a route for the fabric subnet and an ARP entry
+        # for the peer say the packet could leave; their absence says it could
+        # not. `ifconfig ... inet` installs a connected route and no explicit
+        # route is added for a private fabric, so this is the assumption under
+        # test.
+        routes = machine_exec(ctx, check, "net-cross-mac-routes", inside, "machine-mac",
+                          f"/usr/sbin/netstat -rn -f inet | /usr/bin/grep -E '{'.'.join(str(linux_address).split('.')[:3])}|default' || true")
+        neighbours = machine_exec(ctx, check, "net-cross-mac-arp", inside, "machine-mac",
+                                  f"/usr/sbin/arp -an | /usr/bin/grep '{linux_address}' || true")
+        reachable = machine_exec(ctx, check, "net-cross-mac-ping", inside, "machine-mac",
+                                 f"/sbin/ping -c 2 -t 5 '{linux_address}' || true")
+        check.ok(f"macOS view of the path to {linux_address}: routes {routes.stdout[:200]!r}, "
+                 f"arp {neighbours.stdout[:120]!r}, ping exit {reachable.exit_code} "
+                 f"{reachable.stdout[-160:]!r}")
+        # The discriminator. ICMP proves the path, so what remains is whether
+        # this listener serves anyone or only this client. A Linux sibling
+        # reading the same listener separates "the macOS client cannot read a
+        # BusyBox listener" from "the BusyBox listener serves nobody".
+        served_file = machine_exec(ctx, check, "net-cross-served-file", inside, linux_machine,
+                                   "/bin/busybox cat /tmp/vz-crossing")
+        sibling = machine_exec(ctx, check, "net-cross-linux-sibling", inside, "machine-1",
+                               f"/bin/busybox nc -w 5 {linux_address} {PRIVATE_PORT}")
+        check.ok(f"what {linux_machine} is serving: file {served_file.stdout[:60]!r}; "
+                 f"a Linux sibling reading the same listener: exit {sibling.exit_code} "
+                 f"{sibling.stdout[:60]!r}")
         check.check(back is not None and back.exit_code == 0 and back.stdout.strip() == token.encode(),
                     f"the macOS Machine reads the declared path served by {linux_machine} "
                     f"(exit {None if back is None else back.exit_code}, "
-                    f"{b'' if back is None else back.stdout[:80]!r})")
+                    f"stdout {b'' if back is None else back.stdout[:80]!r}, "
+                    f"stderr {b'' if back is None else back.stderr[:200]!r}; "
+                    f"{linux_machine} listeners on {PRIVATE_PORT} after the attempt: "
+                    f"{listener.stdout.strip()!r})")
     finally:
         released = ctx.release(check, reverse)
         check.check(released.exit_code is not None,
