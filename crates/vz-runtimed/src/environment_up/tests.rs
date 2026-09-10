@@ -30,6 +30,7 @@ fn fixture() -> (
         root,
         daemon,
         EnvironmentUpRequest {
+            fork: None,
             workspace_root: None,
             definition: definition(),
             selection: EnvironmentSelectionContext {
@@ -676,6 +677,7 @@ fn fabric_ownership_is_admitted_only_when_it_matches_the_persisted_instances() {
         }
     }
     let mut request = EnvironmentUpRequest {
+        fork: None,
         workspace_root: None,
         definition: definition(),
         selection: EnvironmentSelectionContext::default(),
@@ -714,6 +716,7 @@ fn fabric_ownership_is_admitted_only_when_it_matches_the_persisted_instances() {
     // positive and its negative are asserted together, because an admitted kind
     // whose set comparison were dropped would be a leak Delete could not reclaim.
     let mut exported = EnvironmentUpRequest {
+        fork: None,
         workspace_root: None,
         definition: definition(),
         selection: EnvironmentSelectionContext::default(),

@@ -16,10 +16,11 @@ mod events;
 mod io;
 mod isolation;
 mod machine_execution;
+mod machine_fork;
 mod machine_health;
 pub use environment_up::{
     EnvironmentPreparationProgress, EnvironmentUpAdmission, EnvironmentUpCompletion,
-    EnvironmentUpProgress, EnvironmentUpRequest,
+    EnvironmentUpProgress, EnvironmentUpRequest, MachineForkRequest,
 };
 mod operations;
 mod sandbox;
@@ -38,6 +39,7 @@ pub use self::events::*;
 pub use self::io::*;
 pub use self::isolation::*;
 pub use self::machine_execution::*;
+pub use self::machine_fork::*;
 pub use self::machine_health::*;
 pub use self::operations::*;
 pub use self::sandbox::*;

@@ -214,7 +214,7 @@ fn assert_no_daemon_effects(fixture: &Fixture) {
 }
 
 #[test]
-fn delete_help_is_read_only_and_documents_only_the_environment_boundary() {
+fn delete_help_is_read_only_and_scopes_machine_selection_to_forks() {
     let fixture = Fixture::new(true);
     let output = fixture
         .command()
@@ -227,18 +227,28 @@ fn delete_help_is_read_only_and_documents_only_the_environment_boundary() {
     assert!(help.contains("--environment"));
     assert!(help.contains("--request-id"));
     assert!(help.contains("--idempotency-key"));
-    assert!(!help.contains("--machine"));
+    // Criterion 23 moved the boundary: Delete now names one forked Machine as
+    // well as the whole Environment. The scoping is the point, so the help has
+    // to say `<machine>@<label>` rather than just `--machine` — a Machine the
+    // definition declares is still not deletable on its own.
+    assert!(help.contains("--machine <MACHINE@LABEL>"));
+    assert!(help.contains("fork"));
     assert!(!help.contains("--force"));
     assert!(output.stderr.is_empty());
     assert_no_daemon_effects(&fixture);
 }
 
 #[test]
-fn delete_parser_rejects_machine_force_legacy_selector_and_unpaired_ids_without_effects() {
+fn delete_parser_rejects_declared_machine_force_legacy_selector_and_unpaired_ids_without_effects()
+{
     let fixture = Fixture::new(true);
     for arguments in [
         vec!["delete", "old-sandbox-id"],
+        // A declared Machine, refused locally before any daemon contact: only a
+        // fork `<machine>@<label>` is deletable on its own.
         vec!["delete", "--machine", "dev"],
+        vec!["delete", "--machine", "dev@bad label"],
+        vec!["delete", "--machine", "dev@a@b"],
         vec!["delete", "--force"],
         vec!["delete", "--request-id", "request"],
         vec!["delete", "--idempotency-key", "key"],

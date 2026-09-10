@@ -28,6 +28,7 @@ fn machine_id(suffix: u8) -> MachineId {
 
 fn machine(suffix: u8) -> MachineInstance {
     MachineInstance {
+        fork: None,
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         machine_id: machine_id(suffix),
         environment_id: environment_id(),

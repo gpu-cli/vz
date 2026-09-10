@@ -42,6 +42,7 @@ pub mod machine_docker_runtime_inventory;
 pub mod machine_exec;
 #[cfg(target_os = "macos")]
 mod machine_execution_activity;
+pub mod machine_fork;
 #[cfg(target_os = "macos")]
 pub mod machine_live_sessions;
 #[cfg(target_os = "macos")]

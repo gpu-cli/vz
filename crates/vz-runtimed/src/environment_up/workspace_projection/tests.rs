@@ -347,6 +347,7 @@ fn target() -> TargetSpec {
 
 fn machine_instance(name: &str) -> MachineInstance {
     MachineInstance {
+        fork: None,
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         machine_id: MachineId::generate(),
         environment_id: EnvironmentId::generate(),

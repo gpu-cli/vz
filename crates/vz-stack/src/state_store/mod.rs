@@ -32,6 +32,7 @@ pub mod machine_boot_non_dispatch;
 #[cfg(test)]
 mod machine_docker_context_tests;
 mod machine_execution;
+mod machine_fork;
 pub mod migration_backup;
 mod stack_journal;
 pub use stack_journal::{

@@ -199,6 +199,24 @@ struct MachineStatus {
     incarnation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     incarnation_generation: Option<u64>,
+    /// Present exactly when this Machine is a fork of another in the same
+    /// Environment.
+    ///
+    /// `vz status` is how an agent discovers what exists before it addresses
+    /// anything, and a fork is only addressable as `<machine>@<label>`. Carrying
+    /// the lineage rather than only the composed name means the parent is
+    /// answerable too, which is what lets an agent tell "a fork of the Machine I
+    /// wanted" from "a Machine whose name happens to contain an @".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fork: Option<MachineForkStatus>,
+}
+
+/// Where a forked Machine came from, as `vz status` reports it.
+#[derive(Debug, Serialize)]
+struct MachineForkStatus {
+    parent_machine_id: String,
+    parent_name: String,
+    label: String,
 }
 
 impl EnvironmentStatus {
@@ -257,6 +275,11 @@ impl EnvironmentStatus {
                     incarnation_generation: machine
                         .incarnation
                         .map(|incarnation| incarnation.generation),
+                    fork: machine.fork.map(|origin| MachineForkStatus {
+                        parent_machine_id: origin.parent_machine_id.to_string(),
+                        parent_name: origin.parent_name,
+                        label: origin.label,
+                    }),
                 })
                 .collect(),
             networks: environment
@@ -784,6 +807,12 @@ fn print_text_status(output: &StatusOutput) {
                 machine.target.arch,
                 machine.profile
             );
+            if let Some(fork) = &machine.fork {
+                println!(
+                    "    Fork of {} ({}), label {}",
+                    fork.parent_name, fork.parent_machine_id, fork.label
+                );
+            }
             println!(
                 "    Supervision health (this daemon, not a guest probe): {}",
                 machine.health
@@ -854,6 +883,7 @@ mod tests {
     fn environment_with_machines(id: &str, name: &str) -> EnvironmentInstance {
         let environment_id = EnvironmentId::new(id).unwrap();
         let machine = |id: &str, name: &str| MachineInstance {
+            fork: None,
             docker_context: None,
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             machine_id: MachineId::new(id).unwrap(),

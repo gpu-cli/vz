@@ -714,6 +714,15 @@ pub struct MachineInstance {
     pub state: MachineState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_sandbox_id: Option<String>,
+    /// Present exactly when this Machine was forked from another inside this
+    /// Environment. Absent means the definition declares it.
+    ///
+    /// This is the field that separates a *declared* Machine from a *runtime*
+    /// one, and every definition-versus-instance comparison reads it: a fork is
+    /// not in `vz.json`, so reconciliation must not see it as drift and prune
+    /// it. See [`MachineForkOrigin`](super::MachineForkOrigin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<super::machine_fork::MachineForkOrigin>,
 }
 
 /// Persisted Environment network identity and its declared shape.
@@ -844,6 +853,17 @@ pub enum OwnedResourceKind {
     /// it, and a block volume's image is reclaimed by the Environment that
     /// allocated it rather than by whichever Machine happened to mount it.
     Volume,
+    /// One Machine forked from another inside this Environment.
+    ///
+    /// Machine-scoped, and deliberately a *second* record alongside that
+    /// Machine's `Machine` record rather than a replacement for it. The
+    /// `Machine` record says the runtime owns a Machine; this one says the
+    /// Machine is a runtime object seeded from a sibling's disk, which is what
+    /// makes `vz up` leave it alone and `vz delete --machine <name>@<label>`
+    /// able to reclaim exactly it. A fork with only a `Machine` record would be
+    /// indistinguishable from a declared Machine that the definition had
+    /// dropped, which is the shape reconciliation prunes.
+    MachineFork,
     LegacySandbox,
     Other(String),
 }
@@ -1458,6 +1478,9 @@ impl ProjectDefinition {
                 runtime_identity: None,
                 state: MachineState::Creating,
                 legacy_sandbox_id: None,
+                // Instantiation materialises the definition, and the definition
+                // never declares a fork.
+                fork: None,
             })
             .collect();
         let machine_ids: BTreeMap<_, _> = machines
@@ -4376,6 +4399,27 @@ fn validate_exact_topology_ownership(
             ));
         }
 
+        // A fork carries exactly one `MachineFork` record, and a declared
+        // Machine carries none. Asserting both directions is what stops a
+        // declared Machine from acquiring the record that would exempt it from
+        // reconciliation, and stops a fork from losing the record that is its
+        // only proof of being a runtime object.
+        let exact_fork_count = environment
+            .ownership
+            .iter()
+            .filter(|record| {
+                record.resource_kind == OwnedResourceKind::MachineFork
+                    && record.resource_id == machine.machine_id.as_str()
+                    && record.machine_id.as_ref() == Some(&machine.machine_id)
+            })
+            .count();
+        if exact_fork_count != usize::from(machine.fork.is_some()) {
+            return Err(ownership_mismatch(
+                "machine_fork",
+                machine.machine_id.to_string(),
+            ));
+        }
+
         match &machine.incarnation {
             Some(incarnation) => {
                 let exact = environment.ownership.iter().filter(|record| {
@@ -4528,6 +4572,14 @@ fn validate_exact_topology_ownership(
             OwnedResourceKind::Volume => environment.volumes.iter().any(|volume| {
                 record.resource_id == volume.volume_id.as_str() && record.machine_id.is_none()
             }),
+            // Explicit for the reason the Volume arm is: the `_ => true` arm
+            // below would admit a fork record naming a Machine that is not a
+            // fork, or no Machine at all.
+            OwnedResourceKind::MachineFork => environment.machines.iter().any(|machine| {
+                record.resource_id == machine.machine_id.as_str()
+                    && record.machine_id.as_ref() == Some(&machine.machine_id)
+                    && machine.fork.is_some()
+            }),
             OwnedResourceKind::LegacySandbox => {
                 environment
                     .legacy_migration
@@ -4557,21 +4609,70 @@ fn validate_exact_topology_ownership(
     Ok(())
 }
 
+/// Test-only re-export of [`validate_definition_instance`].
+///
+/// The reconcile rule for forks is asserted from `machine_fork_tests`, which is
+/// a sibling module rather than a child of this one.
+#[cfg(test)]
+pub(crate) fn validate_definition_instance_for_test(
+    spec: &EnvironmentSpec,
+    environment: &EnvironmentInstance,
+) -> Result<(), TopologyValidationError> {
+    validate_definition_instance(spec, environment)
+}
+
 fn validate_definition_instance(
     spec: &EnvironmentSpec,
     environment: &EnvironmentInstance,
 ) -> Result<(), TopologyValidationError> {
     let environment_id = environment.environment_id.to_string();
-    let machines: BTreeMap<_, _> = environment
+    // Forks are runtime objects and are not in the definition, so every
+    // comparison below runs over the DECLARED Machines and over the records
+    // derived from them. This is the whole of "reconcile must not prune forks":
+    // a fork never appears as drift, so nothing ever plans its removal. Only
+    // `vz delete --machine <machine>@<label>` removes one.
+    let declared_machines: Vec<&MachineInstance> = environment
         .machines
         .iter()
-        .map(|machine| (machine.name.as_str(), machine))
+        .filter(|machine| machine.fork.is_none())
         .collect();
-    if machines.len() != spec.machines.len() {
+    let fork_machines: Vec<&MachineInstance> = environment
+        .machines
+        .iter()
+        .filter(|machine| machine.fork.is_some())
+        .collect();
+    let machines: BTreeMap<_, _> = declared_machines
+        .iter()
+        .map(|machine| (machine.name.as_str(), *machine))
+        .collect();
+    if machines.len() != declared_machines.len() || machines.len() != spec.machines.len() {
         return definition_topology_mismatch(
             &environment_id,
             "Machine names/count differ from the project definition",
         );
+    }
+    // A fork's parent must be a declared Machine of this same definition, and
+    // the fork's name must be exactly the address that names it. Without this
+    // check a fork could outlive the declaration it was seeded from and keep an
+    // address nothing can resolve.
+    for fork in &fork_machines {
+        let Some(origin) = &fork.fork else { continue };
+        let parent = declared_machines
+            .iter()
+            .find(|machine| machine.machine_id == origin.parent_machine_id);
+        match parent {
+            Some(parent)
+                if parent.name == origin.parent_name && fork.name == origin.forked_name() => {}
+            _ => {
+                return definition_topology_mismatch(
+                    &environment_id,
+                    format!(
+                        "forked Machine `{}` does not name a declared parent Machine",
+                        fork.name
+                    ),
+                );
+            }
+        }
     }
     // Decision 8: the definition names a symbolic slot, never the opaque
     // minted binding name, so reconciliation reads the resolution table.
@@ -4715,8 +4816,15 @@ fn validate_definition_instance(
                 .map(|network| (machine.name.as_str(), network.as_str()))
         })
         .collect();
-    let actual_attachments: BTreeSet<(&str, &str)> = environment
+    let fork_machine_ids: BTreeSet<&str> = fork_machines
+        .iter()
+        .map(|machine| machine.machine_id.as_str())
+        .collect();
+    let (fork_attachments, declared_attachments): (Vec<_>, Vec<_>) = environment
         .network_attachments
+        .iter()
+        .partition(|attachment| fork_machine_ids.contains(attachment.machine_id.as_str()));
+    let actual_attachments: BTreeSet<(&str, &str)> = declared_attachments
         .iter()
         .filter_map(|attachment| {
             let machine = machine_names_by_id
@@ -4728,13 +4836,40 @@ fn validate_definition_instance(
             Some((machine, network))
         })
         .collect();
-    if environment.network_attachments.len() != desired_attachments.len()
+    if declared_attachments.len() != desired_attachments.len()
         || actual_attachments != desired_attachments
     {
         return definition_topology_mismatch(
             &environment_id,
             "Machine network attachments differ from the project definition",
         );
+    }
+    // A fork is a sibling on exactly its parent's fabric: same networks, its own
+    // attachments. Comparing against the parent rather than against the
+    // definition keeps the fork's membership checkable without the definition
+    // ever having to mention it.
+    for fork in &fork_machines {
+        let Some(origin) = &fork.fork else { continue };
+        let mine: BTreeSet<&str> = fork_attachments
+            .iter()
+            .filter(|attachment| attachment.machine_id == fork.machine_id)
+            .map(|attachment| attachment.network_id.as_str())
+            .collect();
+        let parents: BTreeSet<&str> = environment
+            .network_attachments
+            .iter()
+            .filter(|attachment| attachment.machine_id == origin.parent_machine_id)
+            .map(|attachment| attachment.network_id.as_str())
+            .collect();
+        if mine != parents {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!(
+                    "forked Machine `{}` is not attached to exactly its parent's networks",
+                    fork.name
+                ),
+            );
+        }
     }
 
     let exports: BTreeMap<_, _> = environment
@@ -4824,8 +4959,11 @@ fn validate_definition_instance(
 
     // Offline Machines own no egress record, so the record set must match the
     // set of Machines that declared a non-Offline policy, exactly.
-    let egress: BTreeMap<_, _> = environment
+    let (fork_egress, declared_egress_records): (Vec<_>, Vec<_>) = environment
         .egress
+        .iter()
+        .partition(|egress| fork_machine_ids.contains(egress.machine_id.as_str()));
+    let egress: BTreeMap<_, _> = declared_egress_records
         .iter()
         .filter_map(|egress| {
             machine_names_by_id
@@ -4839,7 +4977,33 @@ fn validate_definition_instance(
         .iter()
         .filter(|machine| machine.egress != EgressPolicy::Offline)
         .count();
-    if egress.len() != environment.egress.len() || egress.len() != declared_egress {
+    // A fork inherits its parent's reachability verbatim: it is the same
+    // workload on the same fabric, and a fork that silently became Offline
+    // would fail in a way the parent never does.
+    for fork in &fork_machines {
+        let Some(origin) = &fork.fork else { continue };
+        let mine: Vec<_> = fork_egress
+            .iter()
+            .filter(|egress| egress.machine_id == fork.machine_id)
+            .map(|egress| egress.policy)
+            .collect();
+        let parents: Vec<_> = environment
+            .egress
+            .iter()
+            .filter(|egress| egress.machine_id == origin.parent_machine_id)
+            .map(|egress| egress.policy)
+            .collect();
+        if mine != parents {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!(
+                    "forked Machine `{}` egress differs from its parent's",
+                    fork.name
+                ),
+            );
+        }
+    }
+    if egress.len() != declared_egress_records.len() || egress.len() != declared_egress {
         return definition_topology_mismatch(
             &environment_id,
             "Machine egress records differ from the project definition",
@@ -5171,6 +5335,8 @@ pub fn migrate_legacy_developer_sandbox(
         runtime_identity: None,
         state: machine_state,
         legacy_sandbox_id: Some(sandbox.sandbox_id.clone()),
+        // A migrated 0.3 Sandbox is a declared Machine, never a fork.
+        fork: None,
     };
     let environment = EnvironmentInstance {
         network_attachments: Vec::new(),
@@ -5257,6 +5423,7 @@ fn resource_kind_requires_machine(kind: &OwnedResourceKind) -> bool {
             | OwnedResourceKind::HostExport
             | OwnedResourceKind::HostImport
             | OwnedResourceKind::PortRange
+            | OwnedResourceKind::MachineFork
             | OwnedResourceKind::LegacySandbox
     )
 }
@@ -5305,6 +5472,7 @@ fn resource_kind_identity(kind: &OwnedResourceKind) -> String {
         OwnedResourceKind::Credential => "credential".to_string(),
         OwnedResourceKind::Fault => "fault".to_string(),
         OwnedResourceKind::Volume => "volume".to_string(),
+        OwnedResourceKind::MachineFork => "machine_fork".to_string(),
         OwnedResourceKind::LegacySandbox => "legacy_sandbox".to_string(),
         OwnedResourceKind::Other(value) => format!("other:{value}"),
     }
@@ -8808,6 +8976,7 @@ mod tests {
             OwnedResourceKind::Credential,
             OwnedResourceKind::Fault,
             OwnedResourceKind::Volume,
+            OwnedResourceKind::MachineFork,
             OwnedResourceKind::LegacySandbox,
             OwnedResourceKind::Other("audit".to_string()),
         ];
@@ -8828,6 +8997,7 @@ mod tests {
                 OwnedResourceKind::Credential => "credential".to_string(),
                 OwnedResourceKind::Fault => "fault".to_string(),
                 OwnedResourceKind::Volume => "volume".to_string(),
+                OwnedResourceKind::MachineFork => "machine_fork".to_string(),
                 OwnedResourceKind::LegacySandbox => "legacy_sandbox".to_string(),
                 OwnedResourceKind::Other(value) => format!("other:{value}"),
             };
@@ -8856,5 +9026,12 @@ mod tests {
         // Environment-owned record with `machine_id: None` would be refused as
         // malformed the moment one was minted.
         assert!(!resource_kind_requires_machine(&OwnedResourceKind::Volume));
+        // A fork is one Machine seeded from another, so its record is
+        // Machine-scoped: Delete acknowledges it on the path that walks a
+        // Machine's own cleanup steps, and a record with no Machine owner is
+        // malformed rather than Environment-scoped.
+        assert!(resource_kind_requires_machine(
+            &OwnedResourceKind::MachineFork
+        ));
     }
 }

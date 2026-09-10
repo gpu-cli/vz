@@ -390,6 +390,22 @@ message MachineInstance {
   // Absent on historical instances persisted before exact runtime identity.
   optional MachineRuntimeIdentity runtime_identity = 15;
   optional MachineDockerContextDescriptor docker_context = 16;
+  // Present exactly when this Machine was forked from another inside the same
+  // Environment. A pure append: 1..16 are unmoved, so an older client decodes a
+  // forked Machine as an ordinary one rather than failing on it.
+  optional MachineForkOrigin fork = 17;
+}
+
+// Lineage of a forked Machine.
+//
+// `parent_name` rides beside `parent_machine_id` so that the fork's own `name`
+// is verifiable from this record alone: a fork is named exactly
+// `<parent_name>@<label>`.
+message MachineForkOrigin {
+  uint32 schema_version = 1;
+  string parent_machine_id = 2;
+  string parent_name = 3;
+  string label = 4;
 }
 
 // Persisted network identity and its declared L2/L3 shape.
@@ -484,6 +500,7 @@ enum OwnedResourceKind {
   OWNED_RESOURCE_KIND_HOST_IMPORT = 14;
   OWNED_RESOURCE_KIND_PORT_RANGE = 15;
   OWNED_RESOURCE_KIND_VOLUME = 16;
+  OWNED_RESOURCE_KIND_MACHINE_FORK = 17;
 }
 
 message OwnershipRecord {
@@ -755,6 +772,22 @@ message UpEnvironmentRequest {
   // Authoritative canonical absolute worktree root for workspace projections.
   // Unlike path_hint this is authorizing and enters the Up request hash.
   optional string workspace_root = 8;
+  // Fork one existing Machine of the selected Environment instead of
+  // reconciling the definition alone. A pure append.
+  optional MachineForkRequest fork = 9;
+}
+
+// `vz up --fork-from <machine> --as <machine>@<label>`.
+//
+// Fork is a flag on Up rather than a sixth verb because the public lifecycle has
+// exactly five, and the agent that drives this speaks the CLI.
+message MachineForkRequest {
+  // Name or immutable ID of the Machine to seed from, within the selected
+  // Environment.
+  string fork_from = 1;
+  // The fork's full address, `<machine>@<label>`. Required rather than derived
+  // so the caller names what it will later target.
+  string fork_as = 2;
 }
 
 message EnvironmentUpAdmission {
@@ -821,6 +854,10 @@ message DeleteEnvironmentRequest {
   optional string process_environment_id = 4;
   optional string workspace_key = 5;
   uint64 machine_timeout_millis = 6;
+  // `<machine>@<label>` selects one forked Machine to reclaim instead of the
+  // whole Environment. Only a fork may be named: a declared Machine is part of
+  // the definition and is removed by removing the Environment. A pure append.
+  optional string machine = 7;
 }
 
 message DeleteEnvironmentEvent {

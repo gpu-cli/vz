@@ -27,10 +27,10 @@ use vz_runtime_contract::{
     HostExportSpec, HostImportId, HostImportInstance, HostImportSpec, HostSpec, Lease, LeaseState,
     LegacyMigrationProvenance, LifecycleOperationId, LifecycleStepResult, LifecycleStepStatus,
     MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION, MachineActivationEvidence, MachineBackend,
-    MachineCapability, MachineDockerContextDescriptor, MachineError, MachineErrorCode, MachineId,
-    MachineIncarnation, MachineIncarnationId, MachineInstance, MachineLifecycleStep,
-    MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources, MachineRuntimeIdentity,
-    MachineSpec, MachineState, MachineWorkloadScope, NetworkAttachmentId,
+    MachineCapability, MachineDockerContextDescriptor, MachineError, MachineErrorCode,
+    MachineForkOrigin, MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance,
+    MachineLifecycleStep, MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources,
+    MachineRuntimeIdentity, MachineSpec, MachineState, MachineWorkloadScope, NetworkAttachmentId,
     NetworkAttachmentInstance, NetworkId, NetworkInstance, NetworkKind, NetworkSpec,
     OperatingSystem, OwnedResourceKind, OwnershipCleanupStep, OwnershipCleanupStepAcknowledgement,
     OwnershipRecord, ProjectDefinition, ProjectId, ProjectState, RequestMetadata, ResourceOwner,
@@ -764,7 +764,40 @@ pub fn machine_instance_to_proto(machine: &MachineInstance) -> runtime_v2::Machi
             .runtime_identity
             .as_ref()
             .map(machine_runtime_identity_to_proto),
+        fork: machine.fork.as_ref().map(machine_fork_origin_to_proto),
     }
+}
+
+fn machine_fork_origin_to_proto(origin: &MachineForkOrigin) -> runtime_v2::MachineForkOrigin {
+    runtime_v2::MachineForkOrigin {
+        schema_version: origin.schema_version,
+        parent_machine_id: origin.parent_machine_id.to_string(),
+        parent_name: origin.parent_name.clone(),
+        label: origin.label.clone(),
+    }
+}
+
+/// Decode a fork's lineage, validating it rather than trusting the sender.
+///
+/// A fork's name is exactly `<parent_name>@<label>`, so a malformed origin would
+/// produce a Machine that nothing can address; refusing it here keeps that
+/// impossible on every path into the daemon.
+fn machine_fork_origin_from_proto(
+    origin: &runtime_v2::MachineForkOrigin,
+) -> Result<MachineForkOrigin, TranslationError> {
+    let decoded = MachineForkOrigin {
+        schema_version: origin.schema_version,
+        parent_machine_id: MachineId::new(origin.parent_machine_id.clone())?,
+        parent_name: origin.parent_name.clone(),
+        label: origin.label.clone(),
+    };
+    decoded
+        .validate()
+        .map_err(|reason| TranslationError::InvalidValue {
+            field: "machine_instance.fork",
+            value: reason.to_string(),
+        })?;
+    Ok(decoded)
 }
 
 /// Decode a persisted Machine and reject malformed companion fields.
@@ -773,6 +806,11 @@ pub fn machine_instance_from_proto(
 ) -> Result<MachineInstance, TranslationError> {
     let machine_id = MachineId::new(machine.machine_id.clone())?;
     let decoded = MachineInstance {
+        fork: machine
+            .fork
+            .as_ref()
+            .map(machine_fork_origin_from_proto)
+            .transpose()?,
         docker_context: machine
             .docker_context
             .as_ref()
@@ -2624,6 +2662,7 @@ fn owned_resource_kind_to_proto(
         OwnedResourceKind::Credential => (runtime_v2::OwnedResourceKind::Credential, None),
         OwnedResourceKind::Fault => (runtime_v2::OwnedResourceKind::Fault, None),
         OwnedResourceKind::Volume => (runtime_v2::OwnedResourceKind::Volume, None),
+        OwnedResourceKind::MachineFork => (runtime_v2::OwnedResourceKind::MachineFork, None),
         OwnedResourceKind::LegacySandbox => (runtime_v2::OwnedResourceKind::LegacySandbox, None),
         OwnedResourceKind::Other(value) => {
             (runtime_v2::OwnedResourceKind::Other, Some(value.clone()))
@@ -2693,6 +2732,10 @@ fn owned_resource_kind_from_proto(
         runtime_v2::OwnedResourceKind::Volume => {
             reject_other(field, other)?;
             Ok(OwnedResourceKind::Volume)
+        }
+        runtime_v2::OwnedResourceKind::MachineFork => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::MachineFork)
         }
         runtime_v2::OwnedResourceKind::LegacySandbox => {
             reject_other(field, other)?;
@@ -3748,6 +3791,7 @@ mod tests {
             }],
             machines: vec![
                 MachineInstance {
+                    fork: None,
                     docker_context: None,
                     schema_version: V,
                     machine_id: linux_id.clone(),
@@ -3781,6 +3825,7 @@ mod tests {
                     legacy_sandbox_id: Some(format!("legacy-{suffix}")),
                 },
                 MachineInstance {
+                    fork: None,
                     docker_context: None,
                     schema_version: V,
                     machine_id: macos_id.clone(),
@@ -5103,6 +5148,7 @@ mod tests {
             OwnedResourceKind::HostImport,
             OwnedResourceKind::PortRange,
             OwnedResourceKind::Volume,
+            OwnedResourceKind::MachineFork,
         ] {
             let (wire, other) = owned_resource_kind_to_proto(&kind);
             assert_eq!(
@@ -5110,6 +5156,64 @@ mod tests {
                 Ok(kind)
             );
         }
+    }
+
+    #[test]
+    fn a_forked_machines_lineage_round_trips_and_a_malformed_one_is_refused() {
+        let mut machine = MachineInstance {
+            fork: None,
+            docker_context: None,
+            schema_version: vz_runtime_contract::TOPOLOGY_SCHEMA_VERSION,
+            machine_id: MachineId::new("mch_forked").unwrap(),
+            environment_id: EnvironmentId::new("env_fork").unwrap(),
+            name: "backend@feat-x".to_string(),
+            profile: MachineProfile::Developer,
+            target: TargetSpec {
+                os: OperatingSystem::Linux,
+                arch: Architecture::Aarch64,
+                image: "vz-linux-appliance".to_string(),
+                version: Some("1.0".to_string()),
+                channel: None,
+                digest: Some(format!("sha256:{}", "b".repeat(64))),
+            },
+            resources: MachineResources::default(),
+            requested_capabilities: CapabilitySet::default(),
+            negotiated_capabilities: CapabilitySet::default(),
+            backend: None,
+            incarnation: None,
+            runtime_identity: None,
+            state: MachineState::Creating,
+            legacy_sandbox_id: None,
+        };
+        // A declared Machine carries no lineage, and the absent field is exactly
+        // how an older peer's Machine arrives.
+        assert_eq!(
+            machine_instance_from_proto(&machine_instance_to_proto(&machine)),
+            Ok(machine.clone())
+        );
+
+        machine.fork = Some(MachineForkOrigin {
+            schema_version: vz_runtime_contract::TOPOLOGY_SCHEMA_VERSION,
+            parent_machine_id: MachineId::new("mch_parent").unwrap(),
+            parent_name: "backend".to_string(),
+            label: "feat-x".to_string(),
+        });
+        assert_eq!(
+            machine_instance_from_proto(&machine_instance_to_proto(&machine)),
+            Ok(machine.clone())
+        );
+
+        // Lineage is validated on decode rather than trusted: a label the
+        // address grammar cannot spell would produce a Machine nothing can name.
+        let mut malformed = machine_instance_to_proto(&machine);
+        malformed.fork.as_mut().unwrap().label = "not a label".to_string();
+        assert!(matches!(
+            machine_instance_from_proto(&malformed),
+            Err(TranslationError::InvalidValue {
+                field: "machine_instance.fork",
+                ..
+            })
+        ));
     }
 
     #[test]

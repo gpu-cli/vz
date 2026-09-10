@@ -36,6 +36,11 @@ pub struct DeleteEnvironmentInput {
     pub selection: EnvironmentSelectionContext,
     pub metadata: RequestMetadata,
     pub machine_timeout: Duration,
+    /// `<machine>@<label>`: reclaim exactly this forked Machine rather than the
+    /// Environment. Only a fork is nameable — a declared Machine is part of the
+    /// definition, and subtracting one would leave the Environment permanently
+    /// unable to instantiate its own `vz.json`.
+    pub machine: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,6 +127,9 @@ impl RuntimeDaemon {
         self: &Arc<Self>,
         input: DeleteEnvironmentInput,
     ) -> Result<watch::Receiver<Progress>, MachineError> {
+        if let Some(selector) = input.machine.clone() {
+            return Err(self.refuse_scoped_machine_delete(&input, &selector));
+        }
         validate_input(&input)?;
         // Resolve immutable request replay BEFORE resolving a now-absent or
         // reused human name/workspace binding. No new target can inherit a key.
@@ -698,6 +706,81 @@ fn docker_config_dir(input: &DeleteEnvironmentInput) -> Result<PathBuf, MachineE
     Ok(path)
 }
 
+impl RuntimeDaemon {
+    /// Resolve `--machine <machine>@<label>` far enough to give an exact answer,
+    /// then refuse for the one reason that is actually true.
+    ///
+    /// The identity half of a fork Delete is implemented and proven:
+    /// `StateStore::delete_exact_machine_fork` removes exactly one fork's rows,
+    /// refuses a declared Machine, and refuses a released set that is not
+    /// exactly what the fork owned. What is not implemented is the *physical*
+    /// half. Every teardown primitive this daemon has — `stop_for_delete`,
+    /// `retire_for_delete`, `ManagedMachineDockerContext::remove_exact` and
+    /// `MachineStoreDeleteIntent::remove` — is fenced on a **persisted**
+    /// `EnvironmentLifecycleOperation`, and `validate_structure` requires that
+    /// operation to carry one Machine step per Machine in the Environment. A
+    /// fork-scoped Delete therefore needs a scoped lifecycle operation in
+    /// `vz-stack`, which does not exist yet.
+    ///
+    /// Refusing here, with the resolution already done, is deliberate: a partial
+    /// teardown would leave a host Docker context or a runtime store behind
+    /// while the ownership rows said they were reclaimed, and that is exactly
+    /// the unaccounted state the whole exact-ownership design exists to prevent.
+    fn refuse_scoped_machine_delete(
+        &self,
+        input: &DeleteEnvironmentInput,
+        selector: &str,
+    ) -> MachineError {
+        let address = match vz_runtime_contract::MachineForkAddress::parse(selector) {
+            Ok(address) => address,
+            Err(error) => {
+                return failure(input, MachineErrorCode::ValidationError, error.to_string());
+            }
+        };
+        if address.label.is_none() {
+            return failure(
+                input,
+                MachineErrorCode::UnsupportedOperation,
+                format!(
+                    "`{selector}` names a Machine the project definition declares; only a fork `<machine>@<label>` can be deleted on its own"
+                ),
+            );
+        }
+        let environment = match self.selected_delete(input) {
+            Ok(environment) => environment,
+            Err(error) => return error,
+        };
+        let Some(machine) = environment.machine_by_address(&address) else {
+            return failure(
+                input,
+                MachineErrorCode::NotFound,
+                format!(
+                    "no Machine `{selector}` in Environment `{}`; `vz status` lists forks with their labels",
+                    environment.environment_id
+                ),
+            );
+        };
+        if machine.fork.is_none() {
+            return failure(
+                input,
+                MachineErrorCode::UnsupportedOperation,
+                format!(
+                    "Machine `{}` is declared by the project definition; only a fork can be deleted on its own",
+                    machine.name
+                ),
+            );
+        }
+        failure(
+            input,
+            MachineErrorCode::UnsupportedOperation,
+            format!(
+                "reclaiming fork `{}` on its own is not implemented: every runtime teardown primitive is fenced on a persisted Environment-wide lifecycle operation, so a fork-scoped Delete needs a scoped lifecycle operation that does not exist yet. `vz delete` reclaims the whole Environment, forks included.",
+                machine.name
+            ),
+        )
+    }
+}
+
 fn validate_supported(
     input: &DeleteEnvironmentInput,
     environment: &EnvironmentInstance,
@@ -731,6 +814,22 @@ fn validate_supported(
             environment_id: environment.environment_id.clone(),
             machine_id: Some(machine.machine_id.clone()),
         });
+        // A forked Machine owns one more record than a declared one: the record
+        // that says its disk was seeded from a sibling rather than provisioned.
+        // It is Machine-scoped, so `drive_delete` acknowledges it on the pass
+        // that walks this Machine's own cleanup steps, and the cloned tree it
+        // names is inside this Machine's runtime store, which the same pass
+        // removes. Omitting it here would make Delete refuse the Environment as
+        // holding an unaccounted resource.
+        if machine.fork.is_some() {
+            expected.push(OwnershipRecord {
+                schema_version: 1,
+                resource_kind: OwnedResourceKind::MachineFork,
+                resource_id: machine.machine_id.to_string(),
+                environment_id: environment.environment_id.clone(),
+                machine_id: Some(machine.machine_id.clone()),
+            });
+        }
         expected.push(
             MachineRuntimeRegistry::<crate::machine_backend::MachineBackendRuntime>::reservation(
                 &owner,

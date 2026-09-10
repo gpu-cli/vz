@@ -2070,6 +2070,7 @@ mod tests {
         stop.completed_at = Some(2);
         stop.machine_steps[0].status = LifecycleStepStatus::Succeeded;
         let machine = vz_runtime_contract::MachineInstance {
+            fork: None,
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             machine_id: owner.machine_id.clone().unwrap(),
             environment_id: owner.environment_id.clone(),
