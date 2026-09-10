@@ -8869,9 +8869,10 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
     free_after = volume_free_bytes(runtime)
     disks_after = docker_data_disks(runtime)
     fork_seconds = forked.elapsed_ns / 1e9
-    detail = fork_error(forked)[1] if forked.exit_code != 0 else ""
+    code, detail = fork_error(forked) if forked.exit_code != 0 else (None, "")
     check.check(forked.exit_code == 0,
-                f"`vz up --fork-from {FORK_PARENT}` exit {forked.exit_code} (expected 0){detail[:200]}")
+                f"`vz up --fork-from {FORK_PARENT}` exit {forked.exit_code} (expected 0)"
+                + (f"; code {code!r}, message {detail[:DOCKER_DETAIL_LIMIT]!r}" if detail else ""))
     if check.status != "PASS":
         return check.finish()
 
@@ -9033,8 +9034,10 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
     second = f"{FORK_PARENT}@{FORK_SECOND_LABEL}"
     twin = ctx.run(check, "fk-fork2-up", ["--json", "up", "--fork-from", FORK_PARENT, "--as", second],
                    cwd=parent["project"], env=parent["env"], timeout=UP_TIMEOUT)
-    check.check(twin.exit_code == 0, f"`vz up --fork-from {FORK_PARENT} --as {second}` exit {twin.exit_code} "
-                f"(expected 0){fork_error(twin)[1][:200] if twin.exit_code else ''}")
+    twin_code, twin_detail = fork_error(twin) if twin.exit_code != 0 else (None, "")
+    check.check(twin.exit_code == 0,
+                f"`vz up --fork-from {FORK_PARENT} --as {second}` exit {twin.exit_code} (expected 0)"
+                + (f"; code {twin_code!r}, message {twin_detail[:DOCKER_DETAIL_LIMIT]!r}" if twin_detail else ""))
     if check.status != "PASS":
         return check.finish()
     three = fork_machines(read_status(ctx, check, "fk-after-twin", project=parent["project"], env=parent["env"]))
