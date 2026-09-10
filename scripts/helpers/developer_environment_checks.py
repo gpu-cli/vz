@@ -8662,7 +8662,14 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
     # ── the control: a cold Up of the same definition, in this same run ───────
     cold_definition = copy.deepcopy(definition)
     cold_definition["project_id"] = "prj_" + uuid.uuid4().hex
+    # Recorded, not asserted: the parent Environment is live inside this window,
+    # so the number carries the noise a one-Machine bound must not. It is what a
+    # first run on real Machines needs in order to judge whether the bound below
+    # is the right one, and revising that bound is a product decision rather
+    # than a repair to the measurement.
+    cold_free_before = volume_free_bytes(ctx.state.socket_root)
     cold = provision(ctx, check, "fk-c", cold_definition)
+    cold_free_after = volume_free_bytes(ctx.state.socket_root)
     if check.status != "PASS" or not cold["status"]:
         return check.finish()
     cold_up = fork_receipt(ctx, "fk-c-up")
@@ -8670,6 +8677,8 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
                        "the cold Up's wall time was recorded in this run"):
         return check.finish()
     cold_seconds = cold_up.elapsed_ns / 1e9
+    check.ok(f"cold up of the same definition: {cold_seconds:.3f}s, "
+             f"{cold_free_before - cold_free_after} bytes of volume free space")
     # Removed before the fork is taken: a second Environment booting inside the
     # free-space window would be charged to the clone.
     removed = ctx.run(check, "fk-c-delete", ["--json", "delete", "--environment", "default", "--timeout", "120"],
@@ -8892,6 +8901,18 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
     # fork's name is `<parent>@<label>`, and `UNIQUE(environment_id, name)` makes
     # exact-name resolution unambiguous by construction, so the parent's own
     # selector must still resolve to the parent and not become ambiguous.
+    #
+    # Recorded because it contradicts the criterion as written: criterion 23 says
+    # "an ambiguous `--machine` fails closed listing them", and `--machine`
+    # cannot be ambiguous across a parent and its forks. `machine_exec`'s
+    # resolver matches an exact `machine_id` or an exact `name`, and a fork's
+    # name is `<parent>@<label>`, so the three selectors below name three
+    # different Machines and never a set. The ambiguity the runtime does fail
+    # closed on is a selection with NO `--machine` at all, which is what is
+    # exercised here.
+    check.ok("`--machine` cannot be ambiguous across a parent and its forks: resolution is by exact "
+             "machine_id or exact name and a fork's name is `<parent>@<label>`, so the ambiguity "
+             "proved below is the one that exists -- a selection with no --machine at all")
     ambiguous = ctx.run(check, "fk-exec-ambiguous",
                         ["--json", "exec", "--environment", "default", "--", "/bin/busybox", "sh", "-c",
                          f"/bin/busybox echo {AMBIGUOUS_SENTINEL}"],
