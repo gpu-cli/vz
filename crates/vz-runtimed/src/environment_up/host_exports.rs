@@ -81,6 +81,49 @@ pub enum HostExportError {
     UnknownInstanceMachine { export: String, machine_id: String },
 }
 
+impl HostExportError {
+    /// The fields a caller can act on without parsing the message.
+    ///
+    /// A refusal reaches the CLI as `{"error":{"code":…,"message":…,
+    /// "details":{…}}}`, and an agent driving `vz up` has to tell a contended
+    /// host port from any other refusal. The message says it in prose; these
+    /// say it in fields, so the port a caller must free — or the declaration it
+    /// must change — is readable rather than scraped.
+    pub fn details(&self) -> BTreeMap<String, String> {
+        let mut details = BTreeMap::new();
+        match self {
+            Self::DynamicPortUnsupported { export }
+            | Self::UndeclaredInstance { export }
+            | Self::MissingInstance { export } => {
+                details.insert("host_export".to_string(), export.clone());
+            }
+            Self::UnknownMachine { export, machine }
+            | Self::UnsupportedMachine { export, machine } => {
+                details.insert("host_export".to_string(), export.clone());
+                details.insert("machine".to_string(), machine.clone());
+            }
+            Self::UnknownInstanceMachine { export, machine_id } => {
+                details.insert("host_export".to_string(), export.clone());
+                details.insert("machine_id".to_string(), machine_id.clone());
+            }
+            Self::DuplicateHostPort {
+                first,
+                second,
+                port,
+            } => {
+                details.insert("host_export".to_string(), second.clone());
+                details.insert("conflicting_host_export".to_string(), first.clone());
+                details.insert("host_port".to_string(), port.to_string());
+            }
+            Self::HostPortUnavailable { export, port, .. } => {
+                details.insert("host_export".to_string(), export.clone());
+                details.insert("host_port".to_string(), port.to_string());
+            }
+        }
+        details
+    }
+}
+
 /// One export joined from its persisted identity to its declared ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedHostExport {

@@ -281,10 +281,12 @@ impl RuntimeDaemon {
             &environment.host_exports,
         )
         .map_err(|error| {
-            failure(
+            let details = error.details();
+            failure_with_details(
                 &metadata,
                 MachineErrorCode::ValidationError,
                 error.to_string(),
+                details,
             )
         })?;
         host_exports::probe_exportable_host_ports(
@@ -293,10 +295,19 @@ impl RuntimeDaemon {
         )
         .await
         .map_err(|error| {
-            failure(
+            // A collision is the one Up refusal a caller is expected to act on
+            // by freeing or re-declaring a port, and it is decided here rather
+            // than in `validate_supported` because the holder is usually a
+            // sibling Environment this definition cannot see. It therefore
+            // reaches the CLI in the terminal receipt, and it carries the
+            // contended port as a field so an agent reading the error envelope
+            // does not have to parse the sentence to find it.
+            let details = error.details();
+            failure_with_details(
                 &metadata,
                 MachineErrorCode::StateConflict,
                 error.to_string(),
+                details,
             )
         })?;
         let mut host_export_ports = host_exports::boot_port_mappings(&resolved_host_exports);

@@ -373,6 +373,40 @@ mod tests {
         );
     }
 
+    /// A grant is for the declared stream protocol and carries nothing else.
+    ///
+    /// `HostImportSpec::protocol` is `TransportProtocol`, whose only variant is
+    /// `Tcp`, and the projection the guest is handed
+    /// ([`GuestHostImportGrant`]) has no protocol field at all — so a datagram
+    /// grant is unconstructible rather than refused. What that leaves to prove
+    /// is the observable half: the guest port an import binds is a stream
+    /// listener and *nothing is bound to it as a datagram socket*, so a
+    /// datagram addressed to the declared port reaches no import.
+    ///
+    /// Binding the same port as UDP is the proof: it succeeds, which it could
+    /// not do if this process already held a datagram socket there.
+    #[tokio::test]
+    async fn a_declared_import_binds_a_stream_listener_and_no_datagram_socket() {
+        let imports = HostImports::new();
+        let port = free_port();
+        imports
+            .configure(vec![grant("db", port)])
+            .await
+            .expect("configured");
+        // The declared stream port answers.
+        TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("loopback reaches the import listener");
+        // The same port as a datagram socket is free, so the import serves no
+        // datagrams: nothing in this agent listens for them.
+        let datagram = tokio::net::UdpSocket::bind(("127.0.0.1", port)).await;
+        assert!(
+            datagram.is_ok(),
+            "a UDP bind on the declared import port must be free, proving the \
+             grant carries the declared stream protocol only: {datagram:?}"
+        );
+    }
+
     #[tokio::test]
     async fn reconfiguring_replaces_rather_than_accumulates() {
         let imports = HostImports::new();

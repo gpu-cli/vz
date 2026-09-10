@@ -123,9 +123,7 @@ fn main() -> anyhow::Result<()> {
             Some(Commands::Up(args)) => match commands::dev_up::cmd_dev_up(args, json).await {
                 Ok(()) => Ok(()),
                 Err(error) => {
-                    if !error.already_emitted() {
-                        eprintln!("{}", error.to_json());
-                    }
+                    eprintln!("{}", error.to_json());
                     std::process::exit(error.exit_code());
                 }
             },
@@ -133,9 +131,7 @@ fn main() -> anyhow::Result<()> {
                 match commands::dev_stop::cmd_dev_stop(args, json).await {
                     Ok(()) => Ok(()),
                     Err(error) => {
-                        if !error.already_emitted() {
-                            eprintln!("{}", error.to_json());
-                        }
+                        eprintln!("{}", error.to_json());
                         std::process::exit(error.exit_code());
                     }
                 }
@@ -144,9 +140,7 @@ fn main() -> anyhow::Result<()> {
                 match commands::dev_delete::cmd_dev_delete(args, json).await {
                     Ok(()) => Ok(()),
                     Err(error) => {
-                        if !error.already_emitted() {
-                            eprintln!("{}", error.to_json());
-                        }
+                        eprintln!("{}", error.to_json());
                         std::process::exit(error.exit_code());
                     }
                 }

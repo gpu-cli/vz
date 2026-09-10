@@ -148,19 +148,37 @@ async fn run(command: Command) -> Output {
         .unwrap()
         .unwrap()
 }
+/// The terminal receipt of a failed `--json up`, with the error envelope the
+/// same failure prints on stderr proved to agree with it.
+///
+/// This used to assert `output.stderr.is_empty()` — that a failure carried in
+/// the Up stream's terminal receipt printed no envelope at all under `--json`.
+/// That was the defect: it left `vz --json up` exiting nonzero with nothing on
+/// stderr, so a caller could not tell a host export port collision from any
+/// other refusal, while a refusal decided *before* the stream (see
+/// `missing_definition_has_zero_runtime_or_workspace_mutation`, which reads its
+/// envelope off stderr) printed one normally. Both now print the same envelope,
+/// and this asserts they say the same thing the receipt says.
 fn terminal(output: &Output) -> Value {
     assert!(!output.status.success());
-    assert!(
-        output.stderr.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let envelope: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|error| {
+        panic!(
+            "a failed --json up must print one error envelope on stderr ({error}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(envelope["schema_version"], 1);
     let records = String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(records[0]["record_type"], "request_started");
-    records.last().unwrap()["progress"]["completion"].clone()
+    let completion = records.last().unwrap()["progress"]["completion"].clone();
+    // CLI and receipt agree on the failure, not merely on the exit status.
+    assert_eq!(envelope["error"]["code"], completion["error"]["code"]);
+    assert_eq!(envelope["error"]["message"], completion["error"]["message"]);
+    assert_eq!(envelope["error"]["details"], completion["error"]["details"]);
+    completion
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_definition_has_zero_runtime_or_workspace_mutation() {
