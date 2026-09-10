@@ -2327,22 +2327,48 @@ esac
                 "setup commit restored into overlay upperdir before mount"
             );
         }
-        // When sharing the VM's host network, ensure the container has a
-        // working /etc/resolv.conf. Container images (e.g., Ubuntu) often
-        // ship a resolv.conf pointing to systemd-resolved (127.0.0.53)
-        // which isn't running in the VM. Write public DNS nameservers into
-        // the overlay's upper layer so DNS resolution works immediately.
+        // A container that shares the Machine's network resolves through the
+        // Machine's own resolver, and through nothing else.
+        //
+        // The image's own `/etc/resolv.conf` cannot be kept: images commonly
+        // ship one naming `127.0.0.53`, which is systemd-resolved and is not
+        // running in a Machine. It is replaced with the Machine's file rather
+        // than with public addresses, because on a Machine holding a port on a
+        // declared network that file names the Environment's own resolver
+        // (`vz.dns.N`, written by `linux/initramfs/init`). Writing public
+        // addresses here would give a container in a shared network namespace
+        // a resolution path off its Environment's fabric that no declaration
+        // authorised, and would make an Environment-local name unresolvable
+        // from inside the very Machine that declared it.
         if run.share_host_network {
             let dns_cmd = format!(
-                "printf 'nameserver 8.8.8.8\\nnameserver 8.8.4.4\\n' > {guest_rootfs_path}/etc/resolv.conf"
+                "mkdir -p {guest_rootfs_path}/etc && cp /etc/resolv.conf {guest_rootfs_path}/etc/resolv.conf"
             );
-            let _ = vm
+            match vm
                 .exec_collect(
                     "sh".to_string(),
                     vec!["-c".to_string(), dns_cmd],
                     Duration::from_secs(5),
                 )
-                .await;
+                .await
+            {
+                Ok(output) if output.exit_code == 0 => {}
+                // Not fatal: a container whose resolver was not installed still
+                // runs, and every other name path it has still works. It is
+                // reported rather than swallowed so a container that resolves
+                // nothing is diagnosable from the daemon's own log.
+                Ok(output) => tracing::warn!(
+                    container_id = %container_id,
+                    exit_code = output.exit_code,
+                    stderr = %output.stderr,
+                    "could not install the Machine's resolver into the container rootfs"
+                ),
+                Err(error) => tracing::warn!(
+                    container_id = %container_id,
+                    %error,
+                    "could not install the Machine's resolver into the container rootfs"
+                ),
+            }
         }
 
         // Bind-mount the VM-level log directory into the container so captured
