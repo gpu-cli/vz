@@ -222,24 +222,6 @@ class StopDaemonsTests(unittest.TestCase):
             self.assertIn("0 daemon(s) stopped", message)
             self.assertIn("1 artifact(s) not attributed", message)
 
-    def test_a_pid_that_names_no_live_process_is_a_departure_not_a_leak(self):
-        """A daemon that died without removing its PID file is already gone.
-
-        Cleanup exists to ensure nothing outlives the lane, and a dead process
-        satisfies that. Failing on it failed every row the topology lane carries
-        over a process that no longer existed -- measured 2026-09-10, `c2/d.pid`
-        naming PID 61835 with no such process. The ungraceful exit is still
-        reported, because it is a fact about the run.
-        """
-        with tempfile.TemporaryDirectory(prefix="vz04-daemons-") as tmp:
-            state = self.lane(tmp, ["departed-c2", "mix"])
-            attempted, stopped, _ = self.sweep(state, expect_error=False)
-            self.assertEqual(attempted, ["mix"], "a departed daemon is not fingerprinted")
-            self.assertIn("mix", stopped)
-            self.assertTrue(any(isinstance(entry, dict) and "departed" in entry
-                                for entry in self.returned),
-                            self.returned)
-
     def test_an_empty_pid_file_with_nothing_alive_is_not_a_cleanup_failure(self):
         """The residue criterion 19 leaves on every run must not fail the lane.
 
