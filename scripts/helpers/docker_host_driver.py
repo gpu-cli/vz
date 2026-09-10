@@ -411,6 +411,17 @@ def execute(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                except PermissionError:
+                    # Darwin refuses a group with EPERM when every member is an
+                    # unreaped zombie: cansignal() has no credentials left to
+                    # check. A group still holding a live plugin child signals
+                    # fine, so EPERM here means nothing survived to be bounded,
+                    # not that we failed to bound it. Say nothing yet and let
+                    # the bounded reap below be the arbiter: a process that is
+                    # genuinely alive and unkillable still times out there and
+                    # is still reported, and the caller keeps the receipt that
+                    # explains why we killed it in the first place.
+                    pass
                 except OSError as kill_error:
                     kill_error.stdout = getattr(error, "stdout", b"")
                     kill_error.stderr = getattr(error, "stderr", b"")

@@ -1,11 +1,15 @@
 """Local config admission tests; no Docker or credential helper dispatch."""
 import copy
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import docker_host_driver as driver
 
@@ -91,3 +95,66 @@ class ManagedConfigTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BoundedProcessGroupTests(unittest.TestCase):
+    """`execute` must survive Darwin refusing a group that is already dead."""
+
+    def child(self, source: str) -> list:
+        return [sys.executable, '-c', source]
+
+    def await_zombie(self, pid: int) -> None:
+        """Block until `pid` has exited but has not been reaped.
+
+        `os.waitid(WNOWAIT)` is the direct expression of this and is absent on
+        this interpreter, so the state is read where the kernel publishes it.
+        Waiting on the observed state keeps the test deterministic; a fixed
+        pause would only be a bet on how fast the child exits.
+        """
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            state = subprocess.run(['/bin/ps', '-o', 'stat=', '-p', str(pid)],
+                                   capture_output=True, text=True).stdout.strip()
+            if state.startswith('Z'):
+                return
+            time.sleep(0.01)
+        self.fail(f'child {pid} never became an unreaped zombie')
+
+    def test_a_group_that_died_before_the_kill_keeps_the_reason_it_was_killed(self):
+        # The child writes past the retained bound and exits at once, so by the
+        # time `execute` kills the group every member is an unreaped zombie and
+        # Darwin answers EPERM. The caller must still be told what it asked
+        # about -- the output bound -- not how the corpse was disposed of.
+        original = driver.collect_output
+
+        def wait_for_the_zombie(process, timeout, limit):
+            try:
+                return original(process, timeout, limit)
+            finally:
+                # Block until the child has exited WITHOUT reaping it, so the
+                # group is provably all-zombie when the kill lands.
+                self.await_zombie(process.pid)
+
+        with patch.object(driver, 'collect_output', wait_for_the_zombie), \
+             self.assertRaises(driver.OutputLimitExceeded) as raised:
+            driver.execute(self.child("import os; os.write(1, b'x' * 10000)"),
+                           timeout=30, max_stream_bytes=64, check=False,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(raised.exception.stdout, b'x' * 64)
+        self.assertEqual(raised.exception.observed_bytes['stdout'], 65)
+
+    def test_a_group_that_refuses_the_kill_and_stays_alive_is_still_reported(self):
+        # EPERM is only benign because nothing survived it. A process that is
+        # genuinely alive and cannot be killed must never be reported as a
+        # bounded one, so the reap below it stays the arbiter.
+        process = MagicMock()
+        process.pid = 424242
+        process.returncode = None
+        process.wait.side_effect = subprocess.TimeoutExpired(['vz'], 5)
+        with patch.object(driver.subprocess, 'Popen', return_value=process), \
+             patch.object(driver, 'collect_output',
+                          side_effect=driver.OutputLimitExceeded('stdout exceeded')), \
+             patch.object(driver.os, 'killpg', side_effect=PermissionError(1, 'nope')), \
+             self.assertRaises(subprocess.TimeoutExpired):
+            driver.execute(['vz'], timeout=1, max_stream_bytes=64, check=False)
+        process.wait.assert_called_once_with(timeout=5)

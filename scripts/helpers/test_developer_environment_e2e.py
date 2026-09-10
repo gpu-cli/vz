@@ -2134,7 +2134,13 @@ class DenialMatrixProbeTests(unittest.TestCase):
 
     def test_each_protocol_is_probed_by_the_tool_that_speaks_it(self):
         self.assertIn("wget", checks.matrix_probe_command(self.cell("tcp")))
-        self.assertIn("nc -u", checks.matrix_probe_command(self.cell("udp")))
+        udp = checks.matrix_probe_command(self.cell("udp"))
+        self.assertIn("nc", udp)
+        # `-z` is not decoration: BusyBox `nc -u` without it exits 0 whether the
+        # grant is allowed or denied, so a probe missing it proves nothing and
+        # this cell would pass in a world where UDP is entirely blocked.
+        self.assertIn(" -z ", udp)
+        self.assertIn(" -u ", udp)
         self.assertIn("ping", checks.matrix_probe_command(self.cell("icmp")))
         self.assertIn("nslookup", checks.matrix_probe_command(self.cell("dns")))
         https = checks.matrix_probe_command(self.cell("https", target="api.one.test", ca_file="/run/vz-edge/own.pem"))
