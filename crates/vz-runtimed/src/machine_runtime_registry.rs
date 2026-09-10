@@ -1719,6 +1719,7 @@ mod tests {
         };
         EnvironmentLifecycleOperation {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
+            machine_scope: None,
             operation_id: LifecycleOperationId::generate(),
             project_id: owner().project_id,
             environment_id: owner().environment_id,

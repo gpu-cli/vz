@@ -44,6 +44,8 @@ pub mod machine_exec;
 mod machine_execution_activity;
 pub mod machine_fork;
 #[cfg(target_os = "macos")]
+pub mod machine_fork_delete;
+#[cfg(target_os = "macos")]
 pub mod machine_live_sessions;
 #[cfg(target_os = "macos")]
 pub mod machine_runtime_activation;

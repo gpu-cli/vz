@@ -56,17 +56,17 @@ pub struct DeleteEnvironmentProgress {
     pub tombstone: Option<EnvironmentTombstone>,
 }
 
-type Progress = Result<DeleteEnvironmentProgress, MachineError>;
+pub(crate) type Progress = Result<DeleteEnvironmentProgress, MachineError>;
 
-struct PreparedDeleteMachine {
-    id: MachineId,
-    store: MachineStoreDeletePreflight,
-    context: Option<PreparedMachineDockerContextDelete>,
-    absent: Option<MachineDeleteAbsentAdmission>,
-    quiescence: Option<MachineDeleteQuiescence>,
+pub(crate) struct PreparedDeleteMachine {
+    pub(crate) id: MachineId,
+    pub(crate) store: MachineStoreDeletePreflight,
+    pub(crate) context: Option<PreparedMachineDockerContextDelete>,
+    pub(crate) absent: Option<MachineDeleteAbsentAdmission>,
+    pub(crate) quiescence: Option<MachineDeleteQuiescence>,
 }
 
-fn failure(
+pub(crate) fn failure(
     input: &DeleteEnvironmentInput,
     code: MachineErrorCode,
     message: impl Into<String>,
@@ -82,11 +82,14 @@ fn failure(
     )
 }
 
-fn conflict(input: &DeleteEnvironmentInput, error: impl std::fmt::Display) -> MachineError {
+pub(crate) fn conflict(
+    input: &DeleteEnvironmentInput,
+    error: impl std::fmt::Display,
+) -> MachineError {
     failure(input, MachineErrorCode::StateConflict, error.to_string())
 }
 
-fn request_hash(
+pub(crate) fn request_hash(
     input: &DeleteEnvironmentInput,
     environment: &vz_runtime_contract::EnvironmentId,
 ) -> Result<String, MachineError> {
@@ -99,7 +102,7 @@ fn request_hash(
     .map_err(|error| conflict(input, error))
 }
 
-fn progress(
+pub(crate) fn progress(
     input: &DeleteEnvironmentInput,
     operation: &EnvironmentLifecycleOperation,
     sequence: u64,
@@ -110,7 +113,13 @@ fn progress(
         request_id: input.metadata.request_id.clone().unwrap_or_default(),
         sequence,
         operation: operation.clone(),
-        terminal: tombstone.is_some() || operation.status == EnvironmentLifecycleStatus::Blocked,
+        // An Environment-wide Delete is terminal when its tombstone exists; a
+        // Machine-scoped one has no tombstone to produce, so its terminal
+        // receipt is its own succeeded journal.
+        terminal: tombstone.is_some()
+            || operation.status == EnvironmentLifecycleStatus::Blocked
+            || (operation.machine_scope.is_some()
+                && operation.status == EnvironmentLifecycleStatus::Succeeded),
         error: (operation.status == EnvironmentLifecycleStatus::Blocked).then(|| {
             failure(
                 input,
@@ -128,7 +137,7 @@ impl RuntimeDaemon {
         input: DeleteEnvironmentInput,
     ) -> Result<watch::Receiver<Progress>, MachineError> {
         if let Some(selector) = input.machine.clone() {
-            return Err(self.refuse_scoped_machine_delete(&input, &selector));
+            return self.delete_machine_fork(input, selector).await;
         }
         validate_input(&input)?;
         // Resolve immutable request replay BEFORE resolving a now-absent or
@@ -347,7 +356,7 @@ impl RuntimeDaemon {
         Ok(Some(receiver))
     }
 
-    fn selected_delete(
+    pub(crate) fn selected_delete(
         &self,
         input: &DeleteEnvironmentInput,
     ) -> Result<EnvironmentInstance, MachineError> {
@@ -401,7 +410,7 @@ impl RuntimeDaemon {
         )
     }
 
-    fn authorize_delete_scope(
+    pub(crate) fn authorize_delete_scope(
         &self,
         input: &DeleteEnvironmentInput,
         project_id: ProjectId,
@@ -666,7 +675,7 @@ impl RuntimeDaemon {
     }
 }
 
-fn validate_input(input: &DeleteEnvironmentInput) -> Result<(), MachineError> {
+pub(crate) fn validate_input(input: &DeleteEnvironmentInput) -> Result<(), MachineError> {
     for text in [&input.metadata.request_id, &input.metadata.idempotency_key] {
         if !text.as_ref().is_some_and(|text| {
             !text.is_empty()
@@ -691,7 +700,7 @@ fn validate_input(input: &DeleteEnvironmentInput) -> Result<(), MachineError> {
     Ok(())
 }
 
-fn docker_config_dir(input: &DeleteEnvironmentInput) -> Result<PathBuf, MachineError> {
+pub(crate) fn docker_config_dir(input: &DeleteEnvironmentInput) -> Result<PathBuf, MachineError> {
     let path = std::env::var_os("VZ_DOCKER_CONFIG")
         .or_else(|| std::env::var_os("DOCKER_CONFIG"))
         .map(PathBuf::from)
@@ -704,81 +713,6 @@ fn docker_config_dir(input: &DeleteEnvironmentInput) -> Result<PathBuf, MachineE
         ));
     }
     Ok(path)
-}
-
-impl RuntimeDaemon {
-    /// Resolve `--machine <machine>@<label>` far enough to give an exact answer,
-    /// then refuse for the one reason that is actually true.
-    ///
-    /// The identity half of a fork Delete is implemented and proven:
-    /// `StateStore::delete_exact_machine_fork` removes exactly one fork's rows,
-    /// refuses a declared Machine, and refuses a released set that is not
-    /// exactly what the fork owned. What is not implemented is the *physical*
-    /// half. Every teardown primitive this daemon has — `stop_for_delete`,
-    /// `retire_for_delete`, `ManagedMachineDockerContext::remove_exact` and
-    /// `MachineStoreDeleteIntent::remove` — is fenced on a **persisted**
-    /// `EnvironmentLifecycleOperation`, and `validate_structure` requires that
-    /// operation to carry one Machine step per Machine in the Environment. A
-    /// fork-scoped Delete therefore needs a scoped lifecycle operation in
-    /// `vz-stack`, which does not exist yet.
-    ///
-    /// Refusing here, with the resolution already done, is deliberate: a partial
-    /// teardown would leave a host Docker context or a runtime store behind
-    /// while the ownership rows said they were reclaimed, and that is exactly
-    /// the unaccounted state the whole exact-ownership design exists to prevent.
-    fn refuse_scoped_machine_delete(
-        &self,
-        input: &DeleteEnvironmentInput,
-        selector: &str,
-    ) -> MachineError {
-        let address = match vz_runtime_contract::MachineForkAddress::parse(selector) {
-            Ok(address) => address,
-            Err(error) => {
-                return failure(input, MachineErrorCode::ValidationError, error.to_string());
-            }
-        };
-        if address.label.is_none() {
-            return failure(
-                input,
-                MachineErrorCode::UnsupportedOperation,
-                format!(
-                    "`{selector}` names a Machine the project definition declares; only a fork `<machine>@<label>` can be deleted on its own"
-                ),
-            );
-        }
-        let environment = match self.selected_delete(input) {
-            Ok(environment) => environment,
-            Err(error) => return error,
-        };
-        let Some(machine) = environment.machine_by_address(&address) else {
-            return failure(
-                input,
-                MachineErrorCode::NotFound,
-                format!(
-                    "no Machine `{selector}` in Environment `{}`; `vz status` lists forks with their labels",
-                    environment.environment_id
-                ),
-            );
-        };
-        if machine.fork.is_none() {
-            return failure(
-                input,
-                MachineErrorCode::UnsupportedOperation,
-                format!(
-                    "Machine `{}` is declared by the project definition; only a fork can be deleted on its own",
-                    machine.name
-                ),
-            );
-        }
-        failure(
-            input,
-            MachineErrorCode::UnsupportedOperation,
-            format!(
-                "reclaiming fork `{}` on its own is not implemented: every runtime teardown primitive is fenced on a persisted Environment-wide lifecycle operation, so a fork-scoped Delete needs a scoped lifecycle operation that does not exist yet. `vz delete` reclaims the whole Environment, forks included.",
-                machine.name
-            ),
-        )
-    }
 }
 
 fn validate_supported(

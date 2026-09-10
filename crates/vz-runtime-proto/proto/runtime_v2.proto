@@ -608,6 +608,11 @@ message EnvironmentLifecycleOperation {
   uint64 created_at = 16;
   uint64 updated_at = 17;
   optional uint64 completed_at = 18;
+  // Set when this operation reclaims exactly one forked Machine rather than the
+  // whole Environment: one Machine step, that Machine's ownership only, and an
+  // Environment that keeps its state and its other Machines throughout. A pure
+  // append; absent means the Environment-wide shape.
+  optional string machine_scope = 19;
 }
 
 message EnvironmentTombstone {

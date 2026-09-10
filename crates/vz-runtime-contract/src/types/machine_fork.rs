@@ -480,3 +480,7 @@ fn parent_machine_is_offline(environment: &EnvironmentInstance, parent: &Machine
 #[cfg(test)]
 #[path = "machine_fork_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "machine_fork_lifecycle_tests.rs"]
+mod lifecycle_tests;
