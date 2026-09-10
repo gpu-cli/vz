@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::{collections::BTreeMap, env, fmt};
 use vz_cli::developer_environment_context::{
-    VZ_ENVIRONMENT_ID, discover_checked_out_branch, discover_git_workspace,
+    VZ_ENVIRONMENT_ID, discover_checked_out_branch, resolve_git_workspace,
 };
 use vz_cli::project_definition::discover_project_definition;
 use vz_runtime_contract::{EnvironmentId, MachineError, fork_label_from_branch};
@@ -140,7 +140,13 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
     };
     // Up always creates/refreshes the calling worktree binding on success,
     // including explicit selection. Its random token is never a path-derived ID.
-    let workspace = discover_git_workspace(&cwd)
+    //
+    // Resolving mints the token in memory and writes nothing: an Up the runtime
+    // refuses must leave the worktree byte-identical, and this key is
+    // persistent identity, so a token published behind a refusal would be a
+    // binding artifact a later Up finds and adopts. It is published below, once
+    // the daemon has reserved this Environment's identity.
+    let pending_workspace = resolve_git_workspace(&cwd)
         .map_err(|error| local_error("workspace_read_failed", error.to_string()))?;
     // The fork address is resolved here rather than in the daemon because the
     // default comes from the caller's worktree, which the daemon cannot see. The
@@ -181,6 +187,7 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
             Ok::<_, UpCommandError>(request)
         })
         .transpose()?;
+    let workspace = pending_workspace.workspace().clone();
     if json_output {
         println!(
             "{}",
@@ -245,7 +252,20 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
         );
     }
     let mut terminal = None;
+    let mut workspace_published = false;
     while let Some(event) = stream.next_event().await.map_err(client_error)? {
+        // The first event carries the admission, which is the daemon saying it
+        // reserved this Environment's identity in a durable transaction. That
+        // is the earliest point at which publishing the token is not a
+        // mutation behind a refusal, and the latest at which it is still
+        // guaranteed: an Up that fails after admission still owns an
+        // Environment this worktree must be able to name for status and delete.
+        if !workspace_published {
+            workspace_published = true;
+            pending_workspace
+                .commit()
+                .map_err(|error| local_error("workspace_bind_failed", error.to_string()))?;
+        }
         if json_output {
             println!(
                 "{}",

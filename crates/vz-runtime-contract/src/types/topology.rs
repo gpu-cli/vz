@@ -98,6 +98,17 @@ pub enum OperatingSystem {
     Windows,
 }
 
+impl OperatingSystem {
+    /// Canonical wire name, identical to the serde representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            OperatingSystem::Linux => "linux",
+            OperatingSystem::Macos => "macos",
+            OperatingSystem::Windows => "windows",
+        }
+    }
+}
+
 /// Host or Machine CPU architecture.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -147,6 +158,33 @@ pub enum MachineCapability {
     WindowsConsole,
 }
 
+impl MachineCapability {
+    /// Canonical wire name, identical to the serde representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MachineCapability::PosixExec => "posix_exec",
+            MachineCapability::PosixPty => "posix_pty",
+            MachineCapability::Signals => "signals",
+            MachineCapability::Files => "files",
+            MachineCapability::Ports => "ports",
+            MachineCapability::DockerEngine => "docker_engine",
+            MachineCapability::Compose => "compose",
+            MachineCapability::Buildx => "buildx",
+            MachineCapability::Snapshot => "snapshot",
+            MachineCapability::Suspend => "suspend",
+            MachineCapability::Checkpoint => "checkpoint",
+            MachineCapability::Gui => "gui",
+            MachineCapability::WindowsConsole => "windows_console",
+        }
+    }
+}
+
+impl std::fmt::Display for MachineCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Explicit operating profile for one Machine.
 ///
 /// Developer Linux Machines implicitly provide their own private Docker stack.
@@ -157,6 +195,16 @@ pub enum MachineCapability {
 pub enum MachineProfile {
     Developer,
     Hardened,
+}
+
+impl MachineProfile {
+    /// Canonical wire name, identical to the serde representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MachineProfile::Developer => "developer",
+            MachineProfile::Hardened => "hardened",
+        }
+    }
 }
 
 /// Deterministically ordered set of Machine capabilities.

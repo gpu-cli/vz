@@ -5,6 +5,7 @@
 //! implement. Callers depend only on this contract, making the backend
 //! selection transparent.
 
+pub mod capability_matrix;
 pub mod error;
 pub mod selection;
 pub mod types;

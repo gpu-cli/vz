@@ -90,6 +90,42 @@ fn failure(
     )
 }
 
+/// Refuse one requested capability the checked-in matrix does not advertise.
+///
+/// The message names the Machine, the capability and the matrix status so the
+/// refusal reads without a lookup, and `details` carry the same facts in wire
+/// names so a caller never has to parse the prose.
+fn unsupported_capability_failure(
+    metadata: &RequestMetadata,
+    host: HostSpec,
+    machine: &MachineSpec,
+    unadvertised: capability_matrix::UnadvertisedCapability,
+) -> MachineError {
+    let host_key = capability_matrix::host_key(host);
+    let capability = unadvertised.capability.as_str();
+    let status = unadvertised.status.as_str();
+    let target = machine.target.os.as_str();
+    let profile = machine.profile.as_str();
+    MachineError::new(
+        MachineErrorCode::UnsupportedOperation,
+        format!(
+            "Machine `{}` requests the `{capability}` capability, which {} marks {status} for {host_key} × {target} × {profile}; that pair has no negotiation path for it, so this Up performs no admission",
+            machine.name,
+            capability_matrix::MATRIX_PATH,
+        ),
+        metadata.request_id.clone(),
+        BTreeMap::from([
+            ("operation".into(), "up_environment".into()),
+            ("machine".into(), machine.name.clone()),
+            ("capability".into(), capability.into()),
+            ("capability_status".into(), status.into()),
+            ("host".into(), host_key),
+            ("target".into(), target.into()),
+            ("profile".into(), profile.into()),
+        ]),
+    )
+}
+
 impl RuntimeDaemon {
     /// Install trusted instrumentation before publishing this daemon owner.
     /// There is no RPC/CLI setting and no alternate/fake readiness provider.
@@ -113,7 +149,7 @@ impl RuntimeDaemon {
         let hash = request
             .request_hash()
             .map_err(|error| failure(&metadata, MachineErrorCode::ValidationError, error))?;
-        validate_supported(&request, &metadata)?;
+        validate_supported(&request, self.machine_target_resolver.host(), &metadata)?;
         let request_id = metadata.request_id.as_deref().unwrap_or_default();
         let key = metadata.idempotency_key.as_deref().unwrap_or_default();
         if [request_id, key].iter().any(|value| {
@@ -519,6 +555,7 @@ fn authorize_ownership(environment: &EnvironmentInstance) -> Result<(), StackErr
 
 fn validate_supported(
     request: &EnvironmentUpRequest,
+    host: HostSpec,
     metadata: &RequestMetadata,
 ) -> Result<(), MachineError> {
     let spec = &request.definition.environment;
@@ -528,6 +565,34 @@ fn validate_supported(
             MachineErrorCode::ValidationError,
             "Up requires 1..128 Machines",
         ));
+    }
+    // Capability negotiation is the checked-in matrix's answer, not the
+    // request's. `config/host-target-capabilities-v0.4.json` is the source of
+    // truth for what is ACTIVE/DEV on this host × target × profile, and a
+    // capability it marks PLANNED or NA has no negotiation path at all. Echoing
+    // the request back would make discovery, `vz status`, help and the site copy
+    // that read it all claim a capability the runtime does not have.
+    //
+    // It is refused HERE, before `reserve_environment_up_admission`, for the
+    // same reason the storage rules above are: an Up that cannot be honoured
+    // must not reserve identity or leave any durable trace behind it. The
+    // refusal names the Machine and the exact capability, and carries both in
+    // machine-readable `details`, so a caller can act on it without parsing
+    // prose.
+    for machine in &spec.machines {
+        if let Some(unadvertised) = capability_matrix::first_unadvertised(
+            host,
+            machine.target.os,
+            machine.profile,
+            &machine.requested_capabilities,
+        ) {
+            return Err(unsupported_capability_failure(
+                metadata,
+                host,
+                machine,
+                unadvertised,
+            ));
+        }
     }
     // Declared networks, endpoints and workspace projections are applied:
     // `install_environment_fabric` starts every switch and mints every port, and

@@ -210,7 +210,11 @@ Linux Machines negotiate `posix_exec` without a PTY, so `vz exec -t` against a
 Linux Machine is
 <!-- capability-matrix: macos-arm64/linux/* posix_pty -->**PLANNED**.
 Unsupported host/Machine-target pairs or capabilities
-fail explicitly and never substitute another Machine or target.
+fail explicitly and never substitute another Machine or target. The runtime
+reads `config/host-target-capabilities-v0.4.json` to decide this: a Machine
+requesting a capability the matrix does not mark ACTIVE or DEV for its
+host × target × profile is refused before admission, with an error naming the
+capability and its matrix status. Negotiation never echoes a request back.
 
 ### Linux Machines and Docker
 
