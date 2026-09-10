@@ -133,6 +133,37 @@ pub(crate) async fn pin_machine_artifacts_retaining_fence(
     .await
 }
 
+/// Pin a fork's artifacts from its already-pinned parent.
+///
+/// A fork has no pin of its own and must not acquire one the way a declared
+/// Machine does. [`load_machine_artifacts`] is recovery and refuses to create;
+/// [`pin_machine_artifacts`] needs a resolved target, which means consulting the
+/// catalog and the installed bundle again -- and a fork must run *exactly* what
+/// its parent runs, because it is seeded from that Machine's disk. Re-resolving
+/// could hand it a different kernel, initramfs or youki than the disk it
+/// inherited was built against.
+///
+/// So the parent's own pinned configuration is the source of truth, and the
+/// parent's verified bundle is the source of bytes. This is the ordinary pin
+/// path with those inputs, so every artifact is digest-verified on the way into
+/// the fork's store exactly as it was on the way into the parent's: the fork
+/// gets an independent, independently-validated pin, not a shared or trusted
+/// one.
+pub(crate) async fn inherit_machine_artifacts(
+    store: Arc<MachineRuntimeStoreLease>,
+    parent: &PinnedMachineArtifacts,
+    fence: Arc<dyn Send + Sync>,
+) -> Result<PinnedMachineArtifacts, MachineArtifactStoreError> {
+    parent.validate_current()?;
+    pin_inner_with_fence(
+        store,
+        parent.configuration().clone(),
+        parent.bundle_dir(),
+        Some(fence),
+    )
+    .await
+}
+
 /// Post-admission recovery. Missing, malformed or mismatched pins fail closed
 /// without consulting the original catalog, source bundle or ambient installer.
 pub async fn load_machine_artifacts(

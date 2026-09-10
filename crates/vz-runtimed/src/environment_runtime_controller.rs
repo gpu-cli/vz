@@ -433,27 +433,90 @@ impl EnvironmentControllerLease {
                 .map(|parent| parent.name.clone())
                 .ok_or_else(|| conflict("a fork's parent is absent from its own Environment"))
         };
-        let mut pins = Vec::new();
+        // Same two passes, and for the same reason, as the store acquisition
+        // above: a fork inherits its parent's pin, so the parent must be pinned
+        // first, and the aggregate's Machine order is not a guarantee of that.
+        // `pins` cannot be indexed by Machine position either -- native macOS
+        // Machines land in `native_pins` instead -- so a fork finds its parent
+        // through an explicit index rather than by counting.
+        let mut pins: Vec<PinnedMachineArtifacts> = Vec::new();
         let mut native_pins = Vec::new();
-        for (store, machine) in stores.iter().zip(&admitted.machines) {
-            state.access(|store| {
-                load_exact(store, &admitted)?;
-                if fresh {
-                    store.require_environment_admission_fence(&admitted)?;
+        let mut pinned_at: HashMap<MachineId, usize> = HashMap::new();
+        for pass_forks in [false, true] {
+            for (store, machine) in stores.iter().zip(&admitted.machines) {
+                if new_fork(machine) != pass_forks {
+                    continue;
                 }
-                Ok(())
-            })?;
-            if machine.target.os == vz_runtime_contract::OperatingSystem::Macos {
-                let native = if let Some(target) = resolved
+                state.access(|store| {
+                    load_exact(store, &admitted)?;
+                    if fresh {
+                        store.require_environment_admission_fence(&admitted)?;
+                    }
+                    Ok(())
+                })?;
+                if machine.target.os == vz_runtime_contract::OperatingSystem::Macos {
+                    let native = if let Some(target) = resolved
+                        .as_ref()
+                        .and_then(|targets| targets.native.get(&machine.name))
+                    {
+                        crate::native_macos::artifacts::prepare(
+                            Arc::clone(store),
+                            target.configuration.clone(),
+                            target.installed_bundle.as_deref(),
+                            registry.native_bootstrap_cache_path(),
+                            &mut progress,
+                        )
+                        .await?
+                    } else {
+                        let wanted = declared_name(machine)?;
+                        let spec = project
+                            .definition
+                            .environment
+                            .machines
+                            .iter()
+                            .find(|s| s.name == wanted)
+                            .ok_or_else(|| conflict("missing native Machine specification"))?;
+                        crate::native_macos::artifacts::load(
+                            Arc::clone(store),
+                            resolver.host(),
+                            spec,
+                        )?
+                    };
+                    native_pins.push(native);
+                    continue;
+                }
+                let pin = if let Some(target) = resolved
                     .as_ref()
-                    .and_then(|targets| targets.native.get(&machine.name))
+                    .and_then(|targets| targets.machines.get(&machine.name))
                 {
-                    crate::native_macos::artifacts::prepare(
+                    pin_machine_artifacts_retaining_fence(
                         Arc::clone(store),
-                        target.configuration.clone(),
-                        target.installed_bundle.as_deref(),
-                        registry.native_bootstrap_cache_path(),
-                        &mut progress,
+                        target,
+                        Arc::clone(&self.guard) as Arc<dyn Send + Sync>,
+                    )
+                    .await?
+                } else if new_fork(machine) {
+                    // A fork's store was created moments ago and holds no pin.
+                    // Recovery refuses to create one and re-resolving could hand the
+                    // fork a different kernel than the disk it inherited was built
+                    // against, so it takes its parent's pinned configuration and
+                    // verified bundle. Forks are appended after their parents in
+                    // this loop for the same reason their stores are opened in two
+                    // passes, so the parent's pin is already in `pins`.
+                    let origin = machine
+                        .fork
+                        .as_ref()
+                        .ok_or_else(|| conflict("fork lost its lineage during admission"))?;
+                    let parent = pinned_at
+                        .get(&origin.parent_machine_id)
+                        .and_then(|at| pins.get(*at))
+                        .ok_or_else(|| {
+                            conflict("a fork's parent has no pinned artifacts to inherit")
+                        })?;
+                    crate::machine_artifact_store::inherit_machine_artifacts(
+                        Arc::clone(store),
+                        parent,
+                        Arc::clone(&self.guard) as Arc<dyn Send + Sync>,
                     )
                     .await?
                 } else {
@@ -463,35 +526,13 @@ impl EnvironmentControllerLease {
                         .environment
                         .machines
                         .iter()
-                        .find(|s| s.name == wanted)
-                        .ok_or_else(|| conflict("missing native Machine specification"))?;
-                    crate::native_macos::artifacts::load(Arc::clone(store), resolver.host(), spec)?
+                        .find(|spec| spec.name == wanted)
+                        .ok_or_else(|| conflict("persisted Machine specification is missing"))?;
+                    load_machine_artifacts(Arc::clone(store), resolver.host(), spec).await?
                 };
-                native_pins.push(native);
-                continue;
+                pinned_at.insert(machine.machine_id.clone(), pins.len());
+                pins.push(pin);
             }
-            let pin = if let Some(target) = resolved
-                .as_ref()
-                .and_then(|targets| targets.machines.get(&machine.name))
-            {
-                pin_machine_artifacts_retaining_fence(
-                    Arc::clone(store),
-                    target,
-                    Arc::clone(&self.guard) as Arc<dyn Send + Sync>,
-                )
-                .await?
-            } else {
-                let wanted = declared_name(machine)?;
-                let spec = project
-                    .definition
-                    .environment
-                    .machines
-                    .iter()
-                    .find(|spec| spec.name == wanted)
-                    .ok_or_else(|| conflict("persisted Machine specification is missing"))?;
-                load_machine_artifacts(Arc::clone(store), resolver.host(), spec).await?
-            };
-            pins.push(pin);
         }
         state.access(|store| {
             load_exact(store, &admitted)?;
