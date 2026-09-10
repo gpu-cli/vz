@@ -15,6 +15,7 @@ from pathlib import Path
 import sys
 
 import docker_host_driver as driver
+import frozen_tree
 import vz04_candidate as candidate
 import vz04_contract as contract_module
 import vz04_decisions as decisions
@@ -204,6 +205,29 @@ def evaluate(root: Path, manifest: dict, *, repo_root: Path = REPO_ROOT, codesig
                 findings.add("lane.fixture_digest", subject, "lane result bound to a different fixture digest")
             if result["contract_sha256"] != frozen["inputs"]["e2e_contract"]["sha256"]:
                 findings.add("lane.contract_digest", subject, "lane result bound to a different contract digest")
+            # Everything above binds a lane result to the candidate's INPUTS.
+            # None of it binds the code that produced the result. The entry
+            # points are thin wrappers -- `run-developer-environment-e2e.sh` is
+            # under thirty lines and does nothing but exec `frozen_tree.py` --
+            # while every assertion a lane makes lives in the helper modules,
+            # which no digest above covers. Without this, a lane result produced
+            # by helper code from another commit validates clean, which is the
+            # same defect as a lane naming a tree it did not run: evidence that
+            # says one thing and executed another.
+            tree = result["source_tree"]
+            release_tree = manifest["candidate_tuple"].get("source", {}).get("tree_sha256")
+            if tree["tree_sha256"] == frozen_tree.UNKNOWN_DIGEST or tree["commit"] == frozen_tree.UNKNOWN_COMMIT:
+                findings.add("lane.source_tree_unknown", subject,
+                             "lane could not describe the tree it ran against; an all-zero digest is not a clean tree")
+            elif tree["commit"] != manifest["release"]["source_commit"] or (release_tree and tree["tree_sha256"] != release_tree):
+                findings.add("lane.source_tree", subject,
+                             f"lane ran against commit {tree['commit'][:12]} tree {tree['tree_sha256'][:12]}, "
+                             f"release built from commit {manifest['release']['source_commit'][:12]} "
+                             f"tree {(release_tree or 'unrecorded')[:12]}")
+            if entry["lane"] in lane_defs and lane_defs[entry["lane"]]["role"] == "acceptance" and not tree["frozen"]:
+                findings.add("lane.unfrozen", subject,
+                             "acceptance lane ran from the working checkout; a tree that can move mid-run cannot "
+                             "be the one the result names")
             if result["outcome"] != entry["outcome"] or (result["failure"] or {}).get("reason") != entry["failure_reason"]:
                 findings.add("lane.manifest_mismatch", subject, "manifest lane row differs from lane result")
             recorded_lane = manifest["lanes"].get(entry["lane"])

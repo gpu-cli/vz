@@ -166,5 +166,70 @@ class GateDryRunTests(unittest.TestCase):
             self.assertTrue(any(r["code"] == "canary.present" for r in report["findings"]))
 
 
+    def test_a_lane_result_is_bound_to_the_tree_that_produced_it(self):
+        """Both directions of the tree binding, from one fixture.
+
+        Every other lane binding covers the candidate's INPUTS -- the tuple, the
+        release directory, the fixtures, the contract, the entry point. None
+        covers the code that produced the result: the entry points are thin
+        wrappers that exec `frozen_tree.py`, and every assertion a lane makes
+        lives in helper modules no digest above reaches. So a lane result
+        produced by helper code from another commit used to validate clean.
+
+        The agreeing case has to be constructed rather than observed, because
+        the dry fixture's lanes are stubs that run from the working checkout and
+        therefore legitimately carry both findings.
+        """
+        import shutil
+        with tempfile.TemporaryDirectory(prefix="vz04-tree-") as copy_root:
+            copy = Path(copy_root).resolve() / "gate-unit-dry-1"
+            shutil.copytree(self.run_root, copy)
+            manifest = common.load_json(copy / "manifest.json")
+            commit = manifest["release"]["source_commit"]
+            tree_sha256 = manifest["candidate_tuple"]["source"]["tree_sha256"]
+            # Every lane result, not one: the findings are per lane, so leaving
+            # the others disagreeing would make the agreeing case unobservable.
+            result_paths = sorted(copy.rglob("lane-result.json"))
+            self.assertTrue(result_paths)
+            subject = copy / "topology" / "clean-provision" / "lane-result.json"
+            self.assertIn(subject, result_paths)
+
+            def report_for(**overrides):
+                for path in result_paths:
+                    value = common.load_json(path)
+                    value["source_tree"].update(frozen=True, commit=commit, tree_sha256=tree_sha256)
+                    if path == subject:
+                        value["source_tree"].update(**overrides)
+                    common.document(path, value, replace=True)
+                report = validate.validate_root(copy, codesign_verifier=fixtures.fake_codesign_verifier)
+                return {r["code"] for r in report["findings"]}, report
+
+            codes, _ = report_for()
+            self.assertNotIn("lane.source_tree", codes)
+            self.assertNotIn("lane.unfrozen", codes)
+            self.assertNotIn("lane.source_tree_unknown", codes)
+
+            # One commit away is the whole failure: same inputs, same release
+            # directory, same contract, same fixtures -- different code.
+            codes, report = report_for(commit="b" * 40)
+            self.assertIn("lane.source_tree", codes)
+            detail = next(r["detail"] for r in report["findings"] if r["code"] == "lane.source_tree")
+            self.assertIn("b" * 12, detail)
+            self.assertIn(commit[:12], detail)
+
+            codes, _ = report_for(tree_sha256="c" * 64)
+            self.assertIn("lane.source_tree", codes)
+
+            codes, _ = report_for(frozen=False)
+            self.assertIn("lane.unfrozen", codes)
+
+            # An all-zero digest means the lane could not describe its tree. It
+            # must be reported as that, not silently compared and not mistaken
+            # for agreement.
+            codes, _ = report_for(tree_sha256="0" * 64)
+            self.assertIn("lane.source_tree_unknown", codes)
+            self.assertNotIn("lane.source_tree", codes)
+
+
 if __name__ == "__main__":
     unittest.main()
