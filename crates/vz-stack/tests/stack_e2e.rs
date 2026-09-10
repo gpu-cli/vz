@@ -5874,6 +5874,7 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
             &target_backend_key,
             vec![],
             StackResourceHint {
+                docker_data_seeded_by_fork: false,
                 cpus: Some(2),
                 memory_mb: Some(1024),
                 disk_image_path: Some(target_disk.clone()),
@@ -5921,6 +5922,7 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
             &sibling_backend_key,
             vec![],
             StackResourceHint {
+                docker_data_seeded_by_fork: false,
                 cpus: Some(2),
                 memory_mb: Some(1024),
                 disk_image_path: Some(sibling_disk.clone()),
@@ -6119,6 +6121,7 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
             &target_backend_key,
             vec![],
             StackResourceHint {
+                docker_data_seeded_by_fork: false,
                 cpus: Some(2),
                 memory_mb: Some(1024),
                 disk_image_path: Some(target_disk.clone()),

@@ -499,7 +499,16 @@ impl RuntimeDaemon {
                     let block_volumes=machine_volumes.blocks.into_iter().map(|volume|StackBlockVolume{
                         id:volume.id,host_path:volume.host_path,guest_path:volume.guest_path,read_only:volume.read_only,
                     }).collect();
+                    // Only a fork's FIRST boot consumes the cloned image. Once
+                    // it has run and stopped, its disk is its own and cleanly
+                    // unmounted like any other, so the permission is confined to
+                    // the one boot that can actually need it rather than granted
+                    // to every Machine that was ever forked.
+                    let seeded_by_fork = machine.fork.is_some()
+                        && machine.incarnation.is_none()
+                        && machine.runtime_identity.is_none();
                     let (activation,start_error)=match entry.boot_or_inspect_machine(&reservation,export_ports,attachments,StackResourceHint {
+                        docker_data_seeded_by_fork: seeded_by_fork,
                         cpus:Some(cpus),memory_mb:Some(memory_mb),
                         volume_mounts,
                         block_volumes,

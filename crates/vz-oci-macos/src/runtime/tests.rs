@@ -191,6 +191,7 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
         target_service: Some("db".to_string()),
     }];
     let resources = vz_runtime_contract::StackResourceHint {
+        docker_data_seeded_by_fork: false,
         cpus: Some(4),
         memory_mb: Some(8192),
         volume_mounts: vec![vz_runtime_contract::StackVolumeMount {

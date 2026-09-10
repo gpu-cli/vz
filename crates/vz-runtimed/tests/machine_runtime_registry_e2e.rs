@@ -381,6 +381,7 @@ fn fixtures(
             resolved_configuration: serde_json::to_value(target.configuration())?,
             artifact,
             resources: StackResourceHint {
+                docker_data_seeded_by_fork: false,
                 cpus: Some(2),
                 memory_mb: Some(memory_mb),
                 ..StackResourceHint::default()

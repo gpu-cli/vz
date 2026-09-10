@@ -432,6 +432,7 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
         ports: Vec<PortMapping>,
     ) -> Result<(), RuntimeError> {
         let resources = StackResourceHint {
+            docker_data_seeded_by_fork: false,
             cpus: spec.cpus,
             memory_mb: spec.memory_mb,
             volume_mounts: Vec::new(),

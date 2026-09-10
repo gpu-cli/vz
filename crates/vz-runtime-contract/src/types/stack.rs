@@ -1689,6 +1689,17 @@ pub struct StackResourceHint {
     /// so the shared VM can set them up at boot time (VirtioFS shares are
     /// static and must be configured before the VM starts).
     pub volume_mounts: Vec<StackVolumeMount>,
+    /// This Machine's Docker data disk arrived by being cloned from a running
+    /// parent, so its filesystem is crash-consistent rather than cleanly
+    /// unmounted.
+    ///
+    /// A fork is seeded with `clonefile(2)` of its parent's `data.img` while the
+    /// parent still has that ext4 mounted, which is exactly the image a power
+    /// cut leaves. The guest must therefore replay its journal before the disk
+    /// can be admitted, and the runtime may only do that for a disk it knows
+    /// arrived this way: a DECLARED Machine whose disk is unclean is a fault to
+    /// fail closed on, not a routine recovery.
+    pub docker_data_seeded_by_fork: bool,
     /// Optional path to a disk image to attach as a VirtioBlock device.
     ///
     /// Used for persistent named volumes: the image contains an ext4

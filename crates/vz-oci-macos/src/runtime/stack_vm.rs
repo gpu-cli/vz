@@ -1345,6 +1345,7 @@ impl Runtime {
         purpose: &str,
         allow_unformatted: bool,
         docker_data: bool,
+        seeded_by_fork: bool,
     ) -> Result<(), OciError> {
         let phase = GuestDiskPhase::Probe;
         let started = std::time::Instant::now();
@@ -1391,6 +1392,9 @@ impl Runtime {
                         return Err(OciError::InvalidConfig(
                             "Docker data requires journaled ext4; existing ext2/ext3 disks are preserved, never reformatted".to_string(),
                         ));
+                    }
+                    if seeded_by_fork {
+                        Self::replay_seeded_docker_journal(vm, device).await?;
                     }
                     Self::verify_guest_docker_filesystem(vm, device).await?;
                 }
@@ -1474,6 +1478,52 @@ impl Runtime {
             // Do not consume the host's exact format intent based on formatter
             // exit alone. The actual on-disk journal and clean state are proof.
             Self::verify_guest_docker_filesystem(vm, device).await?;
+        }
+        Ok(())
+    }
+
+    /// Replay a forked Docker disk's journal so it can be admitted on its own
+    /// terms, without relaxing what admission means.
+    ///
+    /// A fork's disk is `clonefile(2)`d from its parent's while the parent still
+    /// has that ext4 mounted, so it arrives exactly as a power cut would leave
+    /// it: crash-consistent, with a journal that has not been replayed. The
+    /// admission that follows still requires a positively clean filesystem, no
+    /// pending recovery and no recorded errors -- this does not weaken it. It
+    /// brings the disk to that state by the mechanism ext4 provides for it.
+    ///
+    /// Mount-then-unmount IS the replay: ext4 recovers the journal when it
+    /// mounts read-write and marks the superblock clean when it unmounts. That
+    /// is a world away from `e2fsck`, which is repair, remains forbidden, and
+    /// would still be refused a moment later if this were not enough -- a disk
+    /// with real damage fails admission exactly as it does today.
+    async fn replay_seeded_docker_journal(vm: &LinuxVm, device: &str) -> Result<(), OciError> {
+        const MOUNTPOINT: &str = "/run/vz-oci/forked-journal-replay";
+        let timeout = GuestDiskPhase::Probe.timeout();
+        tracing::info!(
+            device,
+            "replaying a forked Docker filesystem's journal before admission"
+        );
+        let replay = vm
+            .exec_collect(
+                "/bin/busybox".to_string(),
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!(
+                        "set -e; /bin/busybox mkdir -p {MOUNTPOINT}; \
+                         /bin/busybox mount -t ext4 {device} {MOUNTPOINT}; \
+                         /bin/busybox umount {MOUNTPOINT}"
+                    ),
+                ],
+                timeout,
+            )
+            .await?;
+        if replay.exit_code != 0 {
+            return Err(OciError::InvalidConfig(format!(
+                "forked Docker filesystem journal replay failed for {device}: exit {}: {}{}",
+                replay.exit_code, replay.stdout, replay.stderr
+            )));
         }
         Ok(())
     }
@@ -1908,6 +1958,7 @@ esac
                 "private Docker data",
                 *disposition == PrivateDiskDisposition::FormatAuthorized,
                 true,
+                resources.docker_data_seeded_by_fork,
             )
             .await?;
             complete_private_disk_format(
@@ -1932,6 +1983,7 @@ esac
                 volume_device,
                 "persistent named-volume",
                 true,
+                false,
                 false,
             )
             .await?;
@@ -1985,8 +2037,15 @@ esac
                 index,
             )?;
             if !volume.read_only {
-                Self::ensure_guest_ext4_disk(&vm, &device, "declared block volume", true, false)
-                    .await?;
+                Self::ensure_guest_ext4_disk(
+                    &vm,
+                    &device,
+                    "declared block volume",
+                    true,
+                    false,
+                    false,
+                )
+                .await?;
             }
             let options = if volume.read_only { "-o ro " } else { "" };
             let guest_path = &volume.guest_path;

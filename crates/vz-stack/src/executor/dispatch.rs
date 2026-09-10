@@ -1435,6 +1435,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     if sum > 0 { Some(sum) } else { None }
                 };
                 vz_runtime_contract::StackResourceHint {
+                    docker_data_seeded_by_fork: false,
                     cpus: max_cpus,
                     memory_mb: total_memory_mb,
                     // The legacy Compose path declares no Environment-owned

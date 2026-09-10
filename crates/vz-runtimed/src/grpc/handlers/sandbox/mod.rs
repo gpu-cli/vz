@@ -902,6 +902,7 @@ async fn boot_runtime_sandbox_resources(
     }
 
     let resources = StackResourceHint {
+        docker_data_seeded_by_fork: false,
         cpus,
         memory_mb,
         volume_mounts,
