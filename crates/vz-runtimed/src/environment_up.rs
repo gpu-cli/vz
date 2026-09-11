@@ -799,3 +799,7 @@ fn validate_supported(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "environment_up/secret_tests.rs"]
+mod secret_tests;

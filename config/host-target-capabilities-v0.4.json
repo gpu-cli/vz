@@ -506,7 +506,7 @@
           "negotiated_by": [],
           "rejected_by": [],
           "evidence": [],
-          "note": "No SecretBinding type exists in vz-runtime-contract."
+          "note": "SecretBindingSpec/SecretBindingInstance exist in vz-runtime-contract and schemas/vz-project-definition-v1.schema.json declares environment.secret_bindings; the CLI resolves source_env and source_command, the daemon delivers per Machine, refuses from_environment, and appends secret_binding_used to audit.jsonl. Still PLANNED because a DEV claim requires digest-bound evidence from an installed slice and gate.secrets.snapshots_scoped_redacted has not yet been measured against it."
         },
         "volumes": {
           "status": "PLANNED",
@@ -958,7 +958,7 @@
           "negotiated_by": [],
           "rejected_by": [],
           "evidence": [],
-          "note": "No SecretBinding type exists in vz-runtime-contract."
+          "note": "SecretBindingSpec/SecretBindingInstance exist in vz-runtime-contract and schemas/vz-project-definition-v1.schema.json declares environment.secret_bindings; the CLI resolves source_env and source_command, the daemon delivers per Machine, refuses from_environment, and appends secret_binding_used to audit.jsonl. Still PLANNED because a DEV claim requires digest-bound evidence from an installed slice and gate.secrets.snapshots_scoped_redacted has not yet been measured against it."
         },
         "volumes": {
           "status": "NA",
@@ -1286,7 +1286,7 @@
           "negotiated_by": [],
           "rejected_by": [],
           "evidence": [],
-          "note": "No SecretBinding type exists in vz-runtime-contract."
+          "note": "SecretBindingSpec/SecretBindingInstance exist in vz-runtime-contract and schemas/vz-project-definition-v1.schema.json declares environment.secret_bindings; the CLI resolves source_env and source_command, the daemon delivers per Machine, refuses from_environment, and appends secret_binding_used to audit.jsonl. Still PLANNED because a DEV claim requires digest-bound evidence from an installed slice and gate.secrets.snapshots_scoped_redacted has not yet been measured against it."
         },
         "volumes": {
           "status": "NA",

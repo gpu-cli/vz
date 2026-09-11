@@ -5,204 +5,864 @@
   "description": "Reusable desired topology, not a running Environment. Structural validation must be followed by ProjectDefinition::validate and target-qualified artifact/capability admission. Schema acceptance is not a support or release-readiness claim.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "project_id", "name", "environment"],
+  "required": [
+    "schema_version",
+    "project_id",
+    "name",
+    "environment"
+  ],
   "properties": {
-    "schema_version": {"const": 1},
-    "project_id": {"$ref": "#/$defs/id"},
-    "name": {"$ref": "#/$defs/name"},
-    "environment": {"$ref": "#/$defs/environment"}
+    "schema_version": {
+      "const": 1
+    },
+    "project_id": {
+      "$ref": "#/$defs/id"
+    },
+    "name": {
+      "$ref": "#/$defs/name"
+    },
+    "environment": {
+      "$ref": "#/$defs/environment"
+    }
   },
   "$defs": {
-    "id": {"type": "string", "minLength": 1, "maxLength": 128, "not": {"pattern": "[^A-Za-z0-9_.:-]"}},
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "not": {
+        "pattern": "[^A-Za-z0-9_.:-]"
+      }
+    },
     "name": {
-      "type": "string", "minLength": 1, "maxLength": 128, "pattern": "\\S",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "\\S",
       "description": "The runtime additionally enforces a maximum of 128 UTF-8 bytes. Names must be unique within their resource kind."
     },
-    "optionalString": {"type": ["string", "null"]},
-    "capability": {"enum": ["posix_exec", "posix_pty", "signals", "files", "ports", "docker_engine", "compose", "buildx", "snapshot", "suspend", "checkpoint", "gui", "windows_console"]},
+    "optionalString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "capability": {
+      "enum": [
+        "posix_exec",
+        "posix_pty",
+        "signals",
+        "files",
+        "ports",
+        "docker_engine",
+        "compose",
+        "buildx",
+        "snapshot",
+        "suspend",
+        "checkpoint",
+        "gui",
+        "windows_console"
+      ]
+    },
     "requestedCapabilities": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "capabilities": {"type": "array", "items": {"$ref": "#/$defs/capability"}},
-        "unsupported": {"type": "object", "maxProperties": 0}
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/capability"
+          }
+        },
+        "unsupported": {
+          "type": "object",
+          "maxProperties": 0
+        }
       }
     },
     "target": {
-      "type": "object", "additionalProperties": false,
-      "required": ["os", "arch", "image"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "arch",
+        "image"
+      ],
       "properties": {
-        "os": {"enum": ["linux", "macos", "windows"]},
-        "arch": {"enum": ["aarch64", "x86_64"]},
-        "image": {"type": "string", "minLength": 1, "pattern": "\\S"},
-        "version": {"$ref": "#/$defs/optionalString"},
-        "channel": {"$ref": "#/$defs/optionalString"},
-        "digest": {"$ref": "#/$defs/optionalString"}
+        "os": {
+          "enum": [
+            "linux",
+            "macos",
+            "windows"
+          ]
+        },
+        "arch": {
+          "enum": [
+            "aarch64",
+            "x86_64"
+          ]
+        },
+        "image": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "version": {
+          "$ref": "#/$defs/optionalString"
+        },
+        "channel": {
+          "$ref": "#/$defs/optionalString"
+        },
+        "digest": {
+          "$ref": "#/$defs/optionalString"
+        }
       },
       "description": "Host and target are separate. This describes a requested target; the backend must resolve and verify exact pinned artifacts and reject unsupported host/target pairs without substitution."
     },
     "resources": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "cpus": {"type": ["integer", "null"], "minimum": 0, "maximum": 255},
-        "memory_mb": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615},
-        "disk_bytes": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615}
+        "cpus": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 255
+        },
+        "memory_mb": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "disk_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
       },
       "description": "Wire-format bounds only. Runtime admission applies backend resource limits before creating a Machine."
     },
     "workspace": {
-      "type": "object", "additionalProperties": false,
-      "required": ["binding", "target_path", "mode", "source_path"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "binding",
+        "target_path",
+        "mode",
+        "source_path"
+      ],
       "properties": {
-        "binding": {"type": "string"},
-        "target_path": {"type": "string"},
-        "mode": {"enum": ["read_write", "read_only", "snapshot"]},
-        "source_path": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(\\.|[^/\\u0000-\\u001f][^\\u0000-\\u001f]*)$", "not": {"pattern": "(^|/)(\\.\\.)?(/|$)"}, "description": "Host source declared RELATIVE to the worktree root; `.` is the root itself. Absolute paths, control characters, empty components and `..` traversal are refused here, matching `validate_workspace_source_path`; the runtime then canonicalises the joined path and refuses symlinks that leave the root."}
+        "binding": {
+          "type": "string"
+        },
+        "target_path": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "read_write",
+            "read_only",
+            "snapshot"
+          ]
+        },
+        "source_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^(\\.|[^/\\u0000-\\u001f][^\\u0000-\\u001f]*)$",
+          "not": {
+            "pattern": "(^|/)(\\.\\.)?(/|$)"
+          },
+          "description": "Host source declared RELATIVE to the worktree root; `.` is the root itself. Absolute paths, control characters, empty components and `..` traversal are refused here, matching `validate_workspace_source_path`; the runtime then canonicalises the joined path and refuses symlinks that leave the root."
+        }
       },
       "description": "Binding names refer to opaque worktree associations, not path-derived Environment identity. Runtime admission validates projection paths and writer policy: a host source that is writable in one Machine is projected into no other Machine of the Environment."
     },
     "machine": {
-      "type": "object", "additionalProperties": false,
-      "required": ["schema_version", "name", "profile", "target"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "name",
+        "profile",
+        "target"
+      ],
       "properties": {
-        "schema_version": {"const": 1},
-        "name": {"$ref": "#/$defs/name"},
-        "profile": {"enum": ["developer", "hardened"]},
-        "target": {"$ref": "#/$defs/target"},
-        "resources": {"$ref": "#/$defs/resources"},
-        "requested_capabilities": {"$ref": "#/$defs/requestedCapabilities"},
-        "workspace": {"anyOf": [{"$ref": "#/$defs/workspace"}, {"type": "null"}]},
-        "networks": {"type": "array", "items": {"$ref": "#/$defs/name"}, "description": "Topology-local network names this Machine attaches to. Semantic validation requires each name to be a declared network and rejects duplicates."},
-        "egress": {"enum": ["offline", "allowed"], "description": "Absent means offline: no external attachment exists at all. Never a filter over a shared gateway address."}
+        "schema_version": {
+          "const": 1
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "profile": {
+          "enum": [
+            "developer",
+            "hardened"
+          ]
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "resources": {
+          "$ref": "#/$defs/resources"
+        },
+        "requested_capabilities": {
+          "$ref": "#/$defs/requestedCapabilities"
+        },
+        "workspace": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/workspace"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "networks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/name"
+          },
+          "description": "Topology-local network names this Machine attaches to. Semantic validation requires each name to be a declared network and rejects duplicates."
+        },
+        "egress": {
+          "enum": [
+            "offline",
+            "allowed"
+          ],
+          "description": "Absent means offline: no external attachment exists at all. Never a filter over a shared gateway address."
+        }
       },
       "allOf": [
         {
-          "if": {"properties": {"profile": {"const": "hardened"}}, "required": ["profile"]},
-          "then": {"properties": {"target": {"properties": {"os": {"const": "linux"}}}}}
+          "if": {
+            "properties": {
+              "profile": {
+                "const": "hardened"
+              }
+            },
+            "required": [
+              "profile"
+            ]
+          },
+          "then": {
+            "properties": {
+              "target": {
+                "properties": {
+                  "os": {
+                    "const": "linux"
+                  }
+                }
+              }
+            }
+          }
         },
         {
-          "if": {"anyOf": [
-            {"properties": {"profile": {"const": "hardened"}}, "required": ["profile"]},
-            {"properties": {"target": {"properties": {"os": {"enum": ["macos", "windows"]}}, "required": ["os"]}}, "required": ["target"]}
-          ]},
-          "then": {"properties": {"requested_capabilities": {"properties": {"capabilities": {"not": {"contains": {"enum": ["docker_engine", "compose", "buildx"]}}}}}}}
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "profile": {
+                    "const": "hardened"
+                  }
+                },
+                "required": [
+                  "profile"
+                ]
+              },
+              {
+                "properties": {
+                  "target": {
+                    "properties": {
+                      "os": {
+                        "enum": [
+                          "macos",
+                          "windows"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "os"
+                    ]
+                  }
+                },
+                "required": [
+                  "target"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "requested_capabilities": {
+                "properties": {
+                  "capabilities": {
+                    "not": {
+                      "contains": {
+                        "enum": [
+                          "docker_engine",
+                          "compose",
+                          "buildx"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         },
         {
-          "if": {"anyOf": [
-            {"properties": {"profile": {"const": "hardened"}}, "required": ["profile"]},
-            {"properties": {"target": {"properties": {"os": {"const": "windows"}}, "required": ["os"]}}, "required": ["target"]}
-          ]},
-          "then": {"properties": {"networks": {"maxItems": 0}, "egress": {"const": "offline"}}},
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "profile": {
+                    "const": "hardened"
+                  }
+                },
+                "required": [
+                  "profile"
+                ]
+              },
+              {
+                "properties": {
+                  "target": {
+                    "properties": {
+                      "os": {
+                        "const": "windows"
+                      }
+                    },
+                    "required": [
+                      "os"
+                    ]
+                  }
+                },
+                "required": [
+                  "target"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "networks": {
+                "maxItems": 0
+              },
+              "egress": {
+                "const": "offline"
+              }
+            }
+          },
           "description": "Who may declare Environment-network membership. This is a SEPARATE grant from implicit Docker, which the preceding conditional governs, and the two no longer withhold from the same set. Hardened is the restricted profile and declares none of this topology; native Windows is PLANNED, not shipped, so it declares none of it either. A Developer macOS Machine may declare `networks` and `egress`, because it is a target-native Machine on the Environment fabric, and still gets no implicit Docker: the preceding conditional continues to refuse `docker_engine`, `compose` and `buildx` on every non-Linux target."
         }
       ],
       "description": "Developer Linux implicitly owns Docker; no Docker flag, global socket or Linux sidecar exists for other profiles/targets. Network membership does not follow that line: see the third conditional below."
     },
     "network": {
-      "type": "object", "additionalProperties": false,
-      "required": ["schema_version", "name", "kind"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "name",
+        "kind"
+      ],
       "properties": {
-        "schema_version": {"const": 1},
-        "name": {"$ref": "#/$defs/name"},
-        "kind": {"enum": ["private", "simulated_public"]},
-        "cidr": {"$ref": "#/$defs/optionalString"}
+        "schema_version": {
+          "const": 1
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "kind": {
+          "enum": [
+            "private",
+            "simulated_public"
+          ]
+        },
+        "cidr": {
+          "$ref": "#/$defs/optionalString"
+        }
       }
     },
     "endpoint": {
-      "type": "object", "additionalProperties": false,
-      "required": ["schema_version", "name", "machine", "network", "protocol", "port"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "name",
+        "machine",
+        "network",
+        "protocol",
+        "port"
+      ],
       "properties": {
-        "schema_version": {"const": 1},
-        "name": {"$ref": "#/$defs/name"},
-        "machine": {"$ref": "#/$defs/name"},
-        "network": {"$ref": "#/$defs/name"},
-        "protocol": {"enum": ["tcp", "udp", "http", "https"]},
-        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
-        "hostname": {"$ref": "#/$defs/optionalString"}
+        "schema_version": {
+          "const": 1
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "machine": {
+          "$ref": "#/$defs/name"
+        },
+        "network": {
+          "$ref": "#/$defs/name"
+        },
+        "protocol": {
+          "enum": [
+            "tcp",
+            "udp",
+            "http",
+            "https"
+          ]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "hostname": {
+          "$ref": "#/$defs/optionalString"
+        }
       }
     },
     "hostExport": {
-      "type": "object", "additionalProperties": false,
-      "required": ["schema_version", "name", "machine", "protocol", "machine_port"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "name",
+        "machine",
+        "protocol",
+        "machine_port"
+      ],
       "properties": {
-        "schema_version": {"const": 1},
-        "name": {"$ref": "#/$defs/name"},
-        "machine": {"$ref": "#/$defs/name"},
-        "protocol": {"enum": ["tcp"]},
-        "machine_port": {"type": "integer", "minimum": 1, "maximum": 65535},
-        "host_port": {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 65535}, {"type": "null"}]}
+        "schema_version": {
+          "const": 1
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "machine": {
+          "$ref": "#/$defs/name"
+        },
+        "protocol": {
+          "enum": [
+            "tcp"
+          ]
+        },
+        "machine_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "host_port": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
       },
       "description": "The host destination is always 127.0.0.1. No host address is declarable, so no export can become a LAN or wildcard listener; absent host_port requests dynamic loopback allocation."
     },
     "hostImport": {
-      "type": "object", "additionalProperties": false,
-      "required": ["schema_version", "name", "machine", "protocol", "host_port"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "name",
+        "machine",
+        "protocol",
+        "host_port"
+      ],
       "properties": {
-        "schema_version": {"const": 1},
-        "name": {"$ref": "#/$defs/name"},
-        "machine": {"$ref": "#/$defs/name"},
-        "protocol": {"enum": ["tcp"]},
-        "host_port": {"type": "integer", "minimum": 1, "maximum": 65535},
-        "guest_port": {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 65535}, {"type": "null"}]},
-        "alias": {"anyOf": [{"$ref": "#/$defs/name"}, {"type": "null"}]}
+        "schema_version": {
+          "const": 1
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "machine": {
+          "$ref": "#/$defs/name"
+        },
+        "protocol": {
+          "enum": [
+            "tcp"
+          ]
+        },
+        "host_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "guest_port": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "alias": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/name"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
       },
       "description": "Imports name exactly one 127.0.0.1 host service. The guest never sends a destination, and an alias is a guest-local convenience, never an authorization."
     },
     "volumeAttachment": {
-      "type": "object", "additionalProperties": false,
-      "required": ["machine", "target_path", "mode"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "machine",
+        "target_path",
+        "mode"
+      ],
       "properties": {
-        "machine": {"$ref": "#/$defs/name"},
-        "target_path": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^/", "not": {"pattern": "(^|/)\\.\\.(/|$)"}, "description": "Absolute, bounded, `..`-free path inside the named Machine where this volume appears."},
-        "mode": {"enum": ["read_write", "read_only"]}
+        "machine": {
+          "$ref": "#/$defs/name"
+        },
+        "target_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^/",
+          "not": {
+            "pattern": "(^|/)\\.\\.(/|$)"
+          },
+          "description": "Absolute, bounded, `..`-free path inside the named Machine where this volume appears."
+        },
+        "mode": {
+          "enum": [
+            "read_write",
+            "read_only"
+          ]
+        }
       },
       "description": "One Machine's attachment. Semantic validation requires the Machine to be declared, refuses one Machine attaching one volume twice, and refuses more than one attachment on a writable `block` volume."
     },
     "sharedCacheConsistency": {
-      "type": "object", "additionalProperties": false,
-      "required": ["model", "staleness_bound_millis"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "staleness_bound_millis"
+      ],
       "properties": {
-        "model": {"enum": ["bounded_staleness"]},
-        "staleness_bound_millis": {"type": "integer", "minimum": 1, "maximum": 60000}
+        "model": {
+          "enum": [
+            "bounded_staleness"
+          ]
+        },
+        "staleness_bound_millis": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000
+        }
       },
       "description": "A closed write on one attached Machine becomes visible to every other attached Machine within staleness_bound_millis. Nothing is promised before that bound: each Machine runs its own virtio-fs attribute and dentry cache over the one host directory."
     },
     "volume": {
-      "type": "object", "additionalProperties": false,
-      "required": ["schema_version", "name", "kind", "attachments"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "name",
+        "kind",
+        "attachments"
+      ],
       "properties": {
-        "schema_version": {"const": 1},
-        "name": {"$ref": "#/$defs/name"},
-        "kind": {"enum": ["block", "shared_cache"]},
-        "size_bytes": {"anyOf": [{"type": "integer", "minimum": 1048576, "maximum": 1099511627776}, {"type": "null"}]},
-        "consistency": {"anyOf": [{"$ref": "#/$defs/sharedCacheConsistency"}, {"type": "null"}]},
-        "attachments": {"type": "array", "minItems": 1, "maxItems": 128, "items": {"$ref": "#/$defs/volumeAttachment"}}
+        "schema_version": {
+          "const": 1
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "kind": {
+          "enum": [
+            "block",
+            "shared_cache"
+          ]
+        },
+        "size_bytes": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1048576,
+              "maximum": 1099511627776
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "consistency": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sharedCacheConsistency"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "attachments": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/volumeAttachment"
+          }
+        }
       },
       "allOf": [
         {
-          "if": {"properties": {"kind": {"const": "block"}}, "required": ["kind"]},
-          "then": {"required": ["size_bytes"], "properties": {"size_bytes": {"type": "integer"}, "consistency": {"type": "null"}}}
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "block"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "size_bytes"
+            ],
+            "properties": {
+              "size_bytes": {
+                "type": "integer"
+              },
+              "consistency": {
+                "type": "null"
+              }
+            }
+          }
         },
         {
-          "if": {"properties": {"kind": {"const": "shared_cache"}}, "required": ["kind"]},
-          "then": {"required": ["consistency"], "properties": {"consistency": {"$ref": "#/$defs/sharedCacheConsistency"}, "size_bytes": {"type": "null"}}}
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "shared_cache"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "consistency"
+            ],
+            "properties": {
+              "consistency": {
+                "$ref": "#/$defs/sharedCacheConsistency"
+              },
+              "size_bytes": {
+                "type": "null"
+              }
+            }
+          }
         }
       ],
       "description": "Environment-owned storage. `block` is one ext4 disk image on a virtio-block device and carries `size_bytes`; a writable block volume is refused on more than one Machine, because ext4 is not a cluster filesystem. `shared_cache` is one host directory exported to every attached Machine over VirtioFS and carries `consistency` instead; multi-attach is its purpose. Each kind refuses the other's field rather than ignoring it."
     },
     "environment": {
-      "type": "object", "additionalProperties": false,
-      "required": ["schema_version", "machines"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "machines"
+      ],
       "properties": {
-        "schema_version": {"const": 1},
-        "machines": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/machine"}},
-        "default_machine": {"anyOf": [{"$ref": "#/$defs/name"}, {"type": "null"}], "description": "Optional topology-local Machine name. Semantic validation requires an exact declared Machine. Explicit and process selectors take precedence without fallback."},
-        "networks": {"type": "array", "items": {"$ref": "#/$defs/network"}},
-        "endpoints": {"type": "array", "items": {"$ref": "#/$defs/endpoint"}},
-        "host_exports": {"type": "array", "items": {"$ref": "#/$defs/hostExport"}},
-        "host_imports": {"type": "array", "items": {"$ref": "#/$defs/hostImport"}},
-        "volumes": {"type": "array", "items": {"$ref": "#/$defs/volume"}}
+        "schema_version": {
+          "const": 1
+        },
+        "machines": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/machine"
+          }
+        },
+        "default_machine": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/name"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional topology-local Machine name. Semantic validation requires an exact declared Machine. Explicit and process selectors take precedence without fallback."
+        },
+        "networks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/network"
+          }
+        },
+        "secret_bindings": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/secretBinding"
+          },
+          "description": "Values delivered to exactly one Machine each, by identity."
+        },
+        "endpoints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/endpoint"
+          }
+        },
+        "host_exports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hostExport"
+          }
+        },
+        "host_imports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hostImport"
+          }
+        },
+        "volumes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/volume"
+          }
+        }
       },
       "description": "Semantic validation checks unique names, exact endpoint Machine/network references, that every endpoint Machine is attached to that endpoint's network, that host exports/imports name a declared Machine, and that every volume attachment names a declared Machine. More than one named Environment may instantiate this same topology, including within one worktree."
+    },
+    "secretBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "name",
+        "machine",
+        "target_path"
+      ],
+      "description": "A value delivered to exactly one Machine at an absolute in-guest path. The VALUE is never here: a declaration names where the value comes from on the host, because a definition is a checked-in file. Exactly one of `source_env` and `source_command` is required.",
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "machine": {
+          "$ref": "#/$defs/name"
+        },
+        "target_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^/",
+          "not": {
+            "pattern": "(^|/)\\.\\.(/|$)"
+          },
+          "description": "Absolute, bounded, `..`-free path inside the named Machine."
+        },
+        "source_env": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Host environment variable the CLI reads the value from."
+        },
+        "source_command": {
+          "anyOf": [
+            {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 64,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              }
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Argv vector whose stdout is the value, e.g. [\"op\",\"read\",\"op://vault/item/field\"]. No shell is involved. SECURITY: a definition is checked in, so this is host code execution at `vz up` for anyone who clones the repository; the exact argv is recorded in the audit log on every use."
+        },
+        "from_environment": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Another Environment's identity. Present only to be REFUSED: separate Environments are default-deny and a secret cannot cross that boundary."
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "source_env"
+          ],
+          "properties": {
+            "source_command": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "required": [
+            "source_command"
+          ],
+          "properties": {
+            "source_env": {
+              "type": "null"
+            }
+          }
+        }
+      ]
     }
   }
 }

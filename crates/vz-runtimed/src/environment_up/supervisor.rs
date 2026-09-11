@@ -818,6 +818,36 @@ fn native_progress(
     }
 }
 
+/// One `secret_binding_used` record, as a value.
+///
+/// Pure and separate from the append so the REDACTION claim is testable rather
+/// than asserted: a test can build a record for a binding whose value it knows
+/// and search the encoded line for those bytes. Everything here is identity or
+/// provenance -- what was used, by whom, from where -- and none of it is the
+/// value or a digest of it, because a digest verifies a guess.
+pub(super) fn secret_audit_record(
+    environment: &EnvironmentInstance,
+    machine: &MachineInstance,
+    binding: &vz_runtime_contract::SecretBindingInstance,
+    metadata: &RequestMetadata,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "event": "secret_binding_used",
+        "recorded_at": current_unix_secs(),
+        "request_id": metadata.request_id.clone(),
+        "project_id": environment.project_id.to_string(),
+        "environment_id": environment.environment_id.to_string(),
+        "machine_id": machine.machine_id.to_string(),
+        "machine": machine.name.clone(),
+        "secret_binding_id": binding.binding_id.to_string(),
+        "secret_binding": binding.name.clone(),
+        "target_path": binding.target_path.clone(),
+        "source_env": binding.source_env.clone(),
+        "source_command": binding.source_command.clone(),
+    })
+}
+
 /// How long one binding's delivery may take, end to end.
 const SECRET_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// Where the daemon appends its audit records, under the runtime data dir.
@@ -996,21 +1026,7 @@ impl RuntimeDaemon {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
 
-        let record = serde_json::json!({
-            "schema_version": 1,
-            "event": "secret_binding_used",
-            "recorded_at": current_unix_secs(),
-            "request_id": metadata.request_id.clone(),
-            "project_id": environment.project_id.to_string(),
-            "environment_id": environment.environment_id.to_string(),
-            "machine_id": machine.machine_id.to_string(),
-            "machine": machine.name.clone(),
-            "secret_binding_id": binding.binding_id.to_string(),
-            "secret_binding": binding.name.clone(),
-            "target_path": binding.target_path.clone(),
-            "source_env": binding.source_env.clone(),
-            "source_command": binding.source_command.clone(),
-        });
+        let record = secret_audit_record(environment, machine, binding, metadata);
         let path = self.config.runtime_data_dir.join(SECRET_AUDIT_LOG);
         let mut line = serde_json::to_vec(&record).map_err(|error| {
             failure(
