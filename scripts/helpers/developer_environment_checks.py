@@ -1931,7 +1931,27 @@ def establish_recovery_environments(ctx: CheckContext, names: tuple) -> tuple:
     """
     check = SubCheck("gate.lifecycle.recovery_including_sleep_wake", "establish_recovery_environments")
     try:
+        # One DECLARED private network per Environment, so each Machine holds a
+        # fabric address that is its Environment's alone.
+        #
+        # These Environments are criterion 8's subjects, and it asks whether one
+        # can route to another. Answering that needs an address belonging to one
+        # Environment and not the others. Without a declared network the only
+        # non-loopback address a Machine has is its Docker bridge, 172.17.0.1,
+        # which is IDENTICAL in every Machine -- so "a reaches b's address"
+        # reached its own docker0 and read its own token, and the clause
+        # reported a routing failure over a packet that never left the Machine.
+        #
+        # It used to be masked: every Machine also had an address on Apple's
+        # shared NAT segment, and those differ. But that is precisely the
+        # address the product contract says is not an authorization boundary,
+        # so proving isolation across it was proving the wrong thing. Enforcing
+        # `EgressPolicy::Offline` removed the NIC and left the confusion with
+        # nothing to hide behind.
         base = minimal_definition(ctx.release_dir)
+        base["environment"]["machines"][0]["networks"] = [PRIVATE_NETWORK]
+        base["environment"]["networks"] = [
+            {"schema_version": 1, "name": PRIVATE_NETWORK, "kind": "private"}]
     except (StopIteration, KeyError, OSError) as error:
         check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
         return None, check.finish()
@@ -8151,7 +8171,27 @@ def check_cross_environment_routing(ctx: CheckContext, top: str, established: di
         if check.status != "PASS":
             return check.finish()
         for a, b in cross_pairs(subjects):
-            for interface, address in b["addresses"]:
+            # An address the SOURCE also holds is not the target's address, and
+            # aiming at it measures a Machine against itself.
+            #
+            # Every Developer Linux Machine's Docker bridge is 172.17.0.1, so
+            # `b`'s address list contains one that `a` also has. `a` fetching it
+            # reaches its OWN docker0 and reads its OWN token, and the check
+            # read that as "a connected to b" -- a cross-Environment routing
+            # failure reported against a packet that never left the Machine.
+            #
+            # The first assertion of the pair passed throughout, because the
+            # token really was absent; only the second could see it. Skipping
+            # the address is exact: two Machines that genuinely share an address
+            # cannot be distinguished by aiming at it, whatever the routing
+            # does, so there is nothing here for this criterion to prove.
+            shared = {address for _interface, address in a["addresses"]}
+            aimable = [(i, address) for i, address in b["addresses"] if address not in shared]
+            check.check(
+                aimable,
+                f"{b['name']} holds an address {a['name']} does not, so the pair can be aimed at "
+                f"(target {b['addresses']}, source-held {sorted(shared)})")
+            for interface, address in aimable:
                 reached = machine_exec(ctx, check, f"iso-route-{a['name']}-{b['name']}-{interface}",
                                        a["instance"], a["machine"], cross_fetch_script(address))
                 observed = reached.stdout.strip()
