@@ -121,9 +121,18 @@ pub fn physical_extent_at(path: &Path, offset: u64) -> Result<u64> {
     // returns the device offset in, unlike plain F_LOG2PHYS which reads the
     // file position. Asking only about offset 0 would ask about the one region a
     // forked disk is guaranteed to have rewritten -- its superblock and journal.
+    // `contigbytes` is the number of bytes to map, and it must be a real
+    // request. Passing 0 is not "map the default": the kernel has nothing to
+    // resolve, and the `devoffset` it leaves behind is not a dependable answer
+    // -- two distinct, fully allocated files could report the SAME offset,
+    // which made the caller's clone-versus-copy control trip its own vacuity
+    // guard intermittently ("a streamed byte copy shares its source's blocks;
+    // this measurement cannot tell a clone from a copy and proves nothing").
+    // One block is the smallest request that names a single extent.
+    const MAP_BYTES: i64 = 4096;
     let mut mapping = Log2Phys {
         flags: 0,
-        contigbytes: 0,
+        contigbytes: MAP_BYTES,
         devoffset: offset as i64,
     };
     // SAFETY: F_LOG2PHYS_EXT takes a pointer to one `struct log2phys`, which
