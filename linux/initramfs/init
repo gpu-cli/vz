@@ -245,6 +245,11 @@ fi
 # refused boot and the cost of being too short is a Machine that silently has
 # no network.
 VZ_FABRIC_NIC_WAIT_SECONDS=20
+# Every declared fabric port this boot could NOT configure, one `vz.net.N`
+# parameter per line. Absent or empty means every declared port came up.
+# Readiness reads it and refuses the Machine rather than publishing a Machine
+# that is not on the network its definition declares.
+VZ_FABRIC_UNCONFIGURED=/run/vz-fabric-unconfigured
 
 # The interface whose MAC is `$1`, waited for rather than sampled.
 #
@@ -307,8 +312,17 @@ configure_fabric_ports_from_cmdline() {
           *,*) cfp_gateway="${cfp_rest#*,}" ;;
           *) cfp_gateway="" ;;
         esac
-        configure_fabric_nic "$cfp_mac" "$cfp_cidr" "$cfp_gateway" ||
+        # A DECLARED fabric port that could not be applied is recorded where
+        # readiness can see it, not just printed. The definition said this
+        # Machine is on that network; handing it back `ready` with no address
+        # on it makes every later denial and reachability claim about it a lie,
+        # and the failure then surfaces as some unrelated "Network is
+        # unreachable" much further downstream.
+        if ! configure_fabric_nic "$cfp_mac" "$cfp_cidr" "$cfp_gateway"; then
           echo "[vz-init] warning: could not apply $cfp_param"
+          /bin/busybox mkdir -p "${VZ_FABRIC_UNCONFIGURED%/*}" 2>/dev/null
+          echo "$cfp_param" >> "$VZ_FABRIC_UNCONFIGURED"
+        fi
         ;;
     esac
   done

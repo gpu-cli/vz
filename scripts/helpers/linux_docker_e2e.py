@@ -24,6 +24,7 @@ import time
 import uuid
 
 import docker_host_driver as driver
+import vz04_common
 import frozen_tree
 import installed_developer_startup as startup
 import linux_docker_engine_probe as engine_probe
@@ -556,7 +557,17 @@ def authenticated_proof(harness, environment, machine):
     configuration = json.loads(configuration_bytes)
     require(json.dumps(configuration, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() == configuration_bytes,
             "noncanonical Machine configuration receipt")
-    configuration_digest = "sha256:" + driver.sha256(b"vz.machine-configuration.v1\x00" + configuration_bytes)
+    # The digest is over the configuration's IDENTITY, not over the whole file:
+    # `resources` -- the runtime shape, spelled once at the top level and once
+    # inside the declared Machine -- is excluded, because cpus and memory decide
+    # how big the VM is and not which Machine owns this store. That is what lets
+    # a definition reconcile move them on a Machine that already exists
+    # (criterion 22); keying the store on them made `memory_mb: 6144` a
+    # different Machine. Recomputed here rather than read back, so this stays an
+    # INDEPENDENT check that the runtime did not merely echo a stored value --
+    # which is also why this projection has to mirror
+    # `ResolvedMachineConfiguration::configuration_digest` exactly.
+    configuration_digest = vz04_common.machine_configuration_digest(configuration_bytes)
     store_owner = json.loads(startup.read_private_regular(path.parent.parent.parent / "owner.json", startup.LIMIT))
     require(row["configuration_digest"] == store_owner["configuration_digest"] == configuration_digest and
             store_owner["schema_version"] == 1 and store_owner["owner"] == descriptor["owner"],

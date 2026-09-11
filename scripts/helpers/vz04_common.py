@@ -66,6 +66,36 @@ def canonical_digest(value) -> str:
     return sha256_bytes(canonical_json(value).encode("utf-8"))
 
 
+MACHINE_CONFIGURATION_DIGEST_DOMAIN = b"vz.machine-configuration.v1\x00"
+
+
+def machine_configuration_digest(configuration_bytes: bytes) -> str:
+    """The digest a Machine's durable runtime store is keyed on.
+
+    Over the configuration's IDENTITY, not over the whole file: `resources` --
+    the runtime shape, spelled once at the top level and once inside the
+    declared Machine -- is excluded. cpus and memory decide how big the VM is
+    when it next starts, not which artifacts it boots or which Machine owns
+    this store. Keying the store on them made `memory_mb: 6144` in vz.json a
+    DIFFERENT Machine, so a definition change the topology layer classifies as
+    reconcilable (criterion 22) was refused two layers down by a store that
+    could no longer find its owner.
+
+    One implementation because several checks recompute this INDEPENDENTLY --
+    that is the point of them, proving the runtime did not merely echo a stored
+    value -- and three copies of the projection would drift. It mirrors
+    `ResolvedMachineConfiguration::configuration_digest` in
+    crates/vz-runtimed/src/machine_target_resolver.rs, which serializes the
+    reduced value with sorted keys and compact separators.
+    """
+    identity = json.loads(configuration_bytes)
+    identity.pop("resources", None)
+    if isinstance(identity.get("machine"), dict):
+        identity["machine"].pop("resources", None)
+    reduced = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return "sha256:" + hashlib.sha256(MACHINE_CONFIGURATION_DIGEST_DOMAIN + reduced).hexdigest()
+
+
 def now_ns() -> int:
     return time.time_ns()
 

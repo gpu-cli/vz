@@ -12,6 +12,9 @@ use std::path::Path;
 /// answer on a terminal in this long will not answer at all. The window is the
 /// classic 24x80: nothing reads it, but a zero dimension is refused upstream.
 const POSIX_PTY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Where the guest initramfs records declared fabric ports it could not apply.
+const FABRIC_UNCONFIGURED_PATH: &str = "/run/vz-fabric-unconfigured";
+const FABRIC_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const POSIX_PTY_PROBE_ROWS: u32 = 24;
 const POSIX_PTY_PROBE_COLUMNS: u32 = 80;
 
@@ -38,6 +41,68 @@ pub(super) async fn await_readiness<T>(
 /// `Ok(false)` means the guest answered and the answer was no; the Machine
 /// boots without the capability. `Err` is reserved for a transport failure,
 /// where we learned nothing and must not publish readiness on a guess.
+/// Every declared fabric port this boot could not configure, or `None`.
+///
+/// The guest records them one per line in `/run/vz-fabric-unconfigured`; an
+/// absent file is the healthy case and the overwhelmingly common one, so the
+/// probe is a single `cat` that is allowed to fail. `Err` is reserved for a
+/// transport failure, where we learned nothing and must not publish readiness
+/// on a guess -- the same rule `measure_posix_pty` follows.
+async fn measure_unconfigured_fabric_ports(
+    activation: &Arc<MachineRuntimeActivation>,
+    metadata: &RequestMetadata,
+) -> Result<Option<String>, MachineError> {
+    let lease = activation.execution_lease();
+    let ticket = lease
+        .prepare_machine_exec_request()
+        .await
+        .map_err(|error| {
+            failure(
+                metadata,
+                MachineErrorCode::BackendUnavailable,
+                format!("fabric-port readiness could not obtain an execution ticket: {error}"),
+            )
+        })?;
+    let deadline = tokio::time::Instant::now() + FABRIC_PROBE_TIMEOUT;
+    let started = lease
+        .start_machine_exec(
+            vz_linux::ContainerExecDispatchGate::new(deadline),
+            ticket,
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                format!("cat {FABRIC_UNCONFIGURED_PATH} 2>/dev/null; printf ''"),
+            ],
+            Default::default(),
+            None,
+        )
+        .await
+        .map_err(|error| {
+            failure(
+                metadata,
+                MachineErrorCode::BackendUnavailable,
+                format!("fabric-port readiness probe could not start: {error}"),
+            )
+        })?;
+    let (stream, _) = started;
+    let observed = match tokio::time::timeout_at(deadline, stream.collect()).await {
+        Ok(observed) => observed,
+        Err(_) => {
+            return Err(failure(
+                metadata,
+                MachineErrorCode::BackendUnavailable,
+                "fabric-port readiness probe exceeded its own budget; original activation retained",
+            ));
+        }
+    };
+    let listed = observed
+        .stdout
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok((!listed.is_empty()).then_some(listed))
+}
+
 async fn measure_posix_pty(
     activation: &Arc<MachineRuntimeActivation>,
     metadata: &RequestMetadata,
@@ -160,6 +225,28 @@ impl ReadinessEvidenceProvider for MeasuredLinuxReadiness<'_> {
             Ok(true) => measured.push(MachineCapability::PosixPty),
             Ok(false) => {}
             Err(error) => return Err(error),
+        }
+        // A declared fabric port that the guest could not configure is a
+        // READINESS FAILURE, not a console warning.
+        //
+        // The initramfs waits a bounded time for the NIC whose MAC the host
+        // minted and, when it never appears, used to log
+        // "fabric port left unconfigured" and carry on booting. The Machine
+        // then reported `ready` holding nothing but `docker0`, so its declared
+        // private path did not exist while status said it did -- and the first
+        // symptom was an unrelated "Network is unreachable" from whatever tried
+        // to use it. Refusing here names the cause at the point it happened.
+        if let Some(ports) = measure_unconfigured_fabric_ports(activation, metadata).await? {
+            return Err(failure(
+                metadata,
+                MachineErrorCode::BackendUnavailable,
+                format!(
+                    "Machine declares fabric port(s) the guest could not configure, so it is not on the \
+                     network its definition declares: {ports}. The host minted the address and put it on \
+                     the kernel cmdline; no interface carrying that MAC appeared. Original Machine \
+                     retained for Stop."
+                ),
+            ));
         }
         let docker_context = if machine.profile == MachineProfile::Developer {
             let backend_error = |error: anyhow::Error| {

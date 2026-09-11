@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 import re
 import sys
+
+import vz04_common
 import threading
 import time
 import uuid
@@ -283,7 +285,7 @@ class DeleteHarness(startup.Harness):
             configuration_bytes = startup.read_private_regular(store / "data/linux-target/configuration.json", startup.LIMIT)
             configuration = json.loads(configuration_bytes)
             require(json.dumps(configuration, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() == configuration_bytes and
-                    manifest["configuration_digest"] == "sha256:" + hashlib.sha256(b"vz.machine-configuration.v1\x00" + configuration_bytes).hexdigest(),
+                    manifest["configuration_digest"] == vz04_common.machine_configuration_digest(configuration_bytes),
                     "Machine configuration bytes do not bind admitted digest")
             require(configuration["release_version"] == self.info["release_version"] and configuration["kernel_profile"] == "developer" and
                     configuration["machine"]["target"] == machine["target"] and configuration["machine"]["name"] == machine["name"] and

@@ -1,5 +1,6 @@
 """Offline public-Up/runtime-proof attribution tests, never runtime evidence."""
 
+import vz04_common
 import copy
 import hashlib
 import json
@@ -102,7 +103,7 @@ class ActivationTests(unittest.TestCase):
                          "version_sha256": sha(b'{"profile":"developer"}')}}
         config_raw = json.dumps(self.configuration, sort_keys=True, separators=(",", ":")).encode()
         self.write(self.configuration_path, config_raw, 0o400)
-        self.configuration_digest = "sha256:" + sha(b"vz.machine-configuration.v1\0" + config_raw)
+        self.configuration_digest = vz04_common.machine_configuration_digest(config_raw)
         self.owner_manifest = {"schema_version": 1, "owner": self.owner,
                               "configuration_digest": self.configuration_digest,
                               "reservation": {"schema_version": 1, "resource_kind": {"other": "machine_runtime_store"},
@@ -446,7 +447,7 @@ class ActivationTests(unittest.TestCase):
                     config["backend"] = "foreign"
                 raw = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
                 self.write(self.configuration_path, raw, 0o400)
-                self.receipt["configuration_digest"] = "sha256:" + sha(b"vz.machine-configuration.v1\0" + raw)
+                self.receipt["configuration_digest"] = vz04_common.machine_configuration_digest(raw)
                 owner = copy.deepcopy(self.owner_manifest)
                 owner["configuration_digest"] = self.receipt["configuration_digest"]
                 self.write(self.owner_path, json.dumps(owner).encode())
