@@ -178,11 +178,28 @@ fn seeding_a_fork_clones_the_docker_disk_for_free_space_metadata_not_bytes() {
     // a live inode to a stale number measured the volume's recent history
     // instead of the clone. Observed failing by 1 MiB on an otherwise idle
     // machine (100663296 vs 101711872).
-    assert_eq!(
-        std::fs::metadata(&destination).unwrap().blocks() * 512,
-        std::fs::metadata(&source).unwrap().blocks() * 512,
-        "a clone and its parent reference the same blocks, so their allocations \
-         agree when read together"
+    //
+    // What st_blocks can honestly settle here, and no more.
+    //
+    // A clone reports its parent's FULL allocation, because both inodes
+    // reference the same blocks -- so this number cannot distinguish a clone
+    // from a second copy at all, and the comment above says so. What it does
+    // distinguish is a destination that is empty or truncated, which is a real
+    // failure mode and worth one assertion.
+    //
+    // It is deliberately NOT an equality against the parent. That comparison has
+    // now failed three times for the same reason: APFS allocation accounting
+    // settles asynchronously, so two inodes sharing every block still report
+    // allocations that differ transiently -- by 1 MiB on an idle machine, and by
+    // more under a parallel workspace run. Raising a tolerance until it stops
+    // failing is fitting a constant to a race. The exact claim, that the fork
+    // SHARES ITS PARENT'S BLOCKS, is settled above by comparing physical
+    // extents, which is local and unaffected by anything else on the volume.
+    let cloned_allocation = std::fs::metadata(&destination).unwrap().blocks() * 512;
+    assert!(
+        cloned_allocation >= DISK_BYTES / 2,
+        "the clone reports its parent's allocation because they share blocks; {cloned_allocation} \
+         bytes against a {DISK_BYTES}-byte parent is an empty or truncated destination, not a fork"
     );
 
     // Separate inodes. A fork writing into its Docker store must never reach its

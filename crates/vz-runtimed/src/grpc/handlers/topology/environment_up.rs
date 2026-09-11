@@ -27,8 +27,16 @@ pub(super) async fn handle(
                     BTreeMap::new(),
                 ))
             })?;
+        // The values are taken off the request and handed across separately:
+        // they are not part of the Up's persisted identity, and nothing below
+        // this point may put them in durable state.
+        let secret_values = request
+            .secret_values
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
         let mut receiver = daemon
-            .up_environment(input, metadata)
+            .up_environment(input, secret_values, metadata)
             .await
             .map_err(status_from_machine_error)?;
         let (sender, stream) = tokio::sync::mpsc::channel(1);

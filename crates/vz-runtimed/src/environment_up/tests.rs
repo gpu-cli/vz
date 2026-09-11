@@ -61,7 +61,7 @@ async fn empty_verified_catalog_cannot_boot_or_publish_ready_even_in_test_backen
     let (_root, daemon, request, metadata) = fixture();
     let completion = terminal(
         daemon
-            .up_environment(request.clone(), metadata)
+            .up_environment(request.clone(), Default::default(), metadata)
             .await
             .unwrap(),
     )
@@ -96,14 +96,14 @@ async fn empty_verified_catalog_cannot_boot_or_publish_ready_even_in_test_backen
 async fn concurrent_exact_retries_and_disconnected_observer_keep_one_durable_admission() {
     let (_root, daemon, request, metadata) = fixture();
     let first = daemon
-        .up_environment(request.clone(), metadata.clone())
+        .up_environment(request.clone(), Default::default(), metadata.clone())
         .await
         .unwrap();
     let admission = first.borrow().admission.clone();
     drop(first);
     let completion = terminal(
         daemon
-            .up_environment(request.clone(), metadata.clone())
+            .up_environment(request.clone(), Default::default(), metadata.clone())
             .await
             .unwrap(),
     )
@@ -111,7 +111,7 @@ async fn concurrent_exact_retries_and_disconnected_observer_keep_one_durable_adm
     assert_eq!(completion.admission, admission);
     let replay = terminal(
         daemon
-            .up_environment(request.clone(), metadata.clone())
+            .up_environment(request.clone(), Default::default(), metadata.clone())
             .await
             .unwrap(),
     )
@@ -121,7 +121,7 @@ async fn concurrent_exact_retries_and_disconnected_observer_keep_one_durable_adm
     changed.timeout_millis += 1;
     assert_eq!(
         daemon
-            .up_environment(changed, metadata)
+            .up_environment(changed, Default::default(), metadata)
             .await
             .unwrap_err()
             .code,
@@ -148,7 +148,7 @@ async fn a_declared_allowed_egress_is_admitted_and_persisted() {
     request.definition.environment.machines[0].egress = EgressPolicy::Allowed;
     let completion = terminal(
         daemon
-            .up_environment(request.clone(), metadata)
+            .up_environment(request.clone(), Default::default(), metadata)
             .await
             .unwrap(),
     )
@@ -187,7 +187,7 @@ async fn an_offline_machine_is_admitted_and_mints_no_egress_instance_at_all() {
     );
     terminal(
         daemon
-            .up_environment(request.clone(), metadata)
+            .up_environment(request.clone(), Default::default(), metadata)
             .await
             .unwrap(),
     )
@@ -238,7 +238,7 @@ async fn a_declared_host_import_is_admitted_and_persisted() {
     declare_host_import(&mut request, "db", 5432, Some(15432));
     let completion = terminal(
         daemon
-            .up_environment(request.clone(), metadata)
+            .up_environment(request.clone(), Default::default(), metadata)
             .await
             .unwrap(),
     )
@@ -365,7 +365,7 @@ async fn an_import_this_up_cannot_serve_is_refused_for_its_own_named_reason() {
         let (_root, daemon, mut request, metadata) = fixture();
         mutate(&mut request);
         let error = daemon
-            .up_environment(request.clone(), metadata)
+            .up_environment(request.clone(), Default::default(), metadata)
             .await
             .unwrap_err();
         assert!(
@@ -416,7 +416,7 @@ async fn a_fixed_port_host_export_is_admitted_and_persisted() {
     declare_host_export(&mut request, "api", 18080);
     let completion = terminal(
         daemon
-            .up_environment(request.clone(), metadata)
+            .up_environment(request.clone(), Default::default(), metadata)
             .await
             .unwrap(),
     )
@@ -533,7 +533,7 @@ async fn an_export_this_up_cannot_serve_is_refused_for_its_own_named_reason() {
         let (_root, daemon, mut request, metadata) = fixture();
         mutate(&mut request);
         let error = daemon
-            .up_environment(request.clone(), metadata)
+            .up_environment(request.clone(), Default::default(), metadata)
             .await
             .unwrap_err();
         assert_eq!(
@@ -608,7 +608,7 @@ async fn declared_networks_endpoints_and_workspaces_are_admitted_and_persisted()
     });
     let completion = terminal(
         daemon
-            .up_environment(request.clone(), metadata)
+            .up_environment(request.clone(), Default::default(), metadata)
             .await
             .unwrap(),
     )
@@ -664,7 +664,7 @@ async fn a_public_like_network_is_admitted_and_persisted_like_a_private_one() {
     request.definition.environment.endpoints[0].hostname = Some("api.shop.test".into());
     let completion = terminal(
         daemon
-            .up_environment(request.clone(), metadata)
+            .up_environment(request.clone(), Default::default(), metadata)
             .await
             .unwrap(),
     )
@@ -983,7 +983,7 @@ async fn declarations_without_adapters_still_reject_before_project_creation() {
         mutate(&mut request);
         assert_eq!(
             daemon
-                .up_environment(request.clone(), metadata)
+                .up_environment(request.clone(), Default::default(), metadata)
                 .await
                 .unwrap_err()
                 .code,
@@ -1013,7 +1013,7 @@ async fn unsupported_topology_and_invalid_ids_reject_before_project_creation() {
     });
     assert!(
         daemon
-            .up_environment(request.clone(), metadata.clone())
+            .up_environment(request.clone(), Default::default(), metadata.clone())
             .await
             .is_err()
     );
@@ -1021,7 +1021,7 @@ async fn unsupported_topology_and_invalid_ids_reject_before_project_creation() {
     metadata.request_id = Some("bad\nrequest".into());
     assert_eq!(
         daemon
-            .up_environment(request.clone(), metadata)
+            .up_environment(request.clone(), Default::default(), metadata)
             .await
             .unwrap_err()
             .code,
@@ -1040,7 +1040,13 @@ async fn unsupported_topology_and_invalid_ids_reject_before_project_creation() {
 #[tokio::test]
 async fn failed_admission_releases_controller_without_fabricating_live_session() {
     let (_root, daemon, request, metadata) = fixture();
-    let completion = terminal(daemon.up_environment(request, metadata).await.unwrap()).await;
+    let completion = terminal(
+        daemon
+            .up_environment(request, Default::default(), metadata)
+            .await
+            .unwrap(),
+    )
+    .await;
     let lease = tokio::time::timeout(
         Duration::from_secs(1),
         daemon.acquire_environment_controller(
@@ -1059,7 +1065,7 @@ async fn context_ownership_authorization_requires_the_exact_persisted_machine_de
     let (_root, daemon, request, metadata) = fixture();
     let completion = terminal(
         daemon
-            .up_environment(request, metadata.clone())
+            .up_environment(request, Default::default(), metadata.clone())
             .await
             .unwrap(),
     )
@@ -1186,7 +1192,7 @@ async fn exact_topology_policy_denial_precedes_project_creation() {
         .unwrap(),
     );
     let error = daemon
-        .up_environment(request.clone(), metadata)
+        .up_environment(request.clone(), Default::default(), metadata)
         .await
         .unwrap_err();
     assert_eq!(error.code, MachineErrorCode::PolicyDenied);
@@ -1375,7 +1381,7 @@ async fn a_writable_host_source_shared_by_two_machines_rejects_before_project_cr
         });
         machines.push(second);
         let error = daemon
-            .up_environment(request.clone(), metadata)
+            .up_environment(request.clone(), Default::default(), metadata)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1421,7 +1427,7 @@ async fn two_read_only_projections_of_one_source_are_still_admitted() {
     // behind the returned progress stream. So `Ok` here is precisely the
     // statement that admission accepted two readers of one source.
     daemon
-        .up_environment(request, metadata)
+        .up_environment(request, Default::default(), metadata)
         .await
         .expect("two read-only readers of one source must pass admission");
 }

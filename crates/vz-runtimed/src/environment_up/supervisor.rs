@@ -15,6 +15,7 @@ impl RuntimeDaemon {
     pub(super) async fn supervise_up(
         self: Arc<Self>,
         request: EnvironmentUpRequest,
+        secret_values: std::collections::HashMap<String, Vec<u8>>,
         metadata: RequestMetadata,
         run: Arc<UpRun>,
     ) {
@@ -25,7 +26,13 @@ impl RuntimeDaemon {
         let worker_run = Arc::clone(&run);
         let mut task = tokio::spawn(async move {
             daemon
-                .drive_up(worker_request, worker_metadata, worker_run, deadline)
+                .drive_up(
+                    worker_request,
+                    secret_values,
+                    worker_metadata,
+                    worker_run,
+                    deadline,
+                )
                 .await
         });
         let result = tokio::select! {
@@ -102,6 +109,7 @@ impl RuntimeDaemon {
     async fn drive_up(
         &self,
         request: EnvironmentUpRequest,
+        secret_values: std::collections::HashMap<String, Vec<u8>>,
         metadata: RequestMetadata,
         run: Arc<UpRun>,
         deadline: tokio::time::Instant,
@@ -645,10 +653,20 @@ impl RuntimeDaemon {
                 }};
                 let docker_endpoint=self.machine_live_sessions.docker_endpoint_path(prepared.lease(),&activation)
                     .map_err(|error|backend_error(error.to_string()))?;
-                if let Some(pin)=native_pin { return super::readiness::await_readiness(super::native_readiness::verify(&activation,pin,machine,incarnation,deadline,&metadata),deadline,&metadata).await; }
-                let pin=pin.ok_or_else(||backend_error("missing Linux pin".into()))?;
-                let readiness=MeasuredLinuxReadiness {pin,docker_endpoint:docker_endpoint.as_deref(),deadline};
-                super::readiness::await_readiness(readiness.verify(&activation,machine,incarnation,&metadata),deadline,&metadata).await
+                let evidence = if let Some(pin)=native_pin {
+                    super::readiness::await_readiness(super::native_readiness::verify(&activation,pin,machine,incarnation,deadline,&metadata),deadline,&metadata).await?
+                } else {
+                    let pin=pin.ok_or_else(||backend_error("missing Linux pin".into()))?;
+                    let readiness=MeasuredLinuxReadiness {pin,docker_endpoint:docker_endpoint.as_deref(),deadline};
+                    super::readiness::await_readiness(readiness.verify(&activation,machine,incarnation,&metadata),deadline,&metadata).await?
+                };
+                // Declared secrets land AFTER readiness and BEFORE this Machine
+                // is recorded as succeeded, so a delivery that fails fails the
+                // Machine. A Machine reported ready without the secret its
+                // definition declares is the same shape of lie as one reported
+                // ready with a fabric port it never configured.
+                self.deliver_secret_bindings(&activation,machine,&environment,&secret_values,&metadata).await?;
+                Ok(evidence)
             }.await;
             let (activation, result) = match result {
                 Ok(activation) => (Some(activation), LifecycleStepResult::Succeeded),
@@ -797,5 +815,234 @@ fn native_progress(
         label: label.into(),
         completed,
         total: total.max(1),
+    }
+}
+
+/// How long one binding's delivery may take, end to end.
+const SECRET_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Where the daemon appends its audit records, under the runtime data dir.
+const SECRET_AUDIT_LOG: &str = "audit.jsonl";
+
+impl RuntimeDaemon {
+    /// Write every SecretBinding this Machine declares into it, and audit each.
+    ///
+    /// Scoped by construction: the loop selects bindings by `machine_id`, so a
+    /// Machine only ever receives the bindings that name it and a sibling in the
+    /// same Environment receives nothing. There is no Environment-wide
+    /// materialisation step for a later filter to get wrong.
+    ///
+    /// The value reaches the guest through the exec channel's STDIN, never as an
+    /// argument: an argv is recorded in receipts, logs and `ps` output, so a
+    /// secret passed as one is a published secret.
+    async fn deliver_secret_bindings(
+        &self,
+        activation: &Arc<MachineRuntimeActivation>,
+        machine: &MachineInstance,
+        environment: &EnvironmentInstance,
+        secret_values: &std::collections::HashMap<String, Vec<u8>>,
+        metadata: &RequestMetadata,
+    ) -> Result<(), MachineError> {
+        let mine: Vec<_> = environment
+            .secret_bindings
+            .iter()
+            .filter(|binding| binding.machine_id == machine.machine_id)
+            .collect();
+        if mine.is_empty() {
+            return Ok(());
+        }
+        for binding in mine {
+            let value = secret_values.get(&binding.name).ok_or_else(|| {
+                failure(
+                    metadata,
+                    MachineErrorCode::ValidationError,
+                    format!(
+                        "SecretBinding `{}` was declared but its value did not reach the daemon; \
+                         refusing rather than leaving {} absent on a Machine reported ready",
+                        binding.name, binding.target_path
+                    ),
+                )
+            })?;
+            self.write_secret_into_machine(activation, binding, value, metadata)
+                .await?;
+            self.append_secret_audit(environment, machine, binding, metadata)?;
+        }
+        Ok(())
+    }
+
+    /// Put one binding's bytes at its `target_path` inside this Machine.
+    ///
+    /// The value travels in the exec's ENVIRONMENT, never as an argument. An
+    /// argv is recorded in receipts, in the daemon's own logs and in the guest's
+    /// process table; an exec environment is visible only to that one short-
+    /// lived process inside the Machine that is about to hold the file anyway.
+    ///
+    /// `umask 077` before the redirect, so the file is created 0600 from the
+    /// outset rather than created wide and narrowed afterwards, and `printf %s`
+    /// rather than `echo` so nothing appends a newline the source did not have.
+    async fn write_secret_into_machine(
+        &self,
+        activation: &Arc<MachineRuntimeActivation>,
+        binding: &vz_runtime_contract::SecretBindingInstance,
+        value: &[u8],
+        metadata: &RequestMetadata,
+    ) -> Result<(), MachineError> {
+        // The exec environment carries strings. A binding whose value is not
+        // UTF-8 is refused by name rather than silently mangled; carrying
+        // arbitrary bytes wants a base64 hop through a guest applet, which is a
+        // later increment and not a thing to guess at here.
+        let text = std::str::from_utf8(value).map_err(|_| {
+            failure(
+                metadata,
+                MachineErrorCode::ValidationError,
+                format!(
+                    "SecretBinding `{}` resolved to bytes that are not valid UTF-8; 0.4 delivers \
+                     text secrets",
+                    binding.name
+                ),
+            )
+        })?;
+        let lease = activation.execution_lease();
+        let ticket = lease
+            .prepare_machine_exec_request()
+            .await
+            .map_err(|error| {
+                failure(
+                    metadata,
+                    MachineErrorCode::BackendUnavailable,
+                    format!(
+                        "SecretBinding `{}` could not obtain an execution ticket: {error}",
+                        binding.name
+                    ),
+                )
+            })?;
+        let deadline = tokio::time::Instant::now() + SECRET_DELIVERY_TIMEOUT;
+        let target = binding.target_path.clone();
+        let script = format!(
+            "umask 077; mkdir -p \"$(dirname \"$VZ_SECRET_TARGET\")\" && \
+             printf %s \"$VZ_SECRET_VALUE\" > \"$VZ_SECRET_TARGET\""
+        );
+        let options = vz_linux::ExecOptions {
+            working_dir: None,
+            env: vec![
+                ("VZ_SECRET_VALUE".to_string(), text.to_string()),
+                ("VZ_SECRET_TARGET".to_string(), target.clone()),
+            ],
+            user: None,
+        };
+        let (stream, _) = lease
+            .start_machine_exec(
+                vz_linux::ContainerExecDispatchGate::new(deadline),
+                ticket,
+                "/bin/sh".into(),
+                vec!["-c".into(), script],
+                options,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                failure(
+                    metadata,
+                    MachineErrorCode::BackendUnavailable,
+                    format!(
+                        "SecretBinding `{}` delivery could not start: {error}",
+                        binding.name
+                    ),
+                )
+            })?;
+        let observed = tokio::time::timeout_at(deadline, stream.collect())
+            .await
+            .map_err(|_| {
+                failure(
+                    metadata,
+                    MachineErrorCode::BackendUnavailable,
+                    format!(
+                        "SecretBinding `{}` delivery exceeded its budget; original activation retained",
+                        binding.name
+                    ),
+                )
+            })?;
+        if observed.exit_code != 0 {
+            // The guest's stderr is quoted; the VALUE only ever travelled in the
+            // exec environment and is never echoed back.
+            return Err(failure(
+                metadata,
+                MachineErrorCode::BackendUnavailable,
+                format!(
+                    "SecretBinding `{}` could not be written to {target} (exit {}): {}",
+                    binding.name,
+                    observed.exit_code,
+                    observed.stderr.trim().chars().take(300).collect::<String>()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Append one `secret_binding_used` record, by identity and never by value.
+    ///
+    /// JSON Lines under the runtime data directory, appended and flushed per
+    /// record so a crash keeps every use already written. What it names is the
+    /// Environment, the Machine, the binding and where the binding came from --
+    /// including the exact argv when the source is a command, so a definition
+    /// that runs something unexpected is visible afterwards. The VALUE is not
+    /// here, and neither is a digest of it: a digest verifies a guess.
+    fn append_secret_audit(
+        &self,
+        environment: &EnvironmentInstance,
+        machine: &MachineInstance,
+        binding: &vz_runtime_contract::SecretBindingInstance,
+        metadata: &RequestMetadata,
+    ) -> Result<(), MachineError> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let record = serde_json::json!({
+            "schema_version": 1,
+            "event": "secret_binding_used",
+            "recorded_at": current_unix_secs(),
+            "request_id": metadata.request_id.clone(),
+            "project_id": environment.project_id.to_string(),
+            "environment_id": environment.environment_id.to_string(),
+            "machine_id": machine.machine_id.to_string(),
+            "machine": machine.name.clone(),
+            "secret_binding_id": binding.binding_id.to_string(),
+            "secret_binding": binding.name.clone(),
+            "target_path": binding.target_path.clone(),
+            "source_env": binding.source_env.clone(),
+            "source_command": binding.source_command.clone(),
+        });
+        let path = self.config.runtime_data_dir.join(SECRET_AUDIT_LOG);
+        let mut line = serde_json::to_vec(&record).map_err(|error| {
+            failure(
+                metadata,
+                MachineErrorCode::InternalError,
+                format!("secret audit record could not be encoded: {error}"),
+            )
+        })?;
+        line.push(b'\n');
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| {
+                failure(
+                    metadata,
+                    MachineErrorCode::BackendUnavailable,
+                    format!(
+                        "secret audit log {} could not be opened: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+        file.write_all(&line)
+            .and_then(|()| file.flush())
+            .map_err(|error| {
+                failure(
+                    metadata,
+                    MachineErrorCode::BackendUnavailable,
+                    format!("secret audit record could not be written: {error}"),
+                )
+            })
     }
 }

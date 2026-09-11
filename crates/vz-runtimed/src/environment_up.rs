@@ -154,9 +154,19 @@ impl RuntimeDaemon {
     }
     /// Admission authorizes exact generated IDs in the transaction that creates
     /// them. Exact retries observe one retained run or its immutable receipt.
+    /// `secret_values` travels BESIDE the request, never inside it.
+    ///
+    /// `EnvironmentUpRequest::request_hash` is persisted in the admission
+    /// record, so a secret that entered the hash would put a digest of the
+    /// value into durable state -- which is one of the seven artifact groups
+    /// criterion 18's redaction sweep reads, and a digest is a verifier for
+    /// anyone who already has a guess. The topology identity of an Up is its
+    /// definition and selection; which bytes a binding resolved to this time is
+    /// not part of it.
     pub async fn up_environment(
         self: &Arc<Self>,
         mut request: EnvironmentUpRequest,
+        secret_values: std::collections::HashMap<String, Vec<u8>>,
         metadata: RequestMetadata,
     ) -> Result<watch::Receiver<EnvironmentUpProgress>, MachineError> {
         if request.selection.explicit.is_some() {
@@ -255,7 +265,9 @@ impl RuntimeDaemon {
         runs.insert(key.into(), Arc::clone(&run));
         let daemon = Arc::clone(self);
         tokio::spawn(async move {
-            daemon.supervise_up(request, metadata, run).await;
+            daemon
+                .supervise_up(request, secret_values, metadata, run)
+                .await;
         });
         Ok(receiver)
     }
@@ -575,6 +587,35 @@ fn validate_supported(
     metadata: &RequestMetadata,
 ) -> Result<(), MachineError> {
     let spec = &request.definition.environment;
+    // A SecretBinding that names ANOTHER Environment is refused here, before
+    // `reserve_environment_up_admission`, so nothing is created and no identity
+    // is reserved for an Up that cannot be honoured.
+    //
+    // Separate Environments are default-deny, and a secret is not among the
+    // things a directional service grant can cross: a grant opens a declared
+    // protocol and port to a declared endpoint, which is a very different thing
+    // from handing over bytes. `from_environment` exists in the schema ONLY so
+    // this refusal can be asked for explicitly and proved, rather than being
+    // unrepresentable and therefore untested.
+    if let Some(binding) = spec
+        .secret_bindings
+        .iter()
+        .find(|binding| binding.from_environment.is_some())
+    {
+        let foreign = binding.from_environment.clone().unwrap_or_default();
+        return Err(MachineError::new(
+            MachineErrorCode::PolicyDenied,
+            format!(
+                "SecretBinding `{}` asks for a secret owned by Environment `{}`; separate                  Environments are default-deny and a secret cannot cross that boundary. Declare                  the binding in the Environment that will read it.",
+                binding.name, foreign
+            ),
+            metadata.request_id.clone(),
+            BTreeMap::from([
+                ("secret_binding".to_string(), binding.name.clone()),
+                ("from_environment".to_string(), foreign),
+            ]),
+        ));
+    }
     if spec.machines.is_empty() || spec.machines.len() > 128 {
         return Err(failure(
             metadata,
