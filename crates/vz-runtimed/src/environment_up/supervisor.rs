@@ -840,8 +840,11 @@ pub(super) fn secret_audit_record(
         "environment_id": environment.environment_id.to_string(),
         "machine_id": machine.machine_id.to_string(),
         "machine": machine.name.clone(),
-        "secret_binding_id": binding.binding_id.to_string(),
-        "secret_binding": binding.name.clone(),
+        // `binding` and `binding_id`, which is what a reader of this log looks
+        // for beside `environment_id` and `machine_id`; the event name already
+        // says these are secrets.
+        "binding_id": binding.binding_id.to_string(),
+        "binding": binding.name.clone(),
         "target_path": binding.target_path.clone(),
         "source_env": binding.source_env.clone(),
         "source_command": binding.source_command.clone(),

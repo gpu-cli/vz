@@ -103,6 +103,9 @@ fn an_audit_record_names_the_binding_and_never_its_value() {
     let encoded = serde_json::to_string(&record).unwrap();
     // The identity criterion 18 requires the record to carry.
     assert_eq!(record["event"], "secret_binding_used");
+    // The exact field names a reader correlates on.
+    assert_eq!(record["binding"], "gate-secret");
+    assert_eq!(record["binding_id"], "sec_0123456789abcdef");
     for needle in [
         "env_0123456789abcdef",
         "mch_0123456789abcdef",
