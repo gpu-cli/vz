@@ -639,12 +639,30 @@ impl PreparedEnvironmentMachines {
         for sibling in &self.native_pins {
             sibling.validate_current()?;
         }
+        // The runtime SHAPE comes from the durable Machine record, not from the
+        // pin. A pin is artifact storage: it says which kernel, initramfs and
+        // youki this Machine boots, and it is deliberately immutable once
+        // published. How many CPUs and how much memory the VM gets is declared
+        // state that a definition reconcile updates in place (criterion 22),
+        // so reading it from the pin would have pinned it too -- a Machine
+        // would keep booting at the size it was first created with no matter
+        // what `vz.json` said afterwards. Normalized through the resolver's
+        // single defaults-and-bounds function so both readers agree.
+        let declared = self
+            .environment
+            .machines
+            .iter()
+            .find(|machine| &machine.machine_id == machine_id)
+            .ok_or_else(|| conflict("Machine is not part of this Environment"))?;
         if let Some(pin) = native_pin {
-            let config = pin.configuration();
+            let shape = crate::machine_target_resolver::resolve_native_machine_resources(
+                &declared.resources,
+            )
+            .map_err(conflict)?;
             let runtime = crate::native_macos::runtime::NativeMacosRuntime::new(
                 pin.directory(),
-                config.cpus,
-                config.memory_mb,
+                shape.cpus,
+                shape.memory_mb,
             );
             return Ok(registry.attach_runtime(Arc::clone(pin.store()), |_| {
                 Ok(MacosRuntimeBackend::Native(Arc::new(runtime)))
@@ -653,7 +671,12 @@ impl PreparedEnvironmentMachines {
         let pin = linux_pin.ok_or_else(|| conflict("missing Linux pin"))?;
         let bundle = pin.runtime_bundle();
         let profile = pin.configuration().kernel_profile;
-        let memory_mb = pin.configuration().resources.memory_mb;
+        let memory_mb = crate::machine_target_resolver::resolve_machine_resources(
+            &declared.resources,
+            declared.profile,
+        )
+        .map_err(conflict)?
+        .memory_mb;
         Ok(
             registry.attach_runtime(Arc::clone(pin.store()), move |data| {
                 Ok(MacosRuntimeBackend::new(Runtime::new(RuntimeConfig {

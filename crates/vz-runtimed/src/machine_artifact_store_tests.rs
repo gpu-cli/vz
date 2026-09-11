@@ -569,8 +569,57 @@ async fn source_symlink_and_hardlink_are_rejected_without_publication() {
     }
 }
 
+/// A changed RUNTIME SHAPE is not drift.
+///
+/// cpus and memory decide how big the VM is when it next starts, not which
+/// Machine owns this store, so a pin written when this Machine asked for 2 CPUs
+/// still describes the Machine that now asks for 8. That is what lets a
+/// definition reconcile (criterion 22) move `resources` on a Machine that
+/// already exists. The pin is read, left untouched, and still reports the shape
+/// it was written with; the shape the VM is actually given comes from the
+/// durable Machine record, not from here.
+///
+/// Its own test rather than a case in the one below: each live
+/// `PinnedMachineArtifacts` is large, and two in one async frame overflow a
+/// test thread's stack.
 #[tokio::test]
-async fn config_profile_and_resource_drift_are_read_only_failures() {
+async fn a_changed_runtime_shape_reads_the_same_pin() {
+    let fixture = Fixture::new(MachineProfile::Developer).await;
+    let published = pin_inner(
+        fixture.store(),
+        fixture.target.configuration().clone(),
+        fixture.source(),
+    )
+    .await
+    .expect("published artifact pin");
+    let expected = tree_snapshot(&fixture.pin_path());
+    let pinned_resources = published.configuration().resources.clone();
+    drop(published);
+
+    let mut resource_drift = fixture.machine.clone();
+    resource_drift.resources.cpus = Some(8);
+    let observed = load_inner(fixture.store(), fixture.host, &resource_drift)
+        .await
+        .expect("a changed runtime shape must not make the pin unreadable")
+        .configuration()
+        .resources
+        .clone();
+    assert_eq!(observed, pinned_resources);
+    assert_eq!(tree_snapshot(&fixture.pin_path()), expected);
+
+    // But a shape no backend could boot is still refused, from either side.
+    let mut invalid_shape = fixture.machine.clone();
+    invalid_shape.resources.cpus = Some(0);
+    assert!(
+        load_inner(fixture.store(), fixture.host, &invalid_shape)
+            .await
+            .is_err()
+    );
+    assert_eq!(tree_snapshot(&fixture.pin_path()), expected);
+}
+
+#[tokio::test]
+async fn config_and_profile_drift_are_read_only_failures() {
     let fixture = Fixture::new(MachineProfile::Developer).await;
     let pinned = pin_inner(
         fixture.store(),
@@ -585,9 +634,7 @@ async fn config_profile_and_resource_drift_are_read_only_failures() {
     target_drift.target.channel = Some("other-channel".into());
     let mut profile_drift = fixture.machine.clone();
     profile_drift.profile = MachineProfile::Hardened;
-    let mut resource_drift = fixture.machine.clone();
-    resource_drift.resources.cpus = Some(8);
-    for machine in [target_drift, profile_drift, resource_drift] {
+    for machine in [target_drift, profile_drift] {
         assert!(
             load_inner(fixture.store(), fixture.host, &machine)
                 .await

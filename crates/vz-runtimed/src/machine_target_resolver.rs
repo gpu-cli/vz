@@ -18,7 +18,7 @@ use vz_linux::{KernelBundleArtifactIdentity, KernelProfile, verify_kernel_bundle
 use vz_runtime_contract::capability_matrix;
 use vz_runtime_contract::{
     Architecture, EnvironmentSpec, HostSpec, MachineBackend, MachineCapability, MachineProfile,
-    MachineSpec, NetworkKind, NetworkSpec, OperatingSystem, ProjectDefinition,
+    MachineResources, MachineSpec, NetworkKind, NetworkSpec, OperatingSystem, ProjectDefinition,
     TOPOLOGY_SCHEMA_VERSION,
 };
 
@@ -248,15 +248,37 @@ pub struct ResolvedMachineConfiguration {
 
 impl ResolvedMachineConfiguration {
     /// Return the portable identity of this exact persisted configuration.
+    ///
+    /// Everything in this configuration EXCEPT the runtime shape. `cpus` and
+    /// `memory_mb` decide how big the VM is when it is next started; they do
+    /// not decide which artifacts it boots, which host and backend own it, or
+    /// which declared Machine it is. Keying the durable Machine store on them
+    /// made `memory_mb: 6144` in `vz.json` a different Machine, so a change
+    /// the topology layer classifies as reconcilable (criterion 22) was
+    /// refused two layers down by a store that could not find its owner. The
+    /// shape lives on the durable `MachineInstance`, which a definition
+    /// reconcile updates in place, and is read from there at attach time.
+    ///
+    /// Both spellings are dropped: the resolved `resources` and the
+    /// `resources` inside the declared `machine`. They are the same two
+    /// numbers written twice, and leaving either one in would keep the digest
+    /// bound to the shape.
     pub fn configuration_digest(&self) -> Result<String, TargetResolutionError> {
-        let canonical = serde_json::to_value(self)
-            .and_then(|value| serde_json::to_vec(&value))
-            .map_err(
-                |error| TargetResolutionError::InvalidResolvedConfiguration {
-                    machine: self.machine.name.clone(),
-                    reason: format!("canonical serialization failed: {error}"),
-                },
-            )?;
+        let invalid = |reason: String| TargetResolutionError::InvalidResolvedConfiguration {
+            machine: self.machine.name.clone(),
+            reason,
+        };
+        let mut identity = serde_json::to_value(self)
+            .map_err(|error| invalid(format!("canonical serialization failed: {error}")))?;
+        let object = identity
+            .as_object_mut()
+            .ok_or_else(|| invalid("resolved configuration is not a JSON object".to_string()))?;
+        object.remove("resources");
+        if let Some(machine) = object.get_mut("machine").and_then(|m| m.as_object_mut()) {
+            machine.remove("resources");
+        }
+        let canonical = serde_json::to_vec(&identity)
+            .map_err(|error| invalid(format!("canonical serialization failed: {error}")))?;
         let mut hasher = Sha256::new();
         hasher.update(MACHINE_CONFIGURATION_DIGEST_DOMAIN);
         hasher.update(canonical);
@@ -328,11 +350,21 @@ impl ResolvedMachineConfiguration {
                 "persisted backend does not match the supported target pair",
             ));
         }
-        if self.machine != *machine {
+        // Compared without the runtime shape, for the reason
+        // `configuration_digest` gives: a pin that was written when this
+        // Machine asked for 4096 MB still describes the Machine that now asks
+        // for 6144, and refusing to load it would make the shape immutable
+        // again from inside the artifact store. Everything else about the
+        // declared Machine -- name, profile, target, capabilities, networks,
+        // workspace, egress -- is still exact.
+        if machine_identity(&self.machine) != machine_identity(machine) {
             return Err(invalid(
                 "persisted MachineSpec differs from the current definition",
             ));
         }
+        // The shape still has to be a shape this backend can boot, whichever
+        // side of the pin it came from.
+        normalized_resources(machine).map_err(invalid)?;
         // The checked-in capability matrix decides this, not a hand-kept list
         // of the two capabilities that were obviously wrong. A persisted
         // configuration that requests anything this host × target × profile
@@ -370,8 +402,14 @@ impl ResolvedMachineConfiguration {
                 "release version/channel is invalid or release differs from the requested version",
             ));
         }
-        let expected_resources = normalized_resources(machine).map_err(&invalid)?;
-        if self.resources != expected_resources {
+        // Against ITS OWN declared shape, not against the caller's. A persisted
+        // configuration is internally consistent or it is forged; whether the
+        // definition has since asked for a different size is a reconcile
+        // (criterion 22) and not a tampered pin. The caller's shape is
+        // validated on its own terms just above, and the shape the VM is
+        // actually given comes from the durable Machine record at attach time.
+        let own_resources = normalized_resources(&self.machine).map_err(&invalid)?;
+        if self.resources != own_resources {
             return Err(invalid(
                 "resolved resources differ from the normalized Machine request",
             ));
@@ -558,17 +596,8 @@ impl MachineTargetResolver {
                 });
             }
         };
-        let cpus = machine.resources.cpus.unwrap_or(4);
-        let memory_mb = machine.resources.memory_mb.unwrap_or(8192);
-        if cpus == 0
-            || memory_mb < 4096
-            || memory_mb.checked_mul(1024 * 1024).is_none()
-            || machine.resources.disk_bytes.is_some()
-        {
-            return Err(invalid(
-                "invalid native compute resources or unsupported disk sizing",
-            ));
-        }
+        let shape = resolve_native_machine_resources(&machine.resources).map_err(invalid)?;
+        let (cpus, memory_mb) = (shape.cpus, shape.memory_mb);
         let configuration = crate::native_macos::artifacts::NativeConfiguration {
             schema_version: 1,
             host: self.host,
@@ -723,15 +752,55 @@ fn kernel_profile(profile: MachineProfile) -> KernelProfile {
 }
 
 fn normalized_resources(machine: &MachineSpec) -> Result<ResolvedMachineResources, &'static str> {
-    let cpus = machine.resources.cpus.unwrap_or(2);
-    let memory_mb = machine
-        .resources
-        .memory_mb
-        .unwrap_or(default_memory(machine.profile));
+    resolve_machine_resources(&machine.resources, machine.profile)
+}
+
+/// The native-macOS spelling of [`resolve_machine_resources`].
+///
+/// A native Machine is a whole macOS guest, so its floor and its defaults are
+/// not the Linux appliance's. Public for the same reason the Linux one is:
+/// the runtime shape is read from the durable `MachineInstance` at attach
+/// time, and that reader must normalize it exactly as resolution did.
+pub fn resolve_native_machine_resources(
+    resources: &MachineResources,
+) -> Result<ResolvedMachineResources, &'static str> {
+    let cpus = resources.cpus.unwrap_or(4);
+    let memory_mb = resources.memory_mb.unwrap_or(8192);
+    if cpus == 0
+        || memory_mb < 4096
+        || memory_mb.checked_mul(1024 * 1024).is_none()
+        || resources.disk_bytes.is_some()
+    {
+        return Err("invalid native compute resources or unsupported disk sizing");
+    }
+    Ok(ResolvedMachineResources { cpus, memory_mb })
+}
+
+/// The declared Machine with its runtime shape removed, for comparisons that
+/// are about which Machine this is rather than how big it is.
+fn machine_identity(machine: &MachineSpec) -> MachineSpec {
+    let mut identity = machine.clone();
+    identity.resources = MachineResources::default();
+    identity
+}
+
+/// Turn a declared shape into the exact one a backend is configured with.
+///
+/// Public because it is the ONE place the defaults and the bounds live, and
+/// the runtime shape is now read at attach time from the durable
+/// `MachineInstance` rather than from the pin: both readers have to normalize
+/// it identically or a reconciled Machine would boot at a size nothing
+/// validated.
+pub fn resolve_machine_resources(
+    resources: &MachineResources,
+    profile: MachineProfile,
+) -> Result<ResolvedMachineResources, &'static str> {
+    let cpus = resources.cpus.unwrap_or(2);
+    let memory_mb = resources.memory_mb.unwrap_or(default_memory(profile));
     if cpus == 0
         || memory_mb < 512
         || memory_mb.checked_mul(1024 * 1024).is_none()
-        || machine.resources.disk_bytes.is_some()
+        || resources.disk_bytes.is_some()
     {
         return Err("invalid compute resources or unsupported explicit Machine disk sizing");
     }
@@ -1159,16 +1228,78 @@ mod tests {
             one.machines["machine-0"].configuration_digest(),
             two.machines["machine-0"].configuration_digest()
         );
-        let mut changed = definition.clone();
-        changed.environment.machines[0].resources.cpus = Some(3);
-        let three = resolver(vec![first.clone()])
-            .resolve_project(&changed)
-            .await
-            .unwrap();
-        assert_ne!(
-            one.machines["machine-0"].configuration_digest(),
-            three.machines["machine-0"].configuration_digest()
-        );
+        // The runtime shape is NOT identity: a Machine that is told to boot
+        // with more CPUs or more memory is the same Machine, owning the same
+        // durable store. This is what makes `resources` the mutable field a
+        // definition reconcile may move (criterion 22); the shape itself is
+        // read from the durable Machine record at attach time.
+        for resize in [
+            Box::new(|definition: &mut ProjectDefinition| {
+                definition.environment.machines[0].resources.cpus = Some(3);
+            }) as Box<dyn Fn(&mut ProjectDefinition)>,
+            Box::new(|definition: &mut ProjectDefinition| {
+                definition.environment.machines[0].resources.memory_mb = Some(6144);
+            }),
+        ] {
+            let mut changed = definition.clone();
+            resize(&mut changed);
+            let resized = resolver(vec![first.clone()])
+                .resolve_project(&changed)
+                .await
+                .unwrap();
+            assert_eq!(
+                one.machines["machine-0"].configuration_digest(),
+                resized.machines["machine-0"].configuration_digest(),
+                "the runtime shape must not key the durable Machine store"
+            );
+            // Resolution still carries the new shape; only the identity drops it.
+            assert_ne!(
+                one.machines["machine-0"].configuration().resources,
+                resized.machines["machine-0"].configuration().resources
+            );
+        }
+        // Everything that IS identity still moves the digest. Kept to changes
+        // this catalog can still resolve, so the assertion is about the digest
+        // and not about target selection.
+        for (label, mutate) in [
+            (
+                "Machine name",
+                Box::new(|definition: &mut ProjectDefinition| {
+                    definition.environment.machines[0].name = "machine-renamed".to_string();
+                }) as Box<dyn Fn(&mut ProjectDefinition)>,
+            ),
+            (
+                "egress policy",
+                Box::new(|definition: &mut ProjectDefinition| {
+                    let machine = &mut definition.environment.machines[0];
+                    machine.egress = match machine.egress {
+                        vz_runtime_contract::EgressPolicy::Offline => {
+                            vz_runtime_contract::EgressPolicy::Allowed
+                        }
+                        vz_runtime_contract::EgressPolicy::Allowed => {
+                            vz_runtime_contract::EgressPolicy::Offline
+                        }
+                    };
+                }),
+            ),
+        ] {
+            let mut changed = definition.clone();
+            mutate(&mut changed);
+            let resolved = resolver(vec![first.clone()])
+                .resolve_project(&changed)
+                .await
+                .unwrap();
+            let moved = resolved
+                .machines
+                .values()
+                .next()
+                .expect("one resolved Machine");
+            assert_ne!(
+                one.machines["machine-0"].configuration_digest(),
+                moved.configuration_digest(),
+                "a changed {label} is identity and must move the digest"
+            );
+        }
         fs::write(first.bundle_dir.join("youki"), "tampered").unwrap();
         assert!(matches!(
             resolver(vec![first]).resolve_project(&definition).await,

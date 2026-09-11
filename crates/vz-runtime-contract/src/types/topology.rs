@@ -1907,6 +1907,163 @@ impl EnvironmentSpec {
     }
 }
 
+/// How a requested [`ProjectDefinition`] differs from the one a project has
+/// already persisted, decided against every Environment that project is
+/// currently running.
+///
+/// This is the classification criterion 22 is about. The dividing line is not a
+/// hand-kept list of field names: it is
+/// [`ProjectState::classify_definition_change`] asking, of each live
+/// Environment, whether the NEW definition still describes the instance that is
+/// already there. That question is answered by exactly the comparison
+/// [`ProjectState::validate`] performs, so a field is immutable precisely when
+/// the runtime would refuse to hold the resulting aggregate valid — the two can
+/// never drift apart, because they are the same code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefinitionChange {
+    /// The requested definition is the persisted one. Nothing to reconcile.
+    Unchanged,
+    /// Every declared field a live instance is bound to still matches. The
+    /// change reconciles in place: no Environment, Machine, network, attachment
+    /// or endpoint identity moves, and no Machine is replaced.
+    Reconcilable,
+    /// A field a live instance is bound to moved. Honouring it would mean
+    /// destroying and recreating durable identity, so it is refused before any
+    /// mutation, naming the Environment and the exact mismatch.
+    Immutable {
+        /// The first Environment that the requested definition no longer describes.
+        environment_id: String,
+        /// The precondition that failed, in the validator's own words.
+        reason: String,
+    },
+}
+
+impl DefinitionChange {
+    /// True when admission may proceed to apply the requested definition.
+    pub fn is_admissible(&self) -> bool {
+        matches!(
+            self,
+            DefinitionChange::Unchanged | DefinitionChange::Reconcilable
+        )
+    }
+}
+
+impl ProjectState {
+    /// Classify a requested definition against this project's live Environments.
+    ///
+    /// Called under the Up transaction before anything is written. A
+    /// `Reconcilable` verdict is the caller's authority to replace the persisted
+    /// definition and re-derive the mutable per-Machine state from it;
+    /// `Immutable` is a refusal that must happen before any mutation.
+    pub fn classify_definition_change(&self, desired: &ProjectDefinition) -> DefinitionChange {
+        if self.definition == *desired {
+            return DefinitionChange::Unchanged;
+        }
+        // A definition addressed at a different project is never a change to
+        // this one; the caller looked up the wrong row.
+        if self.definition.project_id != desired.project_id {
+            return DefinitionChange::Immutable {
+                environment_id: String::new(),
+                reason: format!(
+                    "requested definition names project `{}`, persisted project is `{}`",
+                    desired.project_id, self.definition.project_id
+                ),
+            };
+        }
+        for environment in &self.environments {
+            if let Err(error) = validate_definition_instance(&desired.environment, environment) {
+                return DefinitionChange::Immutable {
+                    environment_id: environment.environment_id.to_string(),
+                    reason: error.to_string(),
+                };
+            }
+        }
+        // `validate_definition_instance` is the topology layer's rule, and it
+        // is necessary but not sufficient. A Machine's durable runtime store
+        // is keyed on its declared spec MINUS the runtime shape, so a field
+        // that layer does not compare -- `workspace`, say -- would be admitted
+        // here and then refused by a store that could no longer find its
+        // owner, leaving the definition persisted and the Up failed. The two
+        // layers therefore share one rule: `resources` is the only declared
+        // per-Machine field a live Machine may have moved under it.
+        for desired_machine in &desired.environment.machines {
+            let Some(persisted) = self
+                .definition
+                .environment
+                .machines
+                .iter()
+                .find(|candidate| candidate.name == desired_machine.name)
+            else {
+                // A Machine the persisted definition does not declare at all.
+                // Every live Environment was just compared against the desired
+                // spec, so this is only reachable for a project with no
+                // Environments, where there is no instance to be bound to it.
+                continue;
+            };
+            if machine_runtime_shape_only(persisted, desired_machine) {
+                continue;
+            }
+            let Some(environment) = self.environments.first() else {
+                continue;
+            };
+            return DefinitionChange::Immutable {
+                environment_id: environment.environment_id.to_string(),
+                reason: format!(
+                    "Machine `{}` declares a change outside its runtime shape; only \
+                     `resources` may be reconciled onto a Machine that already exists",
+                    desired_machine.name
+                ),
+            };
+        }
+        DefinitionChange::Reconcilable
+    }
+
+    /// Rewrite this aggregate so it instantiates `desired`, in place.
+    ///
+    /// Only legal after [`classify_definition_change`](Self::classify_definition_change)
+    /// returned [`DefinitionChange::Reconcilable`], which is what guarantees the
+    /// result validates. Every identity — Environment, Machine, network,
+    /// attachment, endpoint — is left exactly as it was; what moves is the
+    /// persisted definition, each Environment's `definition_digest`, and the
+    /// per-Machine declared state that no instance record is compared against.
+    ///
+    /// `resources` is the whole of that last category today. It is applied state
+    /// the next activation reads, not identity, which is why reconciling it does
+    /// not restart a running Machine: a Machine that is already up keeps its
+    /// incarnation and picks the new shape up when it is next started.
+    pub fn apply_definition_change(
+        &mut self,
+        desired: &ProjectDefinition,
+        now: u64,
+    ) -> Result<(), TopologyValidationError> {
+        desired.validate()?;
+        let digest = desired.digest()?;
+        self.definition = desired.clone();
+        for environment in &mut self.environments {
+            environment.definition_digest = digest.clone();
+            environment.updated_at = now;
+            for machine in &mut environment.machines {
+                // A fork is a runtime object the definition never declares, so
+                // it takes its declared shape from its parent and not from a
+                // spec entry that does not exist for it.
+                let declared_name = match &machine.fork {
+                    Some(origin) => origin.parent_name.clone(),
+                    None => machine.name.clone(),
+                };
+                if let Some(spec) = desired
+                    .environment
+                    .machines
+                    .iter()
+                    .find(|candidate| candidate.name == declared_name)
+                {
+                    machine.resources = spec.resources.clone();
+                }
+            }
+        }
+        self.validate()
+    }
+}
+
 impl ProjectState {
     pub fn validate(&self) -> Result<(), TopologyValidationError> {
         validate_schema(self.schema_version)?;
@@ -5039,6 +5196,22 @@ pub(crate) fn validate_definition_instance_for_test(
     environment: &EnvironmentInstance,
 ) -> Result<(), TopologyValidationError> {
     validate_definition_instance(spec, environment)
+}
+
+/// True when two declarations of one Machine differ in nothing but the runtime
+/// shape (`resources`), which is the single per-Machine field a reconcile may
+/// move under a Machine that already exists.
+///
+/// This is the topology-layer half of the split
+/// `ResolvedMachineConfiguration::configuration_digest` makes in `vz-runtimed`:
+/// cpus and memory choose how big the VM is when it next starts, everything
+/// else chooses which Machine it is and keys its durable store.
+fn machine_runtime_shape_only(persisted: &MachineSpec, desired: &MachineSpec) -> bool {
+    let mut left = persisted.clone();
+    let mut right = desired.clone();
+    left.resources = MachineResources::default();
+    right.resources = MachineResources::default();
+    left == right
 }
 
 fn validate_definition_instance(

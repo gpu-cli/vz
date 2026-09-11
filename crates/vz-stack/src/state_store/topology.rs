@@ -2188,19 +2188,57 @@ impl StateStore {
         let (mut project, project_exists) = match store
             .load_project_state(definition.project_id.as_str())?
         {
-            Some(project) => {
-                if project.definition != *definition {
-                    return Err(StackError::InvalidSpec(format!(
-                        "project definition drift for `{}`; persisted digest={}, requested digest={}",
-                        definition.project_id,
-                        project
-                            .definition
-                            .digest()
-                            .map_err(|error| StackError::InvalidSpec(error.to_string()))?,
-                        definition
-                            .digest()
-                            .map_err(|error| StackError::InvalidSpec(error.to_string()))?,
-                    )));
+            Some(mut project) => {
+                // Criterion 22. A changed ProjectDefinition is CLASSIFIED here,
+                // inside the Up transaction and before anything is written,
+                // rather than refused wholesale. `classify_definition_change`
+                // asks of every live Environment whether the new definition
+                // still describes the instance that is already there -- the
+                // same comparison `ProjectState::validate` performs -- so the
+                // boundary between a field that reconciles and one that cannot
+                // is the runtime's own validity rule and not a second list that
+                // could drift away from it.
+                //
+                // A `Reconcilable` change is applied to the whole aggregate in
+                // memory and persisted below, in this transaction, before the
+                // Environment is selected: the selection and everything after
+                // it therefore see the definition the plan was derived from and
+                // never the caller's file. An `Immutable` change never reaches
+                // a write.
+                let change = project.classify_definition_change(definition);
+                let reconciled = match &change {
+                    vz_runtime_contract::DefinitionChange::Unchanged => false,
+                    vz_runtime_contract::DefinitionChange::Reconcilable => true,
+                    vz_runtime_contract::DefinitionChange::Immutable {
+                        environment_id,
+                        reason,
+                    } => {
+                        return Err(StackError::Machine {
+                            code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                            message: format!(
+                                "immutable project definition change for `{}`; persisted digest={}, \
+                                 requested digest={}; Environment `{}` cannot be reconciled in place: \
+                                 {}. Revert the field, or `vz delete` the Environment and let the new \
+                                 definition create it.",
+                                definition.project_id,
+                                project
+                                    .definition
+                                    .digest()
+                                    .map_err(|error| StackError::InvalidSpec(error.to_string()))?,
+                                definition
+                                    .digest()
+                                    .map_err(|error| StackError::InvalidSpec(error.to_string()))?,
+                                environment_id,
+                                reason,
+                            ),
+                        });
+                    }
+                };
+                if reconciled {
+                    project
+                        .apply_definition_change(definition, now)
+                        .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
+                    store.persist_definition_reconcile(&project, now)?;
                 }
                 (project, true)
             }
@@ -4637,6 +4675,95 @@ impl StateStore {
             )?;
         }
         Ok(())
+    }
+
+    /// Persist an already-validated definition reconcile, in one transaction.
+    ///
+    /// Criterion 22's "reconciles each selected Environment without changing
+    /// its stable identity". The caller has classified the change as
+    /// `Reconcilable` and rewritten the aggregate with
+    /// [`ProjectState::apply_definition_change`], so every identity here is
+    /// unchanged by construction and this function only writes the rows those
+    /// values live in.
+    ///
+    /// Three writes, because the aggregate is stored three times over: the
+    /// project holds the definition, each Environment row holds its
+    /// `definition_digest` and a parent `instance_json` snapshot, and each
+    /// Machine row holds its own `instance_json`. `load_environment_children`
+    /// refuses to read an Environment whose parent snapshot and child rows
+    /// disagree, so all three have to move together or the next read fails
+    /// closed rather than serving a half-reconciled aggregate.
+    fn persist_definition_reconcile(
+        &self,
+        project: &ProjectState,
+        now: u64,
+    ) -> Result<(), StackError> {
+        let definition = &project.definition;
+        let affected = self.conn.execute(
+            "UPDATE project_definitions
+             SET schema_version = ?2, name = ?3, definition_json = ?4, updated_at = ?5
+             WHERE project_id = ?1",
+            params![
+                definition.project_id.as_str(),
+                definition.schema_version,
+                definition.name,
+                serde_json::to_string(definition)?,
+                sqlite_u64(now, "project definition updated_at")?,
+            ],
+        )?;
+        if affected != 1 {
+            return Err(StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                message: format!(
+                    "project `{}` disappeared while reconciling its definition",
+                    definition.project_id
+                ),
+            });
+        }
+        for environment in &project.environments {
+            let affected = self.conn.execute(
+                "UPDATE environment_instances
+                 SET definition_digest = ?2, instance_json = ?3, updated_at = ?4
+                 WHERE environment_id = ?1",
+                params![
+                    environment.environment_id.as_str(),
+                    environment.definition_digest,
+                    serde_json::to_string(environment)?,
+                    sqlite_u64(environment.updated_at, "Environment updated_at")?,
+                ],
+            )?;
+            if affected != 1 {
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: format!(
+                        "Environment `{}` disappeared while reconciling its definition",
+                        environment.environment_id
+                    ),
+                });
+            }
+            for machine in &environment.machines {
+                let affected = self.conn.execute(
+                    "UPDATE machine_instances
+                     SET instance_json = ?3
+                     WHERE machine_id = ?1 AND environment_id = ?2",
+                    params![
+                        machine.machine_id.as_str(),
+                        machine.environment_id.as_str(),
+                        serde_json::to_string(machine)?,
+                    ],
+                )?;
+                if affected != 1 {
+                    return Err(StackError::Machine {
+                        code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                        message: format!(
+                            "Machine `{}` disappeared while reconciling its definition",
+                            machine.machine_id
+                        ),
+                    });
+                }
+            }
+        }
+        self.refresh_project_timestamps(definition.project_id.as_str())
     }
 
     pub(super) fn refresh_project_timestamps(&self, project_id: &str) -> Result<(), StackError> {

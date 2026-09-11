@@ -509,7 +509,28 @@ impl RuntimeDaemon {
                     if !Arc::ptr_eq(activation.entry(),&entry) { return Err(backend_error("Up attachment changed original Runtime object".into())); }
                     Arc::clone(activation)
                 } else {
-                    let (cpus,memory_mb)=if let Some(pin)=native_pin {(pin.configuration().cpus,pin.configuration().memory_mb)} else {let pin=pin.ok_or_else(||backend_error("missing Linux pin".into()))?;(pin.configuration().resources.cpus,pin.configuration().resources.memory_mb)};
+                    // The size this VM boots at comes from the DURABLE Machine
+                    // record, not from the pin. A pin is artifact storage and
+                    // is immutable once published; the runtime shape is
+                    // declared state that a definition reconcile updates in
+                    // place (criterion 22). Reading it from the pin is what
+                    // pinned it -- a Machine kept booting at the size it was
+                    // first created with however the definition changed.
+                    // `attach_machine` reads the same record through the same
+                    // two normalizers, so the object attached and the VM
+                    // dispatched cannot disagree about the shape.
+                    let declared=environment.machines.iter().find(|machine|machine.machine_id==step.machine_id)
+                        .ok_or_else(||backend_error("Machine is not part of this Environment".into()))?;
+                    let (cpus,memory_mb)=if native_pin.is_some() {
+                        let shape=crate::machine_target_resolver::resolve_native_machine_resources(&declared.resources)
+                            .map_err(|reason|backend_error(reason.to_string()))?;
+                        (shape.cpus,shape.memory_mb)
+                    } else {
+                        if pin.is_none() {return Err(backend_error("missing Linux pin".into()));}
+                        let shape=crate::machine_target_resolver::resolve_machine_resources(&declared.resources,declared.profile)
+                            .map_err(|reason|backend_error(reason.to_string()))?;
+                        (shape.cpus,shape.memory_mb)
+                    };
                     let reservation=MachineRuntimeEntry::<MacosRuntimeBackend>::vm_reservation(entry.owner()).map_err(|error|backend_error(error.to_string()))?;
                     if let Some(observer)=&self.environment_up_observer {
                         observer.before_dispatch(&EnvironmentUpBootBoundary {admission:run.admission.clone(),operation:operation.clone(),machine_id:step.machine_id.clone(),owner:entry.owner().clone()}).await;

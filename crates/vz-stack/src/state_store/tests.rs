@@ -26,7 +26,7 @@ use vz_runtime_contract::types::{
     TopologyResolutionError, TransportProtocol, WorkspaceBinding, WorkspaceBindingId,
     WorkspaceProjection, WorkspaceProjectionMode,
 };
-use vz_runtime_contract::{ContainerCreateReceipt, MachineErrorCode};
+use vz_runtime_contract::{ContainerCreateReceipt, DefinitionChange, MachineErrorCode};
 
 const V0_3_20_FIXTURE: &str = include_str!("../../tests/fixtures/v0.3.20-state.sql");
 const V0_3_20_AMBIGUOUS_FIXTURE: &str = include_str!("../../tests/fixtures/v0.3.20-ambiguous.sql");
@@ -15478,29 +15478,289 @@ fn stale_aggregate_save_cannot_erase_concurrent_sibling_or_owned_resource() {
     );
 }
 
+/// Criterion 22, first clause: a mutable field reconciles in place.
+///
+/// `resources` is the mutable field because no instance record is compared
+/// against it. What must survive the reconcile is every identity: the
+/// Environment, its Machines and their incarnations, the networks and the
+/// attachments. What must move is the persisted definition, the Environment's
+/// `definition_digest`, and the declared shape the next activation reads.
 #[test]
-fn up_reservation_rejects_definition_drift_before_mutation() {
+fn up_reservation_reconciles_a_mutable_definition_change_in_place() {
     let store = StateStore::in_memory().unwrap();
-    let state = topology_project_state("prj_drift_up", &["existing"], "/x");
+    let state = topology_project_state("prj_recon_mutable", &["existing"], "/x");
     store.save_project_state(&state).unwrap();
-    let mut drifted = state.definition.clone();
-    drifted.name = "different-project-name".to_string();
+    let before = store
+        .load_project_state("prj_recon_mutable")
+        .unwrap()
+        .unwrap();
+
+    let mut changed = state.definition.clone();
+    changed.environment.machines[0].resources.memory_mb = Some(6144);
+    let changed_digest = changed.digest().unwrap();
+    assert_ne!(changed_digest, before.definition.digest().unwrap());
+
+    let reservation = store
+        .resolve_or_reserve_environment_for_up(
+            &changed,
+            &EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::Name("existing".to_string())),
+                ..EnvironmentSelectionContext::default()
+            },
+            500,
+        )
+        .expect("a mutable definition change reconciles rather than being refused");
+    let selected = match &reservation {
+        EnvironmentUpReservation::Existing { environment, .. } => environment.clone(),
+        other => panic!("expected the existing Environment, got {other:?}"),
+    };
+
+    let after = store
+        .load_project_state("prj_recon_mutable")
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.definition, changed);
+    assert_eq!(after.environments.len(), before.environments.len());
+    let (was, is) = (&before.environments[0], &after.environments[0]);
+    assert_eq!(is.environment_id, was.environment_id);
+    assert_eq!(is.name, was.name);
+    assert_eq!(is.state, was.state);
+    assert_eq!(is.lifecycle_generation, was.lifecycle_generation);
+    assert_eq!(
+        is.machines
+            .iter()
+            .map(|m| &m.machine_id)
+            .collect::<Vec<_>>(),
+        was.machines
+            .iter()
+            .map(|m| &m.machine_id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        is.machines
+            .iter()
+            .map(|m| &m.incarnation)
+            .collect::<Vec<_>>(),
+        was.machines
+            .iter()
+            .map(|m| &m.incarnation)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        is.networks
+            .iter()
+            .map(|n| &n.network_id)
+            .collect::<Vec<_>>(),
+        was.networks
+            .iter()
+            .map(|n| &n.network_id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        is.network_attachments
+            .iter()
+            .map(|a| &a.attachment_id)
+            .collect::<Vec<_>>(),
+        was.network_attachments
+            .iter()
+            .map(|a| &a.attachment_id)
+            .collect::<Vec<_>>()
+    );
+    // The digest moved with the definition, on the project and on the
+    // Environment alike -- one version, not two.
+    assert_eq!(is.definition_digest, changed_digest);
+    assert_eq!(after.definition.digest().unwrap(), changed_digest);
+    assert_eq!(selected.definition_digest, changed_digest);
+    // And the declared shape the next activation reads followed the file.
+    assert_eq!(
+        is.machines
+            .iter()
+            .find(|machine| machine.name == "linux")
+            .unwrap()
+            .resources
+            .memory_mb,
+        Some(6144)
+    );
+}
+
+/// Reconciling twice is reconciling once: the second Up sees no change at all.
+#[test]
+fn up_reservation_definition_reconcile_is_idempotent() {
+    let store = StateStore::in_memory().unwrap();
+    let state = topology_project_state("prj_recon_twice", &["existing"], "/x");
+    store.save_project_state(&state).unwrap();
+    let mut changed = state.definition.clone();
+    changed.environment.machines[0].resources.cpus = Some(4);
+    let context = EnvironmentSelectionContext {
+        explicit: Some(EnvironmentSelector::Name("existing".to_string())),
+        ..EnvironmentSelectionContext::default()
+    };
+
+    store
+        .resolve_or_reserve_environment_for_up(&changed, &context, 500)
+        .expect("first reconcile");
+    let first = store
+        .load_project_state("prj_recon_twice")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first.classify_definition_change(&changed),
+        DefinitionChange::Unchanged
+    );
+    store
+        .resolve_or_reserve_environment_for_up(&changed, &context, 600)
+        .expect("second reconcile");
+    let second = store
+        .load_project_state("prj_recon_twice")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, second);
+}
+
+/// Criterion 22, second clause: an immutable field fails before mutation.
+///
+/// A pinned artifact digest is bound to the Machine that was built from it, so
+/// honouring a change would mean replacing that Machine. The refusal carries a
+/// code distinct from a malformed document's, names both digests it was decided
+/// against, and leaves the aggregate byte-identical.
+#[test]
+fn up_reservation_refuses_an_immutable_definition_change_before_mutation() {
+    let store = StateStore::in_memory().unwrap();
+    let state = topology_project_state("prj_recon_immutable", &["existing"], "/x");
+    store.save_project_state(&state).unwrap();
+    let before = store
+        .load_project_state("prj_recon_immutable")
+        .unwrap()
+        .unwrap();
+    let persisted_digest = before.definition.digest().unwrap();
+
+    let mut changed = state.definition.clone();
+    changed.environment.machines[0].target.digest = Some(format!("sha256:{}", "9".repeat(64)));
+    let requested_digest = changed.digest().unwrap();
 
     let error = store
         .resolve_or_reserve_environment_for_up(
-            &drifted,
+            &changed,
+            &EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::Name("existing".to_string())),
+                ..EnvironmentSelectionContext::default()
+            },
+            500,
+        )
+        .expect_err("an immutable change must be refused before any mutation");
+    assert_eq!(error.machine_code(), MachineErrorCode::StateConflict);
+    let spoken = error.to_string();
+    assert!(spoken.contains(&persisted_digest), "{spoken}");
+    assert!(spoken.contains(&requested_digest), "{spoken}");
+    assert!(spoken.contains("target differs"), "{spoken}");
+    assert!(
+        spoken.contains(before.environments[0].environment_id.as_str()),
+        "{spoken}"
+    );
+    // Before mutation: nothing moved, including for an Up that asked to create
+    // a sibling Environment rather than to touch the offended one.
+    assert_eq!(
+        store.load_project_state("prj_recon_immutable").unwrap(),
+        Some(before.clone())
+    );
+    let sibling = store
+        .resolve_or_reserve_environment_for_up(
+            &changed,
             &EnvironmentSelectionContext {
                 explicit: Some(EnvironmentSelector::Name("new".to_string())),
                 ..EnvironmentSelectionContext::default()
             },
             500,
         )
-        .expect_err("definition drift must reject before creating an Environment");
-    assert!(error.to_string().contains("project definition drift"));
+        .expect_err("an immutable change is refused whichever Environment is selected");
+    assert_eq!(sibling.machine_code(), MachineErrorCode::StateConflict);
     assert_eq!(
-        store.load_project_state("prj_drift_up").unwrap(),
-        Some(state)
+        store.load_project_state("prj_recon_immutable").unwrap(),
+        Some(before)
     );
+}
+
+/// The two classes are answered differently, which is what "classified" means.
+#[test]
+fn definition_change_classification_separates_mutable_from_immutable() {
+    let state = topology_project_state("prj_recon_class", &["existing"], "/x");
+    assert_eq!(
+        state.classify_definition_change(&state.definition),
+        DefinitionChange::Unchanged
+    );
+
+    let mut renamed = state.definition.clone();
+    renamed.name = "different-project-name".to_string();
+    assert_eq!(
+        state.classify_definition_change(&renamed),
+        DefinitionChange::Reconcilable,
+        "a project's display name is bound to no instance record"
+    );
+
+    let mut resized = state.definition.clone();
+    resized.environment.machines[0].resources.memory_mb = Some(6144);
+    assert_eq!(
+        state.classify_definition_change(&resized),
+        DefinitionChange::Reconcilable
+    );
+
+    for (label, mutate) in [
+        (
+            "profile",
+            Box::new(|definition: &mut ProjectDefinition| {
+                definition.environment.machines[0].profile = MachineProfile::Hardened;
+            }) as Box<dyn Fn(&mut ProjectDefinition)>,
+        ),
+        (
+            "target",
+            Box::new(|definition: &mut ProjectDefinition| {
+                definition.environment.machines[0].target.image = "ubuntu:22.04".to_string();
+            }),
+        ),
+        (
+            "requested capabilities",
+            Box::new(|definition: &mut ProjectDefinition| {
+                definition.environment.machines[0].requested_capabilities =
+                    CapabilitySet::new([MachineCapability::DockerEngine]);
+            }),
+        ),
+        (
+            "Machine name",
+            Box::new(|definition: &mut ProjectDefinition| {
+                definition.environment.machines[0].name = "renamed".to_string();
+                definition.environment.default_machine = Some("renamed".to_string());
+            }),
+        ),
+        (
+            "egress",
+            Box::new(|definition: &mut ProjectDefinition| {
+                definition.environment.machines[0].egress = EgressPolicy::Offline;
+            }),
+        ),
+        // Not compared by `validate_definition_instance`, but it keys the
+        // Machine's durable runtime store, so the topology layer has to refuse
+        // it too or Up would be admitted and then fail at the store.
+        (
+            "workspace projection",
+            Box::new(|definition: &mut ProjectDefinition| {
+                definition.environment.machines[0]
+                    .workspace
+                    .as_mut()
+                    .expect("the fixture declares a workspace")
+                    .target_path = "/elsewhere".to_string();
+            }),
+        ),
+    ] {
+        let mut changed = state.definition.clone();
+        mutate(&mut changed);
+        assert!(
+            matches!(
+                state.classify_definition_change(&changed),
+                DefinitionChange::Immutable { .. }
+            ),
+            "a changed {label} is bound to the live instance and must not reconcile in place"
+        );
+    }
 }
 
 #[test]

@@ -28,10 +28,26 @@ pub struct NativeConfiguration {
 }
 
 impl NativeConfiguration {
+    /// The portable identity of this configuration, without its runtime shape.
+    ///
+    /// `cpus` and `memory_mb` are how big the VM is, not which Machine it is;
+    /// the durable Machine record owns them and a definition reconcile moves
+    /// them. See `ResolvedMachineConfiguration::configuration_digest` for the
+    /// whole of this argument -- this is the native-macOS half of the same
+    /// split, kept identical so the two backends cannot disagree about what a
+    /// Machine's identity is.
     pub fn digest(&self) -> Result<String> {
+        let mut identity = serde_json::to_value(self)?;
+        if let Some(object) = identity.as_object_mut() {
+            object.remove("cpus");
+            object.remove("memory_mb");
+            if let Some(machine) = object.get_mut("machine").and_then(|m| m.as_object_mut()) {
+                machine.remove("resources");
+            }
+        }
         let mut hash = Sha256::new();
         hash.update(b"vz.native-macos-configuration.v1\0");
-        hash.update(serde_json::to_vec(self)?);
+        hash.update(serde_json::to_vec(&identity)?);
         Ok(format!("sha256:{hash:x}", hash = hash.finalize()))
     }
 }
@@ -177,7 +193,21 @@ pub async fn prepare(
     );
     let destination = store.data_path().join("native-target");
     if fs::symlink_metadata(&destination).is_ok() {
-        return load(store, configuration.host, &configuration.machine);
+        // The pin is already published, so its release manifest is the one
+        // this Machine boots. The runtime shape, however, is the CURRENT
+        // declared one -- a definition reconcile can move it after the pin
+        // exists -- so the manifest minimum is checked against what the VM
+        // will actually be given, not against what it was given the first
+        // time. Without this a reconcile could shrink a native Machine below
+        // the floor its own release declares and only find out at boot.
+        let pin = load(store, configuration.host, &configuration.machine)?;
+        let platform = &pin.release().platform;
+        ensure!(
+            u32::from(configuration.cpus) >= platform.minimum_cpu_count
+                && configuration.memory_mb * 1024 * 1024 >= platform.minimum_memory_bytes,
+            "native resources below manifest minimum"
+        );
+        return Ok(pin);
     }
     let cache = BootstrapCache::new(cache_root.clone())?;
     let prepared = if let Some(bundle) = bundle {
