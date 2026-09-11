@@ -655,6 +655,15 @@ SENTINEL_PATH = "/run/vz-reproducibility-sentinel"
 # disk would still have failed, and one that preserved nothing but kept a tmpfs
 # file would have passed. Under STORAGE_ROOT because the declared volume that
 # backs it is mounted there.
+def recovery_hostname(isolate: str) -> str:
+    """The Environment-local name this recovery Environment declares.
+
+    `.test` is the RFC 6761 reserved suffix, so a lookup that succeeds was
+    answered by an Environment-local resolver and never by the public DNS.
+    """
+    return f"{isolate}.test"
+
+
 RECOVERY_VOLUME = "recovery"
 RECOVERY_VOLUME_TARGET = "/vz-storage/recovery"
 RECOVERY_SENTINEL_PATH = RECOVERY_VOLUME_TARGET + "/sentinel"
@@ -1972,8 +1981,14 @@ def establish_recovery_environments(ctx: CheckContext, names: tuple) -> tuple:
         # nothing to hide behind.
         base = minimal_definition(ctx.release_dir)
         base["environment"]["machines"][0]["networks"] = [PRIVATE_NETWORK]
+        # PUBLIC-LIKE, not private. Only a `simulated_public` network is given a
+        # FabricGateway (environment_switch/plan.rs), and only a Machine on one
+        # is handed `vz.dns.{N}` on its kernel cmdline -- so a Machine attached
+        # to a private network alone has no environment-local resolver to ask,
+        # and criterion 8's resolve clause has nothing to test. Criterion 10's
+        # DNS-reconstruction clause wants the same thing.
         base["environment"]["networks"] = [
-            {"schema_version": 1, "name": PRIVATE_NETWORK, "kind": "private"}]
+            {"schema_version": 1, "name": PRIVATE_NETWORK, "kind": "simulated_public"}]
         # And one declared ENDPOINT, so each Environment publishes a name.
         #
         # Criterion 8's resolve clause asks that A's DNS view not answer for a
@@ -1982,10 +1997,17 @@ def establish_recovery_environments(ctx: CheckContext, names: tuple) -> tuple:
         # the same in all three, which is the point: three Environments that
         # all declare `probe` and still cannot resolve each other's is a
         # stronger statement than three that declare nothing.
+        # A DISTINCT declared hostname per Environment. The endpoint NAME stays
+        # `probe` in all three -- three Environments that all declare `probe`
+        # and still cannot reach each other's is the stronger statement -- but
+        # the resolve clause needs a name declared in B that A can be asked
+        # for, and a name all three share cannot distinguish "A resolved B's"
+        # from "A resolved its own".
         base["environment"]["endpoints"] = [
             {"schema_version": 1, "name": "probe",
              "machine": base["environment"]["machines"][0]["name"],
-             "network": PRIVATE_NETWORK, "protocol": "tcp", "port": PRIVATE_PORT}]
+             "network": PRIVATE_NETWORK, "protocol": "tcp", "port": PRIVATE_PORT,
+             "hostname": None}]
         # And one declared BLOCK VOLUME, which is where the sentinel goes.
         #
         # Criterion 10 claims stop/up preserves "identity and declared disks,
@@ -2007,6 +2029,7 @@ def establish_recovery_environments(ctx: CheckContext, names: tuple) -> tuple:
     for name in names:
         definition = copy.deepcopy(base)
         definition["project_id"] = "prj_" + uuid.uuid4().hex
+        definition["environment"]["endpoints"][0]["hostname"] = recovery_hostname(name)
         instance = provision(ctx, check, name, definition)
         if instance.get("unsupported"):
             check.not_implemented = "this runtime refused the definition: " + instance["unsupported"][:200]
@@ -2022,7 +2045,8 @@ def establish_recovery_environments(ctx: CheckContext, names: tuple) -> tuple:
             return None, check.finish()
         environment = reported[0]
         environments.append({
-            "isolate": name, "token": token, "project_id": payload.get("project_id"),
+            "isolate": name, "token": token, "hostname": recovery_hostname(name),
+            "project_id": payload.get("project_id"),
             "definition_digest": payload.get("persisted_definition_digest"),
             "environment_id": environment.get("environment_id"), "environment_name": environment.get("name"),
             "state": environment.get("state"), "lifecycle_generation": environment.get("lifecycle_generation"),
@@ -8264,16 +8288,36 @@ def check_cross_environment_resolution(ctx: CheckContext, top: str, established:
         check.check(not text.rstrip().endswith(":0"),
                     f"{a['name']}'s resolver refuses to answer for {b['name']}'s Environment id "
                     f"{target!r} (expected a non-zero nslookup exit, observed {text.rstrip()[-24:]!r})")
-    if check.status == "PASS":
-        quoted = " | ".join(sorted({" ".join(text.split())[:120] for text in replies.values()}))
-        check.not_implemented = (
-            "criterion 8's resolve clause also requires that A's DNS view not answer for a name "
-            "DECLARED in B, and the Environments this phase establishes declare no networks and no "
-            "endpoints, so no Environment publishes a name and none is given an environment-local "
-            "resolver to ask. The Machines answered: " + quoted[:300] +
-            ". What is proved above -- that no Environment's resolver view names any identity of "
-            "another, and that a lookup of another's Environment id does not answer -- is necessary "
-            "but not the whole clause, so the clause is not claimed.")
+    # The clause proper: A's DNS view must not answer for a name DECLARED in B.
+    #
+    # This needs a CONTROL, or the refusals below are unfalsifiable -- a Machine
+    # with no resolver at all refuses every name, which would satisfy "does not
+    # resolve the sibling's" while proving nothing. So each Environment is first
+    # required to resolve its OWN declared hostname; only then does refusing a
+    # sibling's mean the resolver is scoped rather than absent.
+    resolved = {}
+    for subject in subjects:
+        own = subject["entry"].get("hostname")
+        if not own:
+            check.fail(f"{subject['name']}: pre-sleep recorded no declared hostname to resolve")
+            continue
+        row = machine_exec(ctx, check, f"iso-resolve-own-{subject['name']}", subject["instance"],
+                           subject["machine"], f'/bin/busybox nslookup {own} 2>&1; printf ":%s" $?')
+        text = row.stdout.decode("utf-8", "replace")
+        resolved[subject["name"]] = text
+        check.check(text.rstrip().endswith(":0"),
+                    f"{subject['name']}: resolves the name IT declared, {own!r}, so a refusal below is a "
+                    f"scoped resolver and not an absent one (observed {text.rstrip()[-40:]!r})")
+    for a, b in cross_pairs(subjects):
+        foreign = b["entry"].get("hostname")
+        if not foreign:
+            continue
+        row = machine_exec(ctx, check, f"iso-resolve-{a['name']}-{b['name']}", a["instance"], a["machine"],
+                           f'/bin/busybox nslookup {foreign} 2>&1; printf ":%s" $?')
+        text = row.stdout.decode("utf-8", "replace")
+        check.check(not text.rstrip().endswith(":0"),
+                    f"{a['name']}'s resolver refuses {b['name']}'s DECLARED name {foreign!r} "
+                    f"(expected a non-zero nslookup exit, observed {text.rstrip()[-40:]!r})")
     return check.finish()
 
 

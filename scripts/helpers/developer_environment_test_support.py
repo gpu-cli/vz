@@ -1372,6 +1372,28 @@ case "$applet" in
         exit 0
       done
     fi
+    # `cross_environment_resolve_name` answers a name a SIBLING Environment
+    # declared. This is the resolve clause's own falsifier: the name is read out
+    # of the sibling's own edge file, so it is the name that Environment really
+    # published and not one invented here, which is what makes the refusal
+    # assertion able to fail.
+    if [ "$mode" = cross_environment_resolve_name ]; then
+      for other in "$(dirname "$state")"/*/edge; do
+        [ -f "$other" ] || continue
+        [ "$(dirname "$other")" = "$state" ] && continue
+        [ "$1" = "$(cat "$other")" ] || continue
+        printf 'Server:\t10.0.0.1\nAddress:\t10.0.0.1:53\n\nName:\t%s\nAddress: 10.0.0.9\n' "$1"
+        exit 0
+      done
+    fi
+    # `no_local_resolver` is the VACUITY guard for that clause: a Machine with
+    # no resolver at all refuses every name, including a sibling's, so the
+    # refusals alone would be satisfied by a Machine that can resolve nothing.
+    # The control -- each Environment resolving the name IT declared -- is what
+    # this mode has to break.
+    if [ "$mode" = no_local_resolver ]; then
+      printf 'nslookup: no resolver\n'; exit 1
+    fi
     # Resolution through the Environment's own resolver, which answers the
     # Environment's declared name and nothing else. There is no upstream: a name
     # this Environment did not declare is not looked for anywhere.

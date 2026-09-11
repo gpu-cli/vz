@@ -2974,28 +2974,22 @@ class CrossEnvironmentIsolationTests(unittest.TestCase):
         could not reach instead of claiming the clause."""
         result, subs = self.isolation()
         self.assertEqual(set(subs) & CROSS_SLUGS, CROSS_SLUGS, sorted(subs))
-        for slug in ("cross_environment_routing", "cross_environment_read",
-                     "cross_environment_control", "cross_environment_events"):
+        # All FIVE verbs now, including resolve. The recovery Environments
+        # declare a PUBLIC-LIKE network, so each gets a FabricGateway and each
+        # Machine an Environment-local resolver, and each declares its own
+        # `<isolate>.test` endpoint hostname -- so there is a name declared in B
+        # for A's resolver to be asked about, and a name of A's own for the
+        # control that keeps the refusal meaningful.
+        for slug in CROSS_SLUGS:
             self.assertEqual(subs[slug]["status"], "PASS", (slug, subs[slug]["assertions"]))
             self.assertTrue(subs[slug]["evidence"], slug)
-        # The one honest gap: these Environments declare no network and no
-        # endpoint, so no name is DECLARED in one for another's resolver to be
-        # asked about. What could be settled was settled and is recorded above
-        # the not_implemented line.
-        resolution = subs["cross_environment_resolution"]
-        self.assertEqual(resolution["status"], "FAIL")
-        self.assertEqual(self.failures(resolution), [], resolution["assertions"])
-        gaps = [a for a in resolution["assertions"] if a.startswith("not_implemented:")]
-        self.assertEqual(len(gaps), 1, resolution["assertions"])
-        self.assertIn("declare no networks and no", gaps[0])
-        # Criterion 8 cannot be claimed while one of its verbs is unproved, and
-        # the phase carries two other criteria nothing implements yet.
         top = next(s for s in result["scenarios"] if s["id"] == e2e.CRITERION_8)
-        self.assertEqual(top["status"], "FAIL", top["assertions"])
-        self.assertEqual((result["outcome"], result["failure"]["reason"]), ("failed", "not_implemented"))
+        self.assertEqual(top["status"], "PASS", top["assertions"])
         assertions = "\n".join(a for slug in CROSS_SLUGS for a in subs[slug]["assertions"])
         # Each verb of the criterion, named in the evidence it produced.
         for needle in (
+            "resolves the name IT declared",
+            "refuses",
             "resolver view names none of",
             "resolver refuses to answer for",
             "holds at least one non-loopback address to be aimed at",
@@ -3040,6 +3034,31 @@ class CrossEnvironmentIsolationTests(unittest.TestCase):
         _result, subs = self.isolation("cross_environment_resolve")
         self.assert_asserted(subs["cross_environment_resolution"],
                              "resolver refuses to answer for", "cross_environment_resolve")
+
+    def test_a_resolver_that_answers_a_siblings_declared_name_fails(self):
+        """The resolve clause proper: A must not answer for a name DECLARED in B.
+
+        The stand-in reads the name out of the sibling's own edge file, so it is
+        the name that Environment really published rather than one invented by
+        the mode -- which is what makes this assertion able to fail at all.
+        """
+        _result, subs = self.isolation("cross_environment_resolve_name")
+        self.assert_asserted(subs["cross_environment_resolution"],
+                             "DECLARED name", "cross_environment_resolve_name")
+        self.assert_intact(subs, "cross_environment_routing", "cross_environment_read",
+                           "cross_environment_control", "cross_environment_events")
+
+    def test_a_machine_with_no_resolver_fails_the_resolve_control(self):
+        """Vacuity guard for the clause above.
+
+        A Machine that can resolve NOTHING refuses every sibling's name, so the
+        refusals on their own are satisfied by a resolver that is merely absent.
+        The control -- each Environment resolving the name it declared itself --
+        is what separates scoped from absent, and this mode has to break it.
+        """
+        _result, subs = self.isolation("no_local_resolver")
+        self.assert_asserted(subs["cross_environment_resolution"],
+                             "resolves the name IT declared", "no_local_resolver")
 
     # -- route ----------------------------------------------------------------------------
     def test_a_merged_route_domain_fails(self):
