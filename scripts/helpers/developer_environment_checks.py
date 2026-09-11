@@ -647,6 +647,18 @@ def check_three_concurrent_environments(ctx: CheckContext, top: str) -> SubCheck
 
 
 SENTINEL_PATH = "/run/vz-reproducibility-sentinel"
+# Criterion 10's recovery clause writes here instead. `/run` is the guest
+# initramfs's ramdisk, so a sentinel in it cannot survive the stop/up that
+# clause performs -- the assertion was asserting something stronger than the
+# criterion states ("identity and declared disks, volumes, Docker data, and
+# endpoints") and weaker than it means: a Machine that preserved every declared
+# disk would still have failed, and one that preserved nothing but kept a tmpfs
+# file would have passed. Under STORAGE_ROOT because the declared volume that
+# backs it is mounted there.
+RECOVERY_VOLUME = "recovery"
+RECOVERY_VOLUME_TARGET = "/vz-storage/recovery"
+RECOVERY_SENTINEL_PATH = RECOVERY_VOLUME_TARGET + "/sentinel"
+RECOVERY_VOLUME_BYTES = 16 * 1024 * 1024
 
 
 def resolved_shape(payload: dict) -> dict:
@@ -740,20 +752,30 @@ def check_recreate_from_definition(ctx: CheckContext, top: str) -> SubCheck:
     return check.finish()
 
 
-def sentinel_write(ctx: CheckContext, check: SubCheck, name: str, instance: dict, token: str) -> bool:
+def sentinel_write(ctx: CheckContext, check: SubCheck, name: str, instance: dict, token: str,
+                   path: str = SENTINEL_PATH) -> bool:
+    """Write one token into `path` inside this Environment's Machine.
+
+    `path` because two criteria use this helper for different claims. Criterion
+    11 compares sentinel bytes across the deletion of a DIFFERENT Environment
+    with this one still running, where the ramdisk is a perfectly good place for
+    it. Criterion 10 compares them across an explicit stop/up, where it is not.
+    """
     row = ctx.run(check, name + "-sentinel-write",
                   ["exec", "--environment", "default", "--", "/bin/busybox", "sh", "-c",
-                   f"printf %s {token} > {SENTINEL_PATH}; cat {SENTINEL_PATH}"],
+                   f"/bin/busybox mkdir -p $(/bin/busybox dirname {path}); "
+                   f"printf %s {token} > {path}; cat {path}"],
                   cwd=instance["project"], env=instance["env"], timeout=120)
     check.check(row.exit_code == 0 and row.stdout.strip() == token.encode(),
-                f"{name}: sentinel written into its Machine (exit {row.exit_code})")
+                f"{name}: sentinel written into its Machine at {path} (exit {row.exit_code})")
     return row.exit_code == 0 and row.stdout.strip() == token.encode()
 
 
-def sentinel_read(ctx: CheckContext, check: SubCheck, name: str, instance: dict):
+def sentinel_read(ctx: CheckContext, check: SubCheck, name: str, instance: dict,
+                  path: str = SENTINEL_PATH):
     row = ctx.run(check, name + "-sentinel-read",
                   ["exec", "--environment", "default", "--", "/bin/busybox", "sh", "-c",
-                   f"cat {SENTINEL_PATH} 2>/dev/null; printf END"],
+                   f"cat {path} 2>/dev/null; printf END"],
                   cwd=instance["project"], env=instance["env"], timeout=120)
     return row
 
@@ -1964,6 +1986,20 @@ def establish_recovery_environments(ctx: CheckContext, names: tuple) -> tuple:
             {"schema_version": 1, "name": "probe",
              "machine": base["environment"]["machines"][0]["name"],
              "network": PRIVATE_NETWORK, "protocol": "tcp", "port": PRIVATE_PORT}]
+        # And one declared BLOCK VOLUME, which is where the sentinel goes.
+        #
+        # Criterion 10 claims stop/up preserves "identity and declared disks,
+        # volumes, Docker data, and endpoints". The sentinel used to live in
+        # `/run` -- the initramfs ramdisk -- so the clause asserted the survival
+        # of storage the criterion never claimed, and could not pass however
+        # correct the runtime was. A declared volume is the thing the criterion
+        # names, and it is singly attached and writable, which is what a block
+        # volume is for.
+        base["environment"]["volumes"] = [
+            {"schema_version": 1, "name": RECOVERY_VOLUME, "kind": "block",
+             "size_bytes": RECOVERY_VOLUME_BYTES,
+             "attachments": [{"machine": base["environment"]["machines"][0]["name"],
+                              "target_path": RECOVERY_VOLUME_TARGET, "mode": "read_write"}]}]
     except (StopIteration, KeyError, OSError) as error:
         check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
         return None, check.finish()
@@ -1978,7 +2014,7 @@ def establish_recovery_environments(ctx: CheckContext, names: tuple) -> tuple:
         if check.status != "PASS" or not instance["status"]:
             return None, check.finish()
         token = "vzrec-" + uuid.uuid4().hex[:16]
-        if not sentinel_write(ctx, check, name, instance, token):
+        if not sentinel_write(ctx, check, name, instance, token, RECOVERY_SENTINEL_PATH):
             return None, check.finish()
         payload = instance["status"]
         reported = payload.get("environments") or []
@@ -2008,8 +2044,17 @@ def establish_recovery_environments(ctx: CheckContext, names: tuple) -> tuple:
 # are named here rather than left out so the check reports what it did not
 # observe instead of passing on the part that worked.
 RECOVERY_UNEXERCISED = (
-    "declared volumes (no Volume resource exists in schemas/vz-project-definition-v1.schema.json)",
-    "DNS reconstruction (environment-local split DNS arrives with criterion 6's gateway)",
+    # "declared volumes" is no longer here, and the reason it was is worth
+    # recording: it said "no Volume resource exists in
+    # schemas/vz-project-definition-v1.schema.json", which stopped being true.
+    # The schema carries `$defs/volume` and `$defs/volumeAttachment`, and the
+    # recovery Environments now declare a singly-attached writable block volume
+    # whose mount is where the sentinel lives -- so "declared state survived
+    # stop/up" IS the declared-volume claim, measured rather than deferred.
+    "DNS reconstruction (the check does not yet re-resolve an Environment-local "
+    "name across stop/up; `vz.dns` split DNS and criterion 6's FabricGateway both exist now, "
+    "so this clause is exercisable and only wants a public-like recovery Environment -- the "
+    "same fixture criterion 8's resolve clause needs, vz-jbo)",
     "daemon, adapter and guest crash recovery (no crash injection exists in this lane)",
     "manifest recovery deadlines (the contract pins none for this lane)",
 )
@@ -2070,7 +2115,7 @@ def check_lifecycle_recovery(ctx: CheckContext, top: str, established: dict) -> 
                         f"{name}/{machine['name']}: the Docker context is the one it had")
         if check.status != "PASS":
             return check.finish()
-        row = sentinel_read(ctx, check, "wake-" + name, instance)
+        row = sentinel_read(ctx, check, "wake-" + name, instance, RECOVERY_SENTINEL_PATH)
         check.check(row.exit_code == 0 and row.stdout.strip() == (entry["token"] + "END").encode(),
                     f"{name}: Machine-local state came back byte-identical (observed {row.stdout[:60]!r})")
     if check.status != "PASS":
@@ -2099,7 +2144,7 @@ def check_lifecycle_recovery(ctx: CheckContext, top: str, established: dict) -> 
         check.check({machine.get("machine_id") for machine in environment.get("machines") or []} ==
                     {machine["machine_id"] for machine in entry["machines"]},
                     f"{name}: stop/up preserved every Machine identity")
-        row = sentinel_read(ctx, check, "wake-" + name + "-after", instance)
+        row = sentinel_read(ctx, check, "wake-" + name + "-after", instance, RECOVERY_SENTINEL_PATH)
         check.check(row.exit_code == 0 and row.stdout.strip() == (entry["token"] + "END").encode(),
                     f"{name}: declared state survived stop/up (observed {row.stdout[:60]!r})")
     if check.status == "PASS":
@@ -4868,6 +4913,10 @@ DIGEST_SPELLING = re.compile(r"^sha256:[0-9a-f]{64}$")
 ERROR_CODE_SPELLING = re.compile(r"^[a-z][a-z0-9_]*$")
 RECONCILE_UP_TIMEOUT = UP_TIMEOUT
 RECONCILE_STATUS_TIMEOUT = 60
+# How many times the reconcile-back may be re-offered while the daemon is still
+# finishing an Up this sub-check itself admitted. Bounded and small: this waits
+# out a known in-flight operation, and is not a retry loop around a flaky one.
+RECONCILE_RECONVERGE_ATTEMPTS = 3
 # Removed from a plan value by name before two runs are compared: everything
 # that identifies THIS invocation rather than the plan it announced. A lifecycle
 # `generation` is excluded because a second accepted Up legitimately consumes the
@@ -5207,11 +5256,31 @@ def _reconcile_restored(ctx: CheckContext, check: SubCheck, subject: "ReconcileS
     reconverged = False
     if restored is not None and restored.get("definition_drift") is True:
         reconverged = True
-        again = ctx.run(check, subject.name + "-recon-reconverge", ["--json", "up"], cwd=subject.project,
-                        env=subject.env, timeout=RECONCILE_UP_TIMEOUT)
-        check.check(again.exit_code == 0,
+        # An Up this sub-check already admitted may still be in flight: a
+        # signalled CLI does not stop the daemon's supervisor, which keeps
+        # ownership and refuses to be driven twice --
+        #
+        #   timeout: Up deadline elapsed; original supervisor retains in-flight
+        #   effects and ownership; this receipt does not prove quiescence
+        #
+        # -- which is the runtime answering correctly, not a failure to
+        # reconcile. Waiting on that condition rather than on a clock: retry
+        # only while the refusal is exactly that one, bounded, so any other
+        # refusal fails on the first attempt with its own reason.
+        again = None
+        for attempt in range(RECONCILE_RECONVERGE_ATTEMPTS):
+            again = ctx.run(check, f"{subject.name}-recon-reconverge-{attempt}", ["--json", "up"],
+                            cwd=subject.project, env=subject.env, timeout=RECONCILE_UP_TIMEOUT)
+            if again.exit_code == 0:
+                break
+            error = reconcile_error(again) or {}
+            if error.get("code") != "timeout" or "retains in-flight effects" not in str(error.get("message") or ""):
+                break
+        check.check(again is not None and again.exit_code == 0,
                     f"{subject.name}: this runtime accepted the change, so the Environment is reconciled back to "
-                    f"the definition pre-sleep recorded (exit {again.exit_code}, expected 0)")
+                    f"the definition pre-sleep recorded (exit {None if again is None else again.exit_code}, "
+                    f"expected 0, after at most {RECONCILE_RECONVERGE_ATTEMPTS} attempt(s) while an Up this "
+                    f"sub-check admitted was still in flight)")
         restored = reconcile_status(ctx, check, subject.name + "-recon-reconverged", subject.instance)
     identity = reconcile_identity(restored) if restored is not None else None
     comparable = (_reconcile_without_generation(identity), _reconcile_without_generation(subject.identity))
@@ -5500,12 +5569,7 @@ def check_concurrent_stale_reconcile_fail_closed(ctx: CheckContext, top: str, es
         # outcome leaves behind.
         first = ctx.release(check, held)
         codes = (first.exit_code, second.exit_code)
-        converged = codes == (0, 0)
-        closed = all(code is not None and code > 0 for code in codes)
         interrupted = [code for code in codes if code is not None and code < 0]
-        check.check(converged or closed,
-                    f"{subject.name}: the two concurrent Ups both converged or both failed closed (exit codes "
-                    f"{list(codes)}; signalled {interrupted})")
         after = reconcile_status(ctx, check, subject.name + "-recon-concurrent-after", subject.instance)
         if after is None:
             return check.finish()
@@ -5517,6 +5581,33 @@ def check_concurrent_stale_reconcile_fail_closed(ctx: CheckContext, top: str, es
             return check.finish()
         environment = environments[0]
         expected = subject.identity["environments"][0]
+        # The verdict is taken from the STATE the pair left, not from its two
+        # exit codes.
+        #
+        # `ctx.release` signals the held CLI, not the daemon's supervisor, which
+        # goes on driving the Up it already admitted. So a signalled client --
+        # which is precisely the criterion's "interrupted reconciliation", and
+        # what this sub-check sets out to produce -- legitimately leaves a
+        # CONVERGED Environment behind. Grading `both converged or both failed
+        # closed` over the exit codes made that outcome impossible to pass: the
+        # one case named in this sub-check's own docstring could only ever fail,
+        # and did as soon as a declared volume made Up slow enough for the
+        # release to land mid-flight.
+        #
+        # What the criterion actually forbids is a pair that leaves the
+        # Environment between versions. So: exactly one definition version, and
+        # it is either the one the pair planned from or the one it started with.
+        # Everything after this -- no mixed-version topology, no cross-owner
+        # adoption, no orphaned resources -- still has to hold either way.
+        project_digest = after.get("persisted_definition_digest")
+        converged = environment["definition_digest"] == desired_now and project_digest == desired_now
+        untouched = (environment["definition_digest"] == expected["definition_digest"]
+                     and project_digest == subject.persisted)
+        check.check(converged or untouched,
+                    f"{subject.name}: the pair left ONE definition version and nothing between them -- either the "
+                    f"one it planned from or the one it started with (exit codes {list(codes)}, signalled "
+                    f"{interrupted}; Environment {environment['definition_digest']!r}, project {project_digest!r}, "
+                    f"planned {desired_now!r}, started {subject.persisted!r})")
         # No mixed-version topology. With one Machine "they all agree" would be
         # vacuous, so each Machine is compared against the incarnation generation
         # pre-sleep recorded for it by name, and the set is reported beside it.
@@ -5534,10 +5625,10 @@ def check_concurrent_stale_reconcile_fail_closed(ctx: CheckContext, top: str, es
                         and environment["lifecycle_generation"] > expected["lifecycle_generation"],
                         f"{subject.name}: the accepted pair advanced one lifecycle counter monotonically "
                         f"({expected['lifecycle_generation']!r} -> {environment['lifecycle_generation']!r})")
-            check.check(environment["definition_digest"] == after.get("persisted_definition_digest") == desired_now,
+            check.check(environment["definition_digest"] == project_digest == desired_now,
                         f"{subject.name}: one definition version across the project and the Environment, and it is "
                         f"the one the pair planned from (Environment {environment['definition_digest']!r}, project "
-                        f"{after.get('persisted_definition_digest')!r}, planned {desired_now!r})")
+                        f"{project_digest!r}, planned {desired_now!r})")
         else:
             check.check(environment["lifecycle_generation"] == expected["lifecycle_generation"],
                         f"{subject.name}: the refused pair consumed no lifecycle generation "
@@ -5670,9 +5761,25 @@ def check_effective_input_snapshot_identity(ctx: CheckContext, top: str, establi
         moved = reconcile_status(ctx, check, subject.name + "-recon-moved", subject.instance)
         if moved is None:
             return check.finish()
-        check.check(moved.get("desired_definition_digest") not in (None, "", subject.desired),
+        responsive = moved.get("desired_definition_digest") not in (None, "", subject.desired)
+        check.check(responsive,
                     f"{subject.name}: changing {MUTABLE_FIELD} changes the desired-input digest "
                     f"({subject.desired!r} -> {moved.get('desired_definition_digest')!r})")
+        if not responsive:
+            # The same precondition the three reconcile sub-checks test before
+            # they assert anything: without a desired-input identity that moves
+            # when the inputs move, there is no snapshot for planning and
+            # activation to share and nothing here to prove. Reported by name
+            # rather than asserted into a failure, exactly as they do -- what
+            # must NOT happen is reporting it unconditionally, which is what
+            # made this sub-check unpassable before vz-mzs.2.12.
+            reconcile_unimplemented(check,
+                                    f"{RECONCILE_INPUTS_DOC} 'Snapshot model' requires a desired-input identity "
+                                    f"that changes when the inputs change; this runtime published the same "
+                                    f"desired_definition_digest {moved.get('desired_definition_digest')!r} before "
+                                    f"and after {MUTABLE_FIELD} changed, so planning and activation have no "
+                                    f"snapshot to share and the clauses below have no subject.", "")
+            return check.finish()
         check.check(moved.get("persisted_definition_digest") == subject.persisted,
                     f"{subject.name}: activation still names the digest it was activated under "
                     f"({subject.persisted!r} observed {moved.get('persisted_definition_digest')!r})")
@@ -5688,20 +5795,31 @@ def check_effective_input_snapshot_identity(ctx: CheckContext, top: str, establi
                     if not published else
                     f"{subject.name}: the public surface publishes {published}; this sub-check does not yet assert "
                     f"the snapshot contract those keys carry")
-        reconcile_unimplemented(check,
-                                f"{RECONCILE_INPUTS_DOC} 'Snapshot model' requires an immutable operation-owned "
-                                f"`ReconcileInputSnapshot` with a `vz-reconcile-input-manifest-v1` manifest digest "
-                                f"and per-service `vz-effective-service-input-v1` effective digests over each "
-                                f"service's referenced networks, volumes, secret bytes and resolved image content; "
-                                f"'Recovery, retention, and cleanup' requires a tampered or reordered manifest to "
-                                f"be a state conflict before mutation. The 0.4 ProjectDefinition "
-                                f"({PROJECT_DEFINITION_SCHEMA}) declares no services, secrets or volumes and the "
-                                f"public CLI has no scoped service create/recreate/remove, so those digests and "
-                                f"the tamper rules over their staged blobs have no subject here: none of "
-                                f"{list(EFFECTIVE_INPUT_KEYS)} appears on any public interface. What is proved "
-                                f"above is the definition-level identity -- one canonical digest, shared by "
-                                f"planning and activation, canonical over the value and responsive to it.",
-                                reconcile_refusal_text(reconcile_error(refused)))
+        # `reconcile-effective-inputs.md`'s per-service half is 0.5 work, and
+        # criterion 22 no longer claims it for 0.4 (owner decision, vz-mzs.2.12).
+        #
+        # That document specifies a per-service `vz-effective-service-input-v1`
+        # digest over each service's referenced networks, volumes, secret bytes
+        # and resolved image content, a `vz-reconcile-input-manifest-v1`
+        # manifest over the set, and tamper/replay rules over staged blobs. The
+        # 0.4 ProjectDefinition declares no services and no secrets and the
+        # public CLI has no scoped service create/recreate/remove, so those
+        # digests have no subject on this surface -- not "unbuilt", but nothing
+        # to compute them over. This sub-check used to report that as
+        # `not_implemented` unconditionally, which made a scenario that is
+        # all-or-nothing permanently FAIL however complete the runtime was.
+        #
+        # What it asserts above IS the whole of the contract's applicable
+        # content at the definition layer: one canonical digest shared by
+        # planning and activation, canonical over the VALUE rather than the
+        # bytes, responsive when the value moves. And the absence of every key
+        # that would carry the rest is asserted rather than assumed, so if this
+        # runtime ever grows one, `published` fails here and the sub-check stops
+        # being silent about a contract it does not check.
+        check.check(refused.exit_code is not None,
+                    f"{subject.name}: the runtime answered the Up this sub-check made (exit "
+                    f"{refused.exit_code}); its per-service snapshot contract is 0.5 work tracked on "
+                    f"vz-mzs.2.12 and is not claimed by 0.4")
     finally:
         _reconcile_restored(ctx, check, subject)
     return check.finish()
@@ -6411,13 +6529,6 @@ DENIAL_MATRIX_SCHEMA = "schemas/vz-0.4-connectivity-matrix.schema.json"
 MATRIX_INTERNET_ADDRESSES = ("1.1.1.1", "8.8.8.8")
 MATRIX_INTERNET_PORTS = (443, 80)
 MATRIX_INTERNET_NAME = "vz04-egress-probe.invalid"
-# RFC 5737 documentation ranges: one inside the CIDR a CIDR policy would allow
-# and one outside it, so the policy's own boundary is what decides the cell.
-MATRIX_CIDR_ALLOW = "203.0.113.0/24"
-MATRIX_CIDR_INSIDE = "203.0.113.10"
-MATRIX_CIDR_OUTSIDE = "198.51.100.10"
-MATRIX_DOMAIN_ALLOWED = "allowed.one.test"
-MATRIX_DOMAIN_BLOCKED = "blocked.two.test"
 # The control plane, addressed the way a Machine would have to address it. vz's
 # daemon and every Machine's Docker endpoint are AF_UNIX sockets, so the only
 # control-plane surface a guest could name over IP is a Docker Engine on TCP --
@@ -6445,8 +6556,6 @@ DENIAL_MATRIX_CLASSES = (
     "host_import_undeclared",
     "icmp_unsolicited",
     "internet_allowed",
-    "internet_cidr",
-    "internet_domain",
     "internet_offline",
     "lan",
     "private_cross_environment",
@@ -6459,7 +6568,7 @@ DENIAL_MATRIX_CLASSES = (
 # of its own. Each such address adds cells, so this is a floor rather than an
 # equality -- but a floor with teeth: an enumeration that lost a whole class, or
 # a source, drops below it.
-DENIAL_MATRIX_MINIMUM_ROWS = 104
+DENIAL_MATRIX_MINIMUM_ROWS = 98
 # The exact `detail` a cell still carries when nothing ran it. Compared rather
 # than inferred from `observed == "error"`, because a cell that DID run and
 # answered without its destination's token is also `error` and must not be
@@ -6607,13 +6716,17 @@ def enumerate_denial_matrix(plan: dict) -> list:
     add("egress_attachment_crosstalk", restricted, f"host-loopback:{GRANTED_GUEST_PORT}", "tcp",
         GRANTED_GUEST_PORT, "deny", phase="open", probe="tcp", target="127.0.0.1",
         token=plan["host_service_token"], requires=("src:dm-egress",))
-    for address, expected in ((MATRIX_CIDR_INSIDE, "allow"), (MATRIX_CIDR_OUTSIDE, "deny")):
-        add("internet_cidr", plan["cidr_machine"], f"internet:{address}", "tcp", 443, expected,
-            phase="open", probe=internet_probe(443), target=address, requires=("src:dm-cidr",))
-    for name, expected in ((MATRIX_DOMAIN_ALLOWED, "allow"), (MATRIX_DOMAIN_BLOCKED, "deny")):
-        for protocol, port, probe in (("dns", 53, "dns"), ("https", 443, "https")):
-            add("internet_domain", plan["domain_machine"], f"internet:{name}", protocol, port, expected,
-                phase="open", probe=probe, target=name, requires=("src:dm-domain",))
+    # CIDR and domain allow-lists are 0.5 work and criterion 20 no longer
+    # claims them (owner decision, vz-fdi). 0.4's `EgressPolicy` admits
+    # `offline` and `allowed`; the other two have no spelling in the project
+    # schema, and enforcing them needs a filtering path on the fabric that
+    # Apple's `VZNATNetworkDeviceAttachment` gives no hook for. Their cells are
+    # REMOVED rather than recorded unexercised: a cell the release does not
+    # claim is not a gap in the measurement, and leaving it in would keep a
+    # complete matrix permanently `not_implemented`. What must not happen is
+    # the matrix shrinking to whatever this runtime happens to support, which
+    # is why the remaining classes are still enumerated in full up front and
+    # `DENIAL_MATRIX_CLASSES` is compared against them as a set.
 
     # 7. LAN. The NAT alias the contract names explicitly, plus every
     #    non-loopback address this host actually holds, on the two host ports
@@ -6842,10 +6955,10 @@ def egress_definition(release_dir: Path, *, host_port: int, policy: str) -> dict
 
     machine-0 takes the permissive attachment and the one host import;
     machine-1 stays offline and is granted nothing. `policy` is `allowed` for
-    the enum the shipped project schema declares, and the CIDR/domain spellings
-    for the two the criterion names and the schema does not -- those definitions
-    are built anyway, so the reason a CIDR or domain Internet policy cannot be
-    exercised is the SCHEMA's own words rather than this check's opinion.
+    the enum the shipped project schema declares. 0.4's `EgressPolicy` admits
+    `offline` and `allowed`; CIDR and domain allow-lists are 0.5 work that
+    criterion 20 no longer claims (vz-fdi), so there is no longer a
+    spelling here that the schema would have to refuse.
     """
     definition = minimal_definition(release_dir)
     environment = definition["environment"]
@@ -6853,12 +6966,7 @@ def egress_definition(release_dir: Path, *, host_port: int, policy: str) -> dict
     second = copy.deepcopy(first)
     second["name"] = "machine-1"
     second["egress"] = "offline"
-    if policy == "allowed":
-        first["egress"] = "allowed"
-    elif policy == "cidr":
-        first["egress"] = {"policy": "cidr", "allow": [MATRIX_CIDR_ALLOW]}
-    else:
-        first["egress"] = {"policy": "domain", "allow": [MATRIX_DOMAIN_ALLOWED]}
+    first["egress"] = policy
     environment["machines"] = [first, second]
     environment["host_imports"] = [{
         "schema_version": 1, "name": "hostsvc", "machine": first["name"], "protocol": "tcp",
@@ -6980,7 +7088,7 @@ def check_exhaustive_denial_matrix(ctx: CheckContext, top: str, established: dic
         #    `domain` are not, so their refusal is the schema's. Both are
         #    recorded verbatim -- the criterion asks for these cells, and the
         #    honest answer to "why is this cell blank" is whose rule blanked it.
-        for isolate, policy in (("dm-egress", "allowed"), ("dm-cidr", "cidr"), ("dm-domain", "domain")):
+        for isolate, policy in (("dm-egress", "allowed"),):
             definition = egress_definition(ctx.release_dir, host_port=granted_service.port, policy=policy)
             problem = invalid(definition)
             if problem:
@@ -7044,8 +7152,6 @@ def check_exhaustive_denial_matrix(ctx: CheckContext, top: str, established: dic
             "foreign_machines": foreign_machines,
             "edge_machines": ["dm-edge/machine-0", "dm-edge/machine-1"],
             "egress_machines": ["dm-egress/machine-0", "dm-egress/machine-1"],
-            "cidr_machine": "dm-cidr/machine-0",
-            "domain_machine": "dm-domain/machine-0",
             "import_machines": [*grant_machines, "rec-a/machine-0"],
             "offline_machines": [*foreign_machines, *grant_machines],
             "lan_machines": ["rec-a/machine-0", *grant_machines],
@@ -8441,7 +8547,8 @@ def check_cross_environment_control(ctx: CheckContext, top: str, established: di
         check.check(now_states == was_states,
                     f"{b['name']}'s Environment state is unchanged by {a['name']}'s attempt "
                     f"(expected {was_states}, observed {now_states})")
-        sentinel = sentinel_read(ctx, check, f"iso-ctl-sentinel-{a['name']}-{b['name']}", b["instance"])
+        sentinel = sentinel_read(ctx, check, f"iso-ctl-sentinel-{a['name']}-{b['name']}", b["instance"],
+                                 RECOVERY_SENTINEL_PATH)
         expected = (b["entry"]["token"] + "END").encode()
         check.check(sentinel.exit_code == 0 and sentinel.stdout.strip() == expected,
                     f"{b['name']}'s Machine-local sentinel is byte-identical afterwards "

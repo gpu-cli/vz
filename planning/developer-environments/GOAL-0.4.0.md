@@ -261,10 +261,19 @@ required E2E scenario and retained evidence:
 20. **Exhaustive network denial:** a machine-readable
     source×destination×protocol×port matrix records expected and observed results
     for private, public-like, declared and undeclared host imports/exports,
-    offline/allowed/CIDR/domain Internet policy, and LAN/control-plane
-    destinations. Two Machines in one Environment use different egress
-    attachments without policy or host-import cross-talk. Any unexpected success
-    fails the gate.
+    the Internet policies 0.4's `EgressPolicy` can express, and
+    LAN/control-plane destinations. Two Machines in one Environment use
+    different egress attachments without policy or host-import cross-talk. Any
+    unexpected success fails the gate.
+
+    0.4's `EgressPolicy` admits `offline` and `allowed`. CIDR and domain
+    allow-lists are 0.5 work and are NOT claimed here: they have no spelling in
+    [`vz-project-definition-v1`](../../schemas/vz-project-definition-v1.schema.json),
+    and enforcing them needs a filtering path on the fabric that Apple's
+    `VZNATNetworkDeviceAttachment` gives no hook for. The matrix therefore
+    enumerates the policies the release can express, and enumerates them ALL
+    up front: it is still a description of the criterion and never of whatever
+    happens to work on the runtime under test. Tracked on vz-fdi.
 21. **CLI removal:** a checked-in help snapshot lists the five lifecycle verbs.
     Every entry in
     [`legacy-cli-removal.md`](legacy-cli-removal.md) is invoked; each removed
@@ -285,10 +294,15 @@ required E2E scenario and retained evidence:
     recreate, and remove additionally satisfies the exact-generation
     precondition, durable-claim, fail-closed migration, and race/crash contract
     in [`reconcile-generation-fencing.md`](reconcile-generation-fencing.md).
-    Desired planning and activation additionally consume the same immutable,
-    operation-owned effective-input snapshot, canonical service digests, and
-    fail-closed replay/tamper contract in
-    [`reconcile-effective-inputs.md`](reconcile-effective-inputs.md).
+    Desired planning and activation additionally consume one immutable,
+    operation-owned effective-input identity: a single canonical digest, shared
+    by planning and activation, taken over the definition's VALUE rather than
+    its bytes and responsive when that value moves. The per-service digests,
+    reconcile-input manifest and staged-blob tamper/replay rules in
+    [`reconcile-effective-inputs.md`](reconcile-effective-inputs.md) are 0.5
+    work and are NOT claimed by 0.4: that document is written about service
+    replicas, and the 0.4 ProjectDefinition declares no services and no secrets
+    for them to be computed over. Tracked on vz-mzs.2.12.
 23. **Machine forking for parallel worktrees:** a warm Developer Linux Machine
     is forked inside its Environment. The fork holds a distinct identity, its own
     derived fabric address, and its own Docker context, while its parent keeps

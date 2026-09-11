@@ -1466,10 +1466,24 @@ class DefinitionReconciliationFencingTests(unittest.TestCase):
         quoting the runtime.
         """
         subs, established, recorded = self.run_criterion_22("")
-        for slug, sub in sorted(subs.items()):
+        # The three reconcile sub-checks have no subject against a runtime that
+        # refuses every change, and each says so. The fourth does: its clause is
+        # the definition-level effective-input identity, which 0.4 claims and
+        # this stand-in publishes, so it PASSES here. The per-service half of
+        # `reconcile-effective-inputs.md` is 0.5 work the criterion no longer
+        # claims (vz-mzs.2.12); it used to be reported `not_implemented`
+        # unconditionally, which made the scenario permanently FAIL however
+        # complete the runtime became.
+        reconcile_slugs = [slug for slug in sorted(subs) if slug != "effective_input_snapshot_identity"]
+        for slug in reconcile_slugs:
+            sub = subs[slug]
             self.assertTrue(sub.not_implemented, slug)
             self.assertEqual(sub.status, "FAIL", slug)
             self.assertTrue(sub.evidence, slug)
+        inputs = subs["effective_input_snapshot_identity"]
+        self.assertIsNone(inputs.not_implemented, inputs.assertions)
+        self.assertEqual(inputs.status, "PASS", inputs.assertions)
+        self.assertTrue(inputs.evidence)
         # Exactly one clause of the criterion is reported as a failed assertion
         # rather than as an unexercisable contract: this runtime refuses a
         # mutable and an immutable change with one code, so the classification
@@ -1498,10 +1512,15 @@ class DefinitionReconciliationFencingTests(unittest.TestCase):
         for needle in ("no mixed-version topology", "no cross-owner adoption", "no orphaned resources",
                        "stale client replaying request"):
             self.assertTrue(any(needle in text for text in fencing.assertions), (needle, fencing.assertions))
-        inputs = subs["effective_input_snapshot_identity"]
-        self.assertIn("vz-effective-service-input-v1", inputs.not_implemented)
-        self.assertIn("vz-reconcile-input-manifest-v1", inputs.not_implemented)
-        self.assertIn(checks.PROJECT_DEFINITION_SCHEMA, inputs.not_implemented)
+        # The definition-level identity it does claim is proved, and the keys
+        # that would carry the per-service contract are asserted ABSENT rather
+        # than assumed -- so if this runtime ever publishes one, this sub-check
+        # fails instead of staying silent about a contract it does not check.
+        for needle in ("planning and activation name one desired-input identity",
+                       "canonical sha256 digest",
+                       "reserializing the same definition does not change its digest",
+                       "publishes no effective-input snapshot identity"):
+            self.assertTrue(any(needle in text for text in inputs.assertions), (needle, inputs.assertions))
         # Nothing here may consume a lifecycle generation: post-wake compares
         # against exactly the value pre-sleep recorded.
         self.assertEqual([entry["lifecycle_generation"] for entry in established["environments"]],
@@ -1528,9 +1547,19 @@ class DefinitionReconciliationFencingTests(unittest.TestCase):
                             for text in refusal.assertions), refusal.assertions)
         self.assertTrue(any("an accepted reconcile persisted the definition it planned from" in text
                             for text in subs["definition_change_plan_determinism"].assertions))
-        # The effective-input snapshot is still unimplemented even here: the
-        # definition declares no services to digest.
-        self.assertTrue(subs["effective_input_snapshot_identity"].not_implemented)
+        # And the fourth passes too, so a reconciling runtime takes the whole
+        # scenario. Its clause is the DEFINITION-level effective-input identity
+        # -- one canonical digest shared by planning and activation, over the
+        # value rather than the bytes, responsive when the value moves. The
+        # per-service digests of `reconcile-effective-inputs.md` are 0.5 work
+        # the criterion no longer claims (vz-mzs.2.12), and their absence from
+        # every public interface is still asserted rather than assumed.
+        inputs = subs["effective_input_snapshot_identity"]
+        self.assertFalse(inputs.failures, inputs.failures)
+        self.assertIsNone(inputs.not_implemented, inputs.not_implemented)
+        self.assertEqual(inputs.status, "PASS", inputs.assertions)
+        self.assertTrue(any("publishes no effective-input snapshot identity" in text
+                            for text in inputs.assertions), inputs.assertions)
         # A runtime that accepts changes needs its Environments reconciled back
         # and pre-sleep's record refreshed, or post-wake compares against a
         # generation this criterion consumed.
@@ -1597,6 +1626,20 @@ class DefinitionReconciliationFencingTests(unittest.TestCase):
         self.assertTrue(any("the refused pair consumed no lifecycle generation" in text
                             for text in subs["concurrent_stale_reconcile_fail_closed"].failures),
                         subs["concurrent_stale_reconcile_fail_closed"].failures)
+
+    def test_a_pair_that_leaves_the_environment_between_versions_is_caught(self):
+        """The concurrency clause is graded on the STATE, so it must be able to fail.
+
+        `ctx.release` signals the held CLI, not the daemon's supervisor, so an
+        interrupted client legitimately leaves a CONVERGED Environment behind --
+        which is why grading the pair on its two exit codes made the criterion's
+        own "interrupted reconciliation" case impossible to pass. Grading on the
+        state instead is only worth anything if a bad state fails it: this
+        runtime accepts the change into the project but leaves the Environment
+        naming the digest it had before, and the clause has to notice.
+        """
+        self.assert_falsified("recon_half_reconciles", "concurrent_stale_reconcile_fail_closed",
+                              "left ONE definition version")
 
     def test_a_silently_replaced_machine_incarnation_is_mixed_version_topology(self):
         self.assert_falsified("recon_bumps_incarnation", "concurrent_stale_reconcile_fail_closed",

@@ -68,6 +68,24 @@ MODE_FILE=__MODE_FILE__
 SNAPSHOT_FILE=__SNAPSHOT_FILE__
 mode=""
 [ -f "$MODE_FILE" ] && mode=$(cat "$MODE_FILE")
+# Has `establish_recovery_environments` written its sentinel yet?
+#
+# This ARMS criterion 8's cross_environment_read leak, which must not fire until
+# after the three Environments are established -- the leak falsifies the read
+# denial, and firing it earlier would break the precondition that creates the
+# Environments to hold apart. The check decides where the sentinel lives:
+# criterion 11 uses the `/run` ramdisk (rewritten to $VZ_RUNTIME_DATA_DIR/sentinel
+# below), criterion 10 uses a DECLARED VOLUME because a ramdisk cannot survive
+# the stop/up its clause performs. Testing only the first path silently
+# disarmed the leak when the sentinel moved, and four fault-injection tests
+# started passing a runtime that leaks -- which is why this asks about both.
+sentinel_written() {
+  [ -f "$VZ_RUNTIME_DATA_DIR/sentinel" ] && return 0
+  for __s in "$VZ_RUNTIME_DATA_DIR"/guest/*/vz-storage/recovery/sentinel; do
+    [ -f "$__s" ] && return 0
+  done
+  return 1
+}
 reject() {
   if [ "$2" = root ]; then mig='__ROOT_MIGRATION__'; else mig='__FLAG_MIGRATION__'; fi
   printf '{"error":{"code":"legacy_command_removed","command":"%s","message":"`vz %s` was removed from the 0.4 public CLI","migration":"%s","typed_api_migration":"__TYPED__"}}\n' "$1" "$1" "$mig" >&2
@@ -407,7 +425,7 @@ if [ -n "$verb" ]; then
     # that a status names its OWN definition can fail as well as pass. Armed by
     # the same sentinel gate as the leaked Environment objects below.
     dpath="$PWD"
-    if [ "$mode" = cross_environment_read ] && [ -f "$VZ_RUNTIME_DATA_DIR/sentinel" ]; then
+    if [ "$mode" = cross_environment_read ] && sentinel_written; then
       for other in "$(dirname "$VZ_RUNTIME_DATA_DIR")"/*/topology.json; do
         [ -f "$other" ] || continue
         [ "$other" = "$topology" ] && continue
@@ -492,7 +510,7 @@ if [ -n "$verb" ]; then
     # `establish_recovery_environments` writes AFTER it has read this status,
     # so the leak falsifies criterion 8's read denial without breaking the
     # precondition that establishes the three Environments to hold apart.
-    if [ "$mode" = cross_environment_read ] && [ -f "$VZ_RUNTIME_DATA_DIR/sentinel" ]; then
+    if [ "$mode" = cross_environment_read ] && sentinel_written; then
       for other in "$(dirname "$VZ_RUNTIME_DATA_DIR")"/*/topology.json; do
         [ -f "$other" ] || continue
         [ "$other" = "$topology" ] && continue
@@ -1707,7 +1725,8 @@ RECONCILE_MODES = ("", "recon_reconciles", "recon_identity_drift", "recon_nondet
                    "recon_accepts_stale_replay", "recon_orphan", "recon_cross_owner",
                    "recon_consumes_generation", "recon_bumps_incarnation", "recon_accepts_immutable",
                    "recon_activation_digest_differs", "recon_digest_ignores_value",
-                   "recon_digest_over_bytes", "recon_publishes_snapshot_keys")
+                   "recon_digest_over_bytes", "recon_publishes_snapshot_keys",
+                   "recon_half_reconciles")
 
 RECONCILE_VZ = r'''#!/usr/bin/python3
 """UNIT-TEST-ONLY stand-in for `vz`: the definition-digest surface only."""
@@ -1851,6 +1870,8 @@ def status_document(state, raw, definition):
     # What activation was admitted under. `recon_activation_digest_differs`
     # makes it a digest planning never recorded.
     activation = "sha256:" + "a" * 64 if mode() == "recon_activation_digest_differs" else persisted
+    if mode() == "recon_half_reconciles" and state.get("stale_activation"):
+        activation = state["stale_activation"]
     document = {
         "schema_version": 1, "request_id": "req-" + uuid.uuid4().hex[:12],
         "topology_state_source": "persisted", "definition_path": os.path.join(os.getcwd(), "vz.json"),
@@ -1969,6 +1990,20 @@ def run_up(argv):
         # A change to a field the persisted instance is compared against,
         # applied in place instead of refused.
         return accept(state, desired, request_id, key, raw, definition, attempt)
+    if mode() == "recon_half_reconciles":
+        # Accepts like `recon_reconciles`, but pins the Environment's activation
+        # digest to the value it had BEFORE the change. The project then reports
+        # the new definition while the Environment still names the old one:
+        # exactly the between-versions state a concurrent pair may not leave,
+        # and the one the concurrency sub-check's state grading exists to catch.
+        if only_resources_changed(state["definition"], definition):
+            state["stale_activation"] = persisted
+            return accept(state, desired, request_id, key, raw, definition, attempt)
+        return refuse("immutable_field_change",
+                      "Machine `%s` target differs and cannot be reconciled in place; "
+                      "persisted digest=%s, requested digest=%s"
+                      % (definition["environment"]["machines"][0]["name"], persisted, desired),
+                      request_id, key)
     if mode() == "recon_reconciles":
         if only_resources_changed(state["definition"], definition):
             return accept(state, desired, request_id, key, raw, definition, attempt)
