@@ -127,7 +127,13 @@ warn() {
 append_unique() {
     local value="$1"
     local existing
-    for existing in "${RESOLVED_SUITES[@]}"; do
+    # `${RESOLVED_SUITES[@]:+...}` because macOS ships bash 3.2, where expanding
+    # an EMPTY array under `set -u` is an unbound-variable error rather than the
+    # empty list every later bash produces. The first call always has an empty
+    # array, so the lane died at its first suite with
+    #   run-sandbox-vm-e2e.sh: line 127: RESOLVED_SUITES[@]: unbound variable
+    # and the gate recorded it as `input_rejected` with exit 0.
+    for existing in ${RESOLVED_SUITES[@]:+"${RESOLVED_SUITES[@]}"}; do
         if [[ "$existing" == "$value" ]]; then
             return
         fi

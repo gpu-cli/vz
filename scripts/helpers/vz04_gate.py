@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 
+import developer_environment_recorder as recorder
 import vz04_candidate as candidate
 import vz04_contract as contract_module
 import vz04_host as host
@@ -248,6 +249,24 @@ def run(args) -> int:
     receipts = Receipts(root / "prerequisites", run_id)
     env = lanes.minimal_env(lanes.LaneContext(run_id=run_id, release_dir=release["dir"], release_dir_sha256="", state_root=state_root,
                                               contract_path="", contract_sha256="", candidate_tuple_sha256="", fixture_sha256="", clients=clients))
+    # The prerequisites are HOST toolchain invocations, not lane work, and they
+    # get a SHORT temp root rather than the lane one.
+    #
+    # `minimal_env` redirects TMPDIR into the run's state root so nothing a lane
+    # creates escapes into shared temp. That root is deep, and the workspace's
+    # own unit tests bind AF_UNIX sockets under TMPDIR -- which macOS caps at
+    # ~104 bytes, the same bound `recorder.socket_root_for` exists to respect:
+    #   start test runtimed daemon: ControlSocketAdmission { path:
+    #   ".../vz04-gate-<id>/tmp/.tmpXXXX/.vz-runtime/runtimed.sock",
+    #   PermissionDenied, "control socket or private stage exceeds native
+    #   socket path bound" }
+    # so `cargo nextest` failed in the hundreds before a lane ever ran. Derived
+    # from the state root, not random, so one run's prerequisites always address
+    # one root and two runs never share one.
+    prerequisite_temp = recorder.socket_root_for(state_root).with_name(
+        recorder.socket_root_for(state_root).name + "-pre")
+    prerequisite_temp.mkdir(mode=0o700, parents=True, exist_ok=True)
+    env["TMPDIR"] = str(prerequisite_temp)
     prerequisite_status = "passed"
     for label, argv, timeout in PREREQUISITES:
         if args.dry_lanes:

@@ -192,8 +192,20 @@ def translate_sandbox_summary(lane_name, phase, ctx, entry_point, run_dir: Path,
 
 
 def minimal_env(ctx: LaneContext) -> dict:
+    # TMPDIR is redirected into the run's own state root so nothing a lane
+    # creates escapes into the host's shared temp. It has to EXIST before a
+    # child is handed it: the gate's prerequisite builds run under this
+    # environment too, and anything that reaches for a temp file early fails
+    # with a bare errno that names neither the gate nor the directory. sccache,
+    # configured as a global `rustc-wrapper` in a developer's ~/.cargo/config.toml,
+    # does exactly that and took down `cargo nextest --all-features`:
+    #   sccache: error: Failed to create temp dir
+    #   caused by: No such file or directory (os error 2) at path ".../tmp/sccacheXXXXXX"
+    #   error: could not compile `libc` (lib)
+    temp_root = ctx.state_root / "tmp"
+    temp_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin", "HOME": os.environ.get("HOME", "/"),
-           "TMPDIR": str(ctx.state_root / "tmp"), "LANG": "C.UTF-8", "VZ04_RUN_ID": ctx.run_id,
+           "TMPDIR": str(temp_root), "LANG": "C.UTF-8", "VZ04_RUN_ID": ctx.run_id,
            "VZ_DOCKER_CONFIG": str(ctx.state_root / DOCKER_CONFIG_DIRNAME)}
     if ctx.linux_docker_context:
         env["LINUX_DOCKER_CONTEXT"] = ctx.linux_docker_context
