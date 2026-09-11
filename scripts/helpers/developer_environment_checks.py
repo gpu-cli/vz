@@ -6990,8 +6990,25 @@ def check_exhaustive_denial_matrix(ctx: CheckContext, top: str, established: dic
             attempt = attempt_up(ctx, check, isolate, definition, timeout=DELETE_TIMEOUT)
             instances[isolate] = attempt
             if attempt["exit_code"] != 0 or attempt["status"] is None:
-                refuse(f"this runtime refuses a Machine with a {policy} egress attachment: " +
-                       (attempt["message"] or "vz up failed without naming a reason")[:220], "src:" + isolate)
+                # Say WHICH kind of failure, because the two mean opposite
+                # things to a reader of this matrix. A policy refusal is a
+                # statement about the runtime's egress support. A VM that
+                # could not start is a statement about this host at this
+                # moment -- usually its virtual-machine budget, which every
+                # other Environment in the phase is also drawing on.
+                #
+                # Observed reporting the second as the first: `src:dm-egress`
+                # unexercised with "this runtime refuses a Machine with a
+                # allowed egress attachment: ... failed to start VM: Internal
+                # Virtualization error (VZErrorDomain:1)", which would tell
+                # the next reader that egress is still refused when it is not.
+                message = attempt["message"] or "vz up failed without naming a reason"
+                blamed = ("this host could not start the VM for a Machine with a "
+                          f"{policy} egress attachment, so the policy was never exercised; "
+                          "this is a host/resource fact and says nothing about egress support"
+                          if "VZErrorDomain" in message or "failed to start VM" in message else
+                          f"this runtime refuses a Machine with a {policy} egress attachment")
+                refuse(blamed + ": " + message[:220], "src:" + isolate)
             else:
                 provisioned.append(isolate)
 
