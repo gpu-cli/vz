@@ -2004,9 +2004,16 @@ def establish_recovery_environments(ctx: CheckContext, names: tuple) -> tuple:
         # for, and a name all three share cannot distinguish "A resolved B's"
         # from "A resolved its own".
         base["environment"]["endpoints"] = [
+            # `https`, not `tcp`. The Environment edge terminates https ingress
+            # only, and the runtime refuses an endpoint on a public-like network
+            # that has no edge listener to be published behind:
+            #   endpoint `probe` is on public-like network `backend` with
+            #   protocol Tcp; the Environment edge terminates `https` ingress
+            #   only, so this endpoint has no edge listener to be published
+            #   behind
             {"schema_version": 1, "name": "probe",
              "machine": base["environment"]["machines"][0]["name"],
-             "network": PRIVATE_NETWORK, "protocol": "tcp", "port": PRIVATE_PORT,
+             "network": PRIVATE_NETWORK, "protocol": "https", "port": PRIVATE_PORT,
              "hostname": None}]
         # And one declared BLOCK VOLUME, which is where the sentinel goes.
         #
@@ -2075,10 +2082,6 @@ RECOVERY_UNEXERCISED = (
     # recovery Environments now declare a singly-attached writable block volume
     # whose mount is where the sentinel lives -- so "declared state survived
     # stop/up" IS the declared-volume claim, measured rather than deferred.
-    "DNS reconstruction (the check does not yet re-resolve an Environment-local "
-    "name across stop/up; `vz.dns` split DNS and criterion 6's FabricGateway both exist now, "
-    "so this clause is exercisable and only wants a public-like recovery Environment -- the "
-    "same fixture criterion 8's resolve clause needs, vz-jbo)",
     "daemon, adapter and guest crash recovery (no crash injection exists in this lane)",
     "manifest recovery deadlines (the contract pins none for this lane)",
 )
@@ -2171,6 +2174,23 @@ def check_lifecycle_recovery(ctx: CheckContext, top: str, established: dict) -> 
         row = sentinel_read(ctx, check, "wake-" + name + "-after", instance, RECOVERY_SENTINEL_PATH)
         check.check(row.exit_code == 0 and row.stdout.strip() == (entry["token"] + "END").encode(),
                     f"{name}: declared state survived stop/up (observed {row.stdout[:60]!r})")
+        # DNS RECONSTRUCTION, which criterion 10 names alongside routes, sockets
+        # and port state. The Environment declares a public-like network, so its
+        # Machine is handed `vz.dns` for an Environment-local resolver; after a
+        # deliberate stop/up that resolver has to be rebuilt and still answer the
+        # name this Environment declared. Asserted against the NAME and not
+        # against "a resolver exists", so a Machine that came back with an empty
+        # resolver fails here -- the same vacuity criterion 8's resolve control
+        # guards against.
+        hostname = entry.get("hostname")
+        if hostname:
+            resolved = machine_exec(ctx, check, "wake-" + name + "-after-resolve", instance,
+                                    entry["machines"][0]["name"],
+                                    f'/bin/busybox nslookup {hostname} 2>&1; printf ":%s" $?')
+            text = resolved.stdout.decode("utf-8", "replace")
+            check.check(text.rstrip().endswith(":0"),
+                        f"{name}: the Environment-local resolver was reconstructed across stop/up and still "
+                        f"answers the name it declared, {hostname!r} (observed {text.rstrip()[-40:]!r})")
     if check.status == "PASS":
         check.not_implemented = ("criterion 10 also claims " + "; ".join(RECOVERY_UNEXERCISED) +
                                  ". The recovery of Environment and Machine identity, Docker context, "
@@ -4937,10 +4957,12 @@ DIGEST_SPELLING = re.compile(r"^sha256:[0-9a-f]{64}$")
 ERROR_CODE_SPELLING = re.compile(r"^[a-z][a-z0-9_]*$")
 RECONCILE_UP_TIMEOUT = UP_TIMEOUT
 RECONCILE_STATUS_TIMEOUT = 60
-# How many times the reconcile-back may be re-offered while the daemon is still
-# finishing an Up this sub-check itself admitted. Bounded and small: this waits
-# out a known in-flight operation, and is not a retry loop around a flaky one.
-RECONCILE_RECONVERGE_ATTEMPTS = 3
+# The Environment states that mean an operation is still in flight, and the
+# budget for one to finish. `reconciling` is what an Up whose client was
+# signalled leaves behind while the daemon's supervisor finishes it.
+RECONCILE_TRANSITIONAL_STATES = ("creating", "reconciling", "deleting")
+RECONCILE_SETTLE_TIMEOUT = 300
+RECONCILE_SETTLE_POLL = 5
 # Removed from a plan value by name before two runs are compared: everything
 # that identifies THIS invocation rather than the plan it announced. A lifecycle
 # `generation` is excluded because a second accepted Up legitimately consumes the
@@ -5259,6 +5281,28 @@ def _reconcile_without_generation(identity):
     return stripped
 
 
+def reconcile_settle(ctx: CheckContext, check: SubCheck, subject: "ReconcileSubject") -> str:
+    """Poll until this Environment leaves a transitional state; return the last seen.
+
+    Waiting on the runtime's own published condition rather than on a clock:
+    `state` is `reconciling` for exactly as long as a supervisor still owns the
+    Environment, and an Up offered before then is refused for a reason that says
+    so. The caller asserts on the Up, not on this, so an Environment that never
+    settles produces a named state in that assertion instead of a bare timeout.
+    """
+    deadline = time.monotonic() + RECONCILE_SETTLE_TIMEOUT
+    state = "unknown"
+    while time.monotonic() < deadline:
+        payload = reconcile_status(ctx, check, subject.name + "-recon-settle", subject.instance)
+        if payload is None:
+            return state
+        state = str(((payload.get("environments") or [{}])[0]).get("state"))
+        if state not in RECONCILE_TRANSITIONAL_STATES:
+            return state
+        time.sleep(RECONCILE_SETTLE_POLL)
+    return state
+
+
 def _reconcile_restored(ctx: CheckContext, check: SubCheck, subject: "ReconcileSubject") -> None:
     """Put the definition back and prove pre-sleep's record still describes reality.
 
@@ -5291,20 +5335,26 @@ def _reconcile_restored(ctx: CheckContext, check: SubCheck, subject: "ReconcileS
         # reconcile. Waiting on that condition rather than on a clock: retry
         # only while the refusal is exactly that one, bounded, so any other
         # refusal fails on the first attempt with its own reason.
-        again = None
-        for attempt in range(RECONCILE_RECONVERGE_ATTEMPTS):
-            again = ctx.run(check, f"{subject.name}-recon-reconverge-{attempt}", ["--json", "up"],
-                            cwd=subject.project, env=subject.env, timeout=RECONCILE_UP_TIMEOUT)
-            if again.exit_code == 0:
-                break
-            error = reconcile_error(again) or {}
-            if error.get("code") != "timeout" or "retains in-flight effects" not in str(error.get("message") or ""):
-                break
-        check.check(again is not None and again.exit_code == 0,
+        # Wait for the CONDITION, not for a number of tries. An Up this
+        # sub-check already admitted may still be in flight -- a signalled CLI
+        # does not stop the daemon's supervisor, which keeps ownership and
+        # refuses to be driven twice:
+        #
+        #   timeout: Up deadline elapsed; original supervisor retains in-flight
+        #   effects and ownership; this receipt does not prove quiescence
+        #
+        # which is the runtime answering correctly. The Environment publishes
+        # exactly the state that says so, so this polls for it to leave
+        # `reconciling` rather than re-offering the Up and hoping. A settle
+        # that never happens fails below naming the state it was stuck in,
+        # which is a finding rather than a flake.
+        settled = reconcile_settle(ctx, check, subject)
+        again = ctx.run(check, f"{subject.name}-recon-reconverge", ["--json", "up"], cwd=subject.project,
+                        env=subject.env, timeout=RECONCILE_UP_TIMEOUT)
+        check.check(again.exit_code == 0,
                     f"{subject.name}: this runtime accepted the change, so the Environment is reconciled back to "
-                    f"the definition pre-sleep recorded (exit {None if again is None else again.exit_code}, "
-                    f"expected 0, after at most {RECONCILE_RECONVERGE_ATTEMPTS} attempt(s) while an Up this "
-                    f"sub-check admitted was still in flight)")
+                    f"the definition pre-sleep recorded (exit {again.exit_code}, expected 0; the Environment "
+                    f"settled at {settled!r} before this Up was offered)")
         restored = reconcile_status(ctx, check, subject.name + "-recon-reconverged", subject.instance)
     identity = reconcile_identity(restored) if restored is not None else None
     comparable = (_reconcile_without_generation(identity), _reconcile_without_generation(subject.identity))
