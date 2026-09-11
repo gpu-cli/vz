@@ -6,7 +6,7 @@
   "normative_source": "planning/developer-environments/GOAL-0.4.0.md#versioned-gate-inputs",
   "source_head": "05cf2d662c9f64d1738dd4f5ca8c98ef1a5e72f5",
   "status_definitions": {
-    "ACTIVE": "Shipped in the published target release AND retained installed evidence exists for the exact host×target×profile pair. Requires non-empty evidence.",
+    "ACTIVE": "Shipped in the published target release AND retained installed evidence exists for the exact host\u00d7target\u00d7profile pair. Requires non-empty evidence.",
     "DEV": "Implemented and demonstrated by an installed local-Mac slice that is not release certified. Requires non-empty evidence.",
     "PLANNED": "Committed direction with no negotiation path. Requires empty negotiated_by, rejected_by and evidence.",
     "NA": "Explicitly rejected by validation as an unsupported pairing or declaration. Requires non-empty rejected_by."
@@ -227,11 +227,29 @@
           ]
         },
         "posix_pty": {
-          "status": "PLANNED",
-          "negotiated_by": [],
+          "status": "DEV",
+          "negotiated_by": [
+            "crates/vz-runtimed/src/environment_up/readiness.rs:159-163"
+          ],
           "rejected_by": [],
-          "evidence": [],
-          "note": "Linux readiness measures only posix_exec plus Docker capabilities; terminal exec requires posix_pty (crates/vz-runtimed/src/machine_exec.rs:364-377) so `vz exec --tty` against a Linux Machine is not negotiable today. Docker container TTY in the lifecycle lane goes through the Machine's private Engine, not Machine PTY exec."
+          "evidence": [
+            {
+              "lane": "installed-local-mac",
+              "suite": "pty-readiness",
+              "run_id": "vz-0.4.0-rc27/pty-probe",
+              "outcome": "passed_dev_installed_local_slice_not_release_certified",
+              "result_path": "planning/developer-environments/linux-pty-dev-evidence.json",
+              "result_sha256": "bcd38e2a64b2cbcbf51b27d0dab1086c7847208891025b4de1daa2e37c484c0f",
+              "checksums_sha256": null,
+              "release_certified": false,
+              "source_head": "06b5aa51",
+              "checks_cited": [
+                "negotiated_capabilities contains posix_pty after readiness",
+                "vz exec --tty from a pipe returns exit 0 and the PTY sentinel"
+              ]
+            }
+          ],
+          "note": "Linux readiness now MEASURES a PTY exec rather than assuming none: `test -t 0 && test -t 1` plus a sentinel, the same claim native macOS readiness makes. The guest agent implemented `exec_pty` for the supervised Machine path all along; what was missing was the measurement, so the capability was never negotiated and `vz exec --tty` was refused. A Machine whose PTY does not answer simply does not negotiate it and still boots."
         },
         "signals": {
           "status": "PLANNED",
@@ -735,11 +753,29 @@
           "note": "Only the native-evidence Linux Hardened regression check is retained; the Docker lanes install the container profile in installed-catalog.json but their topology.json uses developer Machines."
         },
         "posix_pty": {
-          "status": "PLANNED",
-          "negotiated_by": [],
+          "status": "DEV",
+          "negotiated_by": [
+            "crates/vz-runtimed/src/environment_up/readiness.rs:159-163"
+          ],
           "rejected_by": [],
-          "evidence": [],
-          "note": "Same gap as the developer profile: no Linux PTY readiness measurement."
+          "evidence": [
+            {
+              "lane": "installed-local-mac",
+              "suite": "pty-readiness",
+              "run_id": "vz-0.4.0-rc27/pty-probe",
+              "outcome": "passed_dev_installed_local_slice_not_release_certified",
+              "result_path": "planning/developer-environments/linux-pty-dev-evidence.json",
+              "result_sha256": "bcd38e2a64b2cbcbf51b27d0dab1086c7847208891025b4de1daa2e37c484c0f",
+              "checksums_sha256": null,
+              "release_certified": false,
+              "source_head": "06b5aa51",
+              "checks_cited": [
+                "negotiated_capabilities contains posix_pty after readiness",
+                "vz exec --tty from a pipe returns exit 0 and the PTY sentinel"
+              ]
+            }
+          ],
+          "note": "Linux readiness now MEASURES a PTY exec rather than assuming none: `test -t 0 && test -t 1` plus a sentinel, the same claim native macOS readiness makes. The guest agent implemented `exec_pty` for the supervised Machine path all along; what was missing was the measurement, so the capability was never negotiated and `vz exec --tty` was refused. A Machine whose PTY does not answer simply does not negotiate it and still boots."
         },
         "signals": {
           "status": "PLANNED",
@@ -1641,7 +1677,7 @@
       "profile": "developer",
       "pair_status": "NA",
       "backend": null,
-      "note": "Not a supported pairing; the product contract marks macOS host × Windows target N/A.",
+      "note": "Not a supported pairing; the product contract marks macOS host \u00d7 Windows target N/A.",
       "negotiated_by": [],
       "rejected_by": [
         "crates/vz-runtime-contract/src/types/topology.rs:4189-4200"
@@ -1937,7 +1973,7 @@
       "profile": "hardened",
       "pair_status": "NA",
       "backend": null,
-      "note": "Not a supported pairing; the product contract marks macOS host × Windows target N/A.",
+      "note": "Not a supported pairing; the product contract marks macOS host \u00d7 Windows target N/A.",
       "negotiated_by": [],
       "rejected_by": [
         "crates/vz-runtime-contract/src/types/topology.rs:4189-4200",

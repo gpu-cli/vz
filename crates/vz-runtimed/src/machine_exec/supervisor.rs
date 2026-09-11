@@ -303,6 +303,9 @@ async fn run(
     };
     let mut stdin_closed = false;
     let mut control_sequence = 1;
+    // Set by a control the guest refused; see the control arm below for why it
+    // is not `reason` itself.
+    let mut control_failure: Option<String> = None;
     let mut reason = emit_live(
         sender,
         scope,
@@ -332,7 +335,26 @@ async fn run(
                         MachineExecControl::Cancel=>{reason=Some("client requested execution cancellation".into());Ok(())},
                     }
                 }).await;
-                match result {Ok(Ok(()))=>{},Ok(Err(error))=>reason=Some(format!("guest control failed: {error}")),Err(_)=>reason=Some("guest control timed out".into())}
+                // A control that fails is REMEMBERED, not fatal on its own.
+                //
+                // `while reason.is_none()` means setting it here leaves the
+                // loop before the guest's terminal exit can be read -- so an
+                // execution that ran, produced its output and exited cleanly
+                // was reported as a failure because a control landed after the
+                // process was gone. Measured on a PTY exec: the guest answered
+                // `PTY-OK`, and `--no-stdin`'s EOF then raced the exit and came
+                // back `NotFound: process 12 not found`, turning a successful
+                // run into exit 5.
+                //
+                // The terminal exit is the authority on what happened. A
+                // control error only becomes the verdict if no exit follows,
+                // and then it is appended to whatever ended the loop so the
+                // reader still sees it.
+                match result {
+                    Ok(Ok(()))=>{},
+                    Ok(Err(error))=>{control_failure.get_or_insert(format!("guest control failed: {error}"));},
+                    Err(_)=>{control_failure.get_or_insert_with(|| "guest control timed out".into());},
+                }
             },
             event=stream.next_checked()=>match event {
                 Ok(Some(MachineExecOutputEvent::Exit(code))) if (0..=255).contains(&code)=>return (Proof::Reaped(code),None),
@@ -342,6 +364,16 @@ async fn run(
                 Err(error)=>reason=Some(format!("guest stream failed: {error}")),
             },
         }
+    }
+    // A control the guest refused matters only now, when no terminal exit came
+    // to overrule it: the loop above returns straight out on `Exit`, so
+    // reaching here means the execution ended some other way and the reader
+    // should see both halves.
+    if let Some(control) = control_failure {
+        reason = Some(match reason {
+            Some(ended) => format!("{ended}; and earlier: {control}"),
+            None => control,
+        });
     }
     // Dropping observation is never itself terminal proof. Cancellation targets
     // the exact addressable guest process, then reconciliation fences its ticket.

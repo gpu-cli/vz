@@ -57,10 +57,14 @@ macOS Developer Machines on Apple-silicon macOS are
 <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->**DEV**: all five verbs work against installed local-Mac builds,
 but no 0.4 release is published and nothing is release certified. Private
 Docker, Compose and buildx for Linux Developer Machines are
-<!-- capability-matrix: macos-arm64/linux/developer docker_engine,compose,buildx -->**DEV**. Linux Machine PTY, declared
-networks, endpoints and workspace projections are
-<!-- capability-matrix: macos-arm64/linux/* posix_pty,network_private,endpoint,workspace_read_write -->**PLANNED**;
-Up rejects definitions that declare them. Linux and Windows hosts are
+<!-- capability-matrix: macos-arm64/linux/developer docker_engine,compose,buildx -->**DEV**, and so is Linux
+Machine PTY
+(<!-- capability-matrix: macos-arm64/linux/* posix_pty -->**DEV**), negotiated
+from a readiness probe rather than assumed. Declared networks, endpoints and
+workspace projections are still recorded
+<!-- capability-matrix: macos-arm64/linux/* network_private,endpoint,workspace_read_write -->**PLANNED** in the
+matrix, though Up now admits and serves all three -- the matrix rows are stale
+rather than the behaviour absent, and need evidence before they move. Linux and Windows hosts are
 <!-- capability-matrix: linux-*/linux/*,windows-*/linux/* pair -->**PLANNED**. Treat installed
 evidence as a development slice, not certification, and record which
 host×Machine-target pair a result covers.

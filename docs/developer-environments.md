@@ -203,12 +203,14 @@ silently converts a Hardened/generic record into Developer.
 
 Every supported Machine provides target-native execution, streaming stdin and
 stdout/stderr, PTY where negotiated, cancellation, exit status, inspectable
-state, and lifecycle behavior. Today `posix_pty` is negotiated only by native
-macOS Machines
-(<!-- capability-matrix: macos-arm64/macos/developer posix_pty -->**DEV**);
-Linux Machines negotiate `posix_exec` without a PTY, so `vz exec -t` against a
-Linux Machine is
-<!-- capability-matrix: macos-arm64/linux/* posix_pty -->**PLANNED**.
+state, and lifecycle behavior. `posix_pty` is negotiated by native macOS
+Machines
+(<!-- capability-matrix: macos-arm64/macos/developer posix_pty -->**DEV**)
+and by Linux Machines
+(<!-- capability-matrix: macos-arm64/linux/* posix_pty -->**DEV**). Neither is
+assumed: readiness runs a PTY probe on the Machine and negotiates the
+capability only when the guest answers on a real terminal, so a Machine whose
+PTY does not answer boots without it and `vz exec -t` is refused by name.
 Unsupported host/Machine-target pairs or capabilities
 fail explicitly and never substitute another Machine or target. The runtime
 reads `config/host-target-capabilities-v0.4.json` to decide this: a Machine

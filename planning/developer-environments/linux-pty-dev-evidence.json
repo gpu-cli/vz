@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "kind": "vz-0.4-linux-pty-dev-evidence",
+  "candidate": "0.4.0-rc27",
+  "release_dir": "/private/tmp/vz-pty-rc27-1789098805",
+  "source_head": "06b5aa51",
+  "host": "Apple silicon macOS 26.3.1",
+  "pair": "macos-arm64 host x linux aarch64 target",
+  "profiles": [
+    "developer",
+    "hardened"
+  ],
+  "release_certified": false,
+  "what_was_measured": [
+    "A Developer Linux Machine declaring requested_capabilities [posix_exec, posix_pty] reached ready and reported negotiated_capabilities ['posix_exec','posix_pty','docker_engine','compose','buildx'].",
+    " returned exit 0 with stdout PTY-OK and empty stderr, from a caller whose own stdin and stdout are pipes.",
+    " is true only on a real terminal, so the sentinel proves the command ran on a PTY the guest allocated and that its bytes came back through it."
+  ],
+  "negotiated_by": "crates/vz-runtimed/src/environment_up/readiness.rs:measure_posix_pty",
+  "notes": [
+    "The guest agent implemented exec_pty for the supervised Machine path before this; what was missing was any readiness measurement, so the capability was never negotiated and every  against a Linux Machine was refused with unsupported_operation.",
+    "A Machine whose PTY does not answer does not negotiate the capability and still boots; the probe is not a readiness failure.",
+    "DEV rather than ACTIVE: this is an installed local-Mac slice, not release-certified evidence."
+  ]
+}

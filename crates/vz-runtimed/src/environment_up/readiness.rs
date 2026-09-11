@@ -6,6 +6,15 @@ use crate::machine_docker_host::HostDockerClient;
 use crate::machine_docker_runtime_inventory::VerifiedMachineRuntimeInventory;
 use std::path::Path;
 
+/// The PTY readiness probe's own budget and window.
+///
+/// Short, because this runs inside the Up deadline and a Machine that cannot
+/// answer on a terminal in this long will not answer at all. The window is the
+/// classic 24x80: nothing reads it, but a zero dimension is refused upstream.
+const POSIX_PTY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const POSIX_PTY_PROBE_ROWS: u32 = 24;
+const POSIX_PTY_PROBE_COLUMNS: u32 = 80;
+
 /// Await the owned probe even after expiry, then refuse late readiness. A
 /// timeout must never abandon the future that still owns its guest effects.
 pub(super) async fn await_readiness<T>(
@@ -22,6 +31,62 @@ pub(super) async fn await_readiness<T>(
         ));
     }
     Ok(value)
+}
+
+/// Whether this Machine's guest can run a command on a real PTY.
+///
+/// `Ok(false)` means the guest answered and the answer was no; the Machine
+/// boots without the capability. `Err` is reserved for a transport failure,
+/// where we learned nothing and must not publish readiness on a guess.
+async fn measure_posix_pty(
+    activation: &Arc<MachineRuntimeActivation>,
+    metadata: &RequestMetadata,
+) -> Result<bool, MachineError> {
+    let lease = activation.execution_lease();
+    let ticket = match lease.prepare_machine_exec_request().await {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            return Err(failure(
+                metadata,
+                MachineErrorCode::BackendUnavailable,
+                format!("PTY readiness could not obtain an execution ticket: {error}"),
+            ));
+        }
+    };
+    let deadline = tokio::time::Instant::now() + POSIX_PTY_PROBE_TIMEOUT;
+    let started = lease
+        .start_machine_exec(
+            vz_linux::ContainerExecDispatchGate::new(deadline),
+            ticket,
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                "test -t 0 && test -t 1 && printf vz-up-posix-pty".into(),
+            ],
+            Default::default(),
+            Some((POSIX_PTY_PROBE_ROWS, POSIX_PTY_PROBE_COLUMNS)),
+        )
+        .await;
+    let (stream, _) = match started {
+        Ok(started) => started,
+        // The backend refusing to start a PTY exec at all is the guest saying
+        // it has none, which is exactly what this measures.
+        Err(_) => return Ok(false),
+    };
+    // The probe owns guest effects until it finishes, so the timeout bounds
+    // the WAIT and never abandons the future: a dropped observation is not
+    // evidence that the guest stopped.
+    let observed = match tokio::time::timeout_at(deadline, stream.collect()).await {
+        Ok(observed) => observed,
+        Err(_) => {
+            return Err(failure(
+                metadata,
+                MachineErrorCode::BackendUnavailable,
+                "PTY readiness probe exceeded its own budget; original activation retained",
+            ));
+        }
+    };
+    Ok(observed.exit_code == 0 && observed.stdout == "vz-up-posix-pty")
 }
 
 #[tonic::async_trait]
@@ -68,6 +133,34 @@ impl ReadinessEvidenceProvider for MeasuredLinuxReadiness<'_> {
             ));
         }
         let mut measured = vec![MachineCapability::PosixExec];
+        // Measure PTY execution, so a Machine that has it can negotiate it.
+        //
+        // The guest agent has implemented `exec_pty` for the supervised
+        // Machine path all along (vz-guest-agent grpc_server.rs), and the whole
+        // chain down to it is wired -- `MachineExecutionSpec.terminal`, the
+        // supervisor, `term_rows`/`term_cols`. What was missing was any
+        // measurement, so `PosixPty` never entered `negotiated_capabilities`
+        // and `machine_exec.rs` refused every `vz exec --tty` against a Linux
+        // Machine. `host-target-capabilities-v0.4.json` recorded that
+        // faithfully: "Linux readiness measures only posix_exec plus Docker
+        // capabilities".
+        //
+        // The probe is the one native macOS readiness already uses, because
+        // the claim is the same one: `test -t 0 && test -t 1` is true only on
+        // a real terminal, so a pipe dressed up as one cannot answer it, and
+        // the sentinel proves the bytes came back through that terminal
+        // rather than from a shell that exited early.
+        //
+        // A Machine whose PTY does not answer is NOT a readiness failure. It
+        // simply does not negotiate the capability, and an exec that wanted
+        // one is refused later with a message naming exactly that -- which is
+        // a better outcome than refusing the boot of a Machine whose declared
+        // work never needed a terminal.
+        match measure_posix_pty(activation, metadata).await {
+            Ok(true) => measured.push(MachineCapability::PosixPty),
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
         let docker_context = if machine.profile == MachineProfile::Developer {
             let backend_error = |error: anyhow::Error| {
                 failure(

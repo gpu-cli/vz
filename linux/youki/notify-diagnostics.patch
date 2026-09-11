@@ -1,0 +1,41 @@
+Locally authored vz diagnostic correction for pinned youki 0.7.0.
+Apply AFTER runtime-audit.patch. Not an upstream-reviewed backport.
+
+The notify socket is bound by a RELATIVE name after a process-global chdir, to
+stay inside the 108-byte sun_path limit. When that bind fails, the error keeps
+the errno in a `source` field the Display impl never prints, so the whole
+message is the socket's random name:
+
+    failed to bind notify socket: tenant-notify-f7a93802.sock
+
+That is the entire diagnostic for a failure that has cost this project several
+composed release candidates (`vz-mzs.7.4`), and it does not say which errno, nor
+whether the chdir that the relative name depends on was actually in effect. This
+prints the errno, the directory the code intended to be in, and the directory it
+was actually in. It changes no behaviour.
+
+--- a/crates/libcontainer/src/notify_socket.rs
++++ b/crates/libcontainer/src/notify_socket.rs
+@@ -15,10 +15,15 @@
+     #[error("invalid path: {0}")]
+     InvalidPath(PathBuf),
+-    #[error("failed to bind notify socket: {name}")]
++    // vz: the relative bind depends on a process-global chdir having taken
++    // effect, so report the errno and both the intended and observed cwd.
++    #[error("failed to bind notify socket {name}: {source} (intended cwd {workdir}, observed cwd {observed})")]
+     Bind {
+         source: std::io::Error,
+         name: String,
++        workdir: PathBuf,
++        observed: PathBuf,
+     },
+     #[error("failed to connect to notify socket: {name}")]
+     Connect {
+@@ -67,8 +72,12 @@
+         let stream = UnixListener::bind(socket_name).map_err(|e| NotifyListenerError::Bind {
+             source: e,
+             // ok to unwrap here as OsStr should always be utf-8 compatible
+             name: socket_name.to_str().unwrap().to_owned(),
++            workdir: workdir.to_owned(),
++            observed: env::current_dir().unwrap_or_else(|_| PathBuf::from("<unreadable>")),
+         })?;

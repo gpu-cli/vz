@@ -137,10 +137,11 @@ The implemented topology CLI currently exposes:
 - `vz exec`: streamed execution in an already Ready, exactly owned Linux or
   native macOS Machine on Apple silicon
   (<!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer posix_exec -->**DEV**).
-  An interactive terminal (`-t`) is negotiated only by native macOS Machines
-  (<!-- capability-matrix: macos-arm64/macos/developer posix_pty -->**DEV**);
-  Linux Machine PTY is
-  <!-- capability-matrix: macos-arm64/linux/* posix_pty -->**PLANNED**.
+  An interactive terminal (`-t`) is negotiated by native macOS Machines
+  (<!-- capability-matrix: macos-arm64/macos/developer posix_pty -->**DEV**)
+  and by Linux Machines
+  (<!-- capability-matrix: macos-arm64/linux/* posix_pty -->**DEV**), each
+  measured at readiness rather than assumed.
   Automatic startup/dependency reconciliation is still unfinished.
 - `vz stop`: selected-Environment Stop with exact ownership and positive
   execution reaping. Unsupported resources and unknown live ownership fail

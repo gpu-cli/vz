@@ -125,7 +125,9 @@ nothing is labelled shipped until a 0.4 release is published.
   runtime.
 - <!-- capability-matrix: macos-arm64/macos/developer posix_pty -->**DEV** — interactive PTY execution on native macOS
   Machines.
-- <!-- capability-matrix: macos-arm64/linux/* posix_pty -->**PLANNED** — Linux Machine PTY;
+- <!-- capability-matrix: macos-arm64/linux/* posix_pty -->**DEV** — interactive PTY execution on Linux Machines,
+  negotiated from a readiness probe rather than assumed.
+- 
   <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer signals,files,ports,snapshot,suspend,checkpoint -->**PLANNED** —
   signals, files, ports, snapshot, suspend and checkpoint capabilities on every
   live pair.

@@ -171,9 +171,18 @@ fn seeding_a_fork_clones_the_docker_disk_for_free_space_metadata_not_bytes() {
     assert_eq!(std::fs::metadata(&destination).unwrap().len(), DISK_BYTES);
     // And why the obvious check is the wrong one: the clone reports the parent's
     // full allocation, because both inodes reference the same blocks.
+    //
+    // Both read at the SAME MOMENT, not against the snapshot taken before the
+    // clone. They share blocks, so they agree with each other whenever they are
+    // compared -- but the source's own allocation is not frozen, and comparing
+    // a live inode to a stale number measured the volume's recent history
+    // instead of the clone. Observed failing by 1 MiB on an otherwise idle
+    // machine (100663296 vs 101711872).
     assert_eq!(
         std::fs::metadata(&destination).unwrap().blocks() * 512,
-        source_allocated
+        std::fs::metadata(&source).unwrap().blocks() * 512,
+        "a clone and its parent reference the same blocks, so their allocations \
+         agree when read together"
     );
 
     // Separate inodes. A fork writing into its Docker store must never reach its

@@ -318,6 +318,10 @@ mod tests {
             ),
             BTreeSet::from([
                 MachineCapability::PosixExec,
+                // Measured at readiness, not assumed: `readiness.rs`
+                // runs a PTY probe and negotiates this only when the guest
+                // answers on a real terminal.
+                MachineCapability::PosixPty,
                 MachineCapability::DockerEngine,
                 MachineCapability::Compose,
                 MachineCapability::Buildx,
@@ -332,7 +336,12 @@ mod tests {
             OperatingSystem::Linux,
             MachineProfile::Hardened,
         );
-        assert_eq!(hardened, BTreeSet::from([MachineCapability::PosixExec]));
+        // A Hardened Machine gets exec and a terminal -- both measured -- and
+        // none of the Docker stack, which is the line this test defends.
+        assert_eq!(
+            hardened,
+            BTreeSet::from([MachineCapability::PosixExec, MachineCapability::PosixPty])
+        );
     }
 
     #[test]

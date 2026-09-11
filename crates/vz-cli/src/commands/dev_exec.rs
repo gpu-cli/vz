@@ -40,7 +40,8 @@ pub struct DevExecArgs {
     /// Explicit guest environment variable; repeat for multiple values.
     #[arg(long="env",value_name="KEY=VALUE",value_parser=parse_env)]
     pub env: Vec<(String, String)>,
-    /// Request an interactive guest terminal (requires a local terminal).
+    /// Request a terminal for the guest. A local terminal is mirrored into it
+    /// when there is one; without one the guest still gets a PTY.
     #[arg(short = 't', long)]
     pub tty: bool,
     /// Send immediate stdin EOF instead of reading local stdin.
@@ -152,10 +153,22 @@ pub async fn cmd_dev_exec(args: DevExecArgs, json_output: bool) -> Result<i32, E
             return Err(local("validation_error","request/idempotency IDs must be nonempty bounded strings without control characters or surrounding whitespace".into()));
         }
     }
-    if args.tty && (!std::io::stdin().is_terminal() || json_output) {
+    // `--tty` is about the GUEST's terminal, so only `--json` conflicts with it.
+    //
+    // This used to refuse whenever OUR stdin was not a terminal too. A local
+    // terminal is needed to MIRROR one -- raw mode and resize forwarding --
+    // and both of those are now conditional on actually having it. The guest's
+    // PTY does not depend on the caller owning one, and a caller that wants a
+    // guest terminal without having one is ordinary: a CI job, a test driver,
+    // anything capturing the transcript.
+    //
+    // `--json` still conflicts, and for a reason that does not go away:
+    // `--tty` streams raw terminal bytes on the same stdout the JSON records
+    // use, so the two would corrupt each other.
+    if args.tty && json_output {
         return Err(local(
             "validation_error",
-            "--tty requires a local terminal and is incompatible with --json".into(),
+            "--tty streams raw terminal bytes and cannot share stdout with --json".into(),
         ));
     }
     let cwd =
