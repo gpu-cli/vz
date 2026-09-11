@@ -86,6 +86,7 @@ fn environment(
     network_attachments: Vec<NetworkAttachmentInstance>,
 ) -> EnvironmentInstance {
     EnvironmentInstance {
+        secret_bindings: Vec::new(),
         volumes: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         environment_id: environment_id(),

@@ -114,6 +114,7 @@ impl Fixture {
             project_id: ProjectId::generate(),
             name: "delete-tests".into(),
             environment: EnvironmentSpec {
+                secret_bindings: Vec::new(),
                 volumes: Vec::new(),
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),

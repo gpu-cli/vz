@@ -194,8 +194,31 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
     let mut client = connect_up_daemon_for_state_db(&default_state_db_path())
         .await
         .map_err(|error| local_error("daemon_unavailable", error.to_string()))?;
+    // Read each declared binding's value out of THIS process's environment.
+    //
+    // The definition names the variable; the value never appears in it, and
+    // never on a command line -- the gate's recorder writes every argv into a
+    // receipt, so an argument is a published secret. A binding whose variable
+    // is unset or empty fails here, before anything is admitted: delivering a
+    // Machine an empty file where its definition promised a secret is worse
+    // than refusing, because the Machine comes up looking correct.
+    let mut secret_values = std::collections::HashMap::new();
+    for binding in &discovered.definition.environment.secret_bindings {
+        let value = std::env::var(&binding.source_env).unwrap_or_default();
+        if value.is_empty() {
+            return Err(local_error(
+                "validation_error",
+                format!(
+                    "SecretBinding `{}` reads its value from `{}`, which is unset or empty in this                      environment; set it before `vz up` rather than have the Machine come up                      holding nothing at {}",
+                    binding.name, binding.source_env, binding.target_path
+                ),
+            ));
+        }
+        secret_values.insert(binding.name.clone(), value.into_bytes());
+    }
     let mut stream = client
         .up_environment_stream(runtime_v2::UpEnvironmentRequest {
+            secret_values,
             metadata: Some(runtime_v2::RequestMetadata {
                 request_id: request_id.clone(),
                 idempotency_key: idempotency_key.clone(),

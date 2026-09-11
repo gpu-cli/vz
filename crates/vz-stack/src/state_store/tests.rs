@@ -261,6 +261,7 @@ fn topology_project_state(
         project_id: project_id.clone(),
         name: "shop".to_string(),
         environment: EnvironmentSpec {
+            secret_bindings: Vec::new(),
             volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
@@ -297,6 +298,7 @@ fn topology_project_state(
             let attachment_id = NetworkAttachmentId::new(format!("att_{name}")).unwrap();
             let egress_id = EgressId::new(format!("egr_{name}")).unwrap();
             EnvironmentInstance {
+                secret_bindings: Vec::new(),
                 volumes: Vec::new(),
                 network_attachments: vec![NetworkAttachmentInstance {
                     schema_version: TOPOLOGY_SCHEMA_VERSION,

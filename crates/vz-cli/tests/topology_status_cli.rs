@@ -258,6 +258,7 @@ fn definition(project_name: &str, image: &str) -> ProjectDefinition {
         project_id: ProjectId::new("prj_status_cli").unwrap(),
         name: project_name.to_string(),
         environment: EnvironmentSpec {
+            secret_bindings: Vec::new(),
             volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),

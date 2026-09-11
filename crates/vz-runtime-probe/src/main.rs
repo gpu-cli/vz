@@ -227,6 +227,9 @@ async fn run_up(options: &Options) -> Result<(), (String, String)> {
         .map_err(|error| ("daemon_unavailable".to_string(), error.to_string()))?;
     let request = runtime_v2::UpEnvironmentRequest {
         fork: None,
+        // The probe drives agreement checks against definitions that declare no
+        // SecretBinding, and it must never be a second way to plant a value.
+        secret_values: Default::default(),
         metadata: Some(metadata(&request_id, &idempotency_key)),
         definition: Some(vz_runtime_translate::project_definition_to_proto(
             &definition,

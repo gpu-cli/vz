@@ -129,6 +129,7 @@ async fn target(source: &Path) -> ResolvedLinuxMachineTarget {
         project_id: ProjectId::new("prj_cancel_pin").unwrap(),
         name: "cancel-pin".into(),
         environment: EnvironmentSpec {
+            secret_bindings: Vec::new(),
             volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),

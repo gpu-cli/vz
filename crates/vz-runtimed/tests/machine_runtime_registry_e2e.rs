@@ -233,6 +233,7 @@ fn definition(
         project_id,
         name: "machine-runtime-registry-e2e".into(),
         environment: EnvironmentSpec {
+            secret_bindings: Vec::new(),
             volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),

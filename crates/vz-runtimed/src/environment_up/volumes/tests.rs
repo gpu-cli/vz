@@ -101,6 +101,7 @@ fn shared_cache(name: &str, attachments: Vec<VolumeAttachment>) -> VolumeSpec {
 
 fn spec(machines: Vec<MachineSpec>, volumes: Vec<VolumeSpec>) -> EnvironmentSpec {
     EnvironmentSpec {
+        secret_bindings: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         default_machine: None,
         machines,

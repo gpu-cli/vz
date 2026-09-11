@@ -150,6 +150,7 @@ impl Fixture {
             project_id: project_id.clone(),
             name: "controller-prepare".into(),
             environment: EnvironmentSpec {
+                secret_bindings: Vec::new(),
                 volumes: Vec::new(),
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),

@@ -928,6 +928,7 @@ mod tests {
             project_id: ProjectId::new("prj_resolution").unwrap(),
             name: "resolution".into(),
             environment: EnvironmentSpec {
+                secret_bindings: Vec::new(),
                 volumes: Vec::new(),
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),
