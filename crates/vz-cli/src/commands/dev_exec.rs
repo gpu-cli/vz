@@ -209,6 +209,10 @@ pub async fn cmd_dev_exec(args: DevExecArgs, json_output: bool) -> Result<i32, E
             .map_err(|error| local("workspace_read_failed", error.to_string()))?
             .map(|workspace| workspace.workspace_key)
     };
+    // Whether there is a local terminal whose size is worth mirroring into the
+    // guest's. Without one the guest keeps the window we gave it at the start,
+    // and nothing polls for changes that cannot happen.
+    let mut mirroring = false;
     let mut dimensions = if args.tty {
         // `--tty` asks for a PTY in the GUEST. The local terminal's size is
         // only the window to mirror into it, and there may not be one: a
@@ -230,6 +234,7 @@ pub async fn cmd_dev_exec(args: DevExecArgs, json_output: bool) -> Result<i32, E
         let (columns, rows) = if columns == 0 || rows == 0 {
             (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_ROWS)
         } else {
+            mirroring = true;
             (columns, rows)
         };
         Some(MachineExecutionTerminal { rows, columns })
@@ -335,8 +340,14 @@ pub async fn cmd_dev_exec(args: DevExecArgs, json_output: bool) -> Result<i32, E
                 else{stream.stdin_write(input[..count].to_vec()).await.map_err(client_error)?;}
             },
             result=tokio::signal::ctrl_c()=>{result.map_err(|error|local("signal_failed",error.to_string()))?;stream.signal(2).await.map_err(client_error)?;},
-            _=resize.tick(),if ready && dimensions.is_some()=>{
+            // Only mirror a terminal that EXISTS. Polling `size()` with no
+            // local terminal returns 0x0, and the daemon refuses a resize with
+            // a zero dimension -- so a headless `--tty` caller was killing its
+            // own execution 250ms in with "daemon protocol mismatch: invalid
+            // Machine Exec resize", after the guest had already started fine.
+            _=resize.tick(),if ready && mirroring && dimensions.is_some()=>{
                 let (columns,rows)=crossterm::terminal::size().map_err(|error|local("terminal_unavailable",error.to_string()))?;
+                if columns==0 || rows==0 {continue;}
                 let current=MachineExecutionTerminal {rows,columns};
                 if dimensions!=Some(current) {stream.resize(current).await.map_err(client_error)?;dimensions=Some(current);}
             },
