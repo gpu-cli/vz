@@ -1952,6 +1952,18 @@ def establish_recovery_environments(ctx: CheckContext, names: tuple) -> tuple:
         base["environment"]["machines"][0]["networks"] = [PRIVATE_NETWORK]
         base["environment"]["networks"] = [
             {"schema_version": 1, "name": PRIVATE_NETWORK, "kind": "private"}]
+        # And one declared ENDPOINT, so each Environment publishes a name.
+        #
+        # Criterion 8's resolve clause asks that A's DNS view not answer for a
+        # name DECLARED in B. An Environment that publishes no name gives the
+        # clause nothing to ask for, and it reported exactly that. The name is
+        # the same in all three, which is the point: three Environments that
+        # all declare `probe` and still cannot resolve each other's is a
+        # stronger statement than three that declare nothing.
+        base["environment"]["endpoints"] = [
+            {"schema_version": 1, "name": "probe",
+             "machine": base["environment"]["machines"][0]["name"],
+             "network": PRIVATE_NETWORK, "protocol": "tcp", "port": PRIVATE_PORT}]
     except (StopIteration, KeyError, OSError) as error:
         check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
         return None, check.finish()
