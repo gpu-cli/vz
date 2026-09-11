@@ -74,6 +74,7 @@ mod tests {
     fn up_environment_wire_roundtrips_nonempty_request_and_terminal_receipt() {
         use super::runtime_v2::*;
         let request = UpEnvironmentRequest {
+            secret_values: Default::default(),
             fork: None,
             metadata: Some(RequestMetadata {
                 request_id: "req-up".into(),
@@ -907,6 +908,7 @@ mod tests {
                     ("host_exports", 6),
                     ("host_imports", 7),
                     ("volumes", 8),
+                    ("secret_bindings", 9),
                 ],
             ),
             (
@@ -1217,6 +1219,7 @@ mod tests {
                     ("host_imports", 19),
                     ("egress", 20),
                     ("volumes", 21),
+                    ("secret_bindings", 22),
                 ],
             ),
             (
@@ -1257,6 +1260,7 @@ mod tests {
                     // Tag 9 is a pure append, so an older daemon decodes an
                     // ordinary Up unchanged.
                     ("fork", 9),
+                    ("secret_values", 10),
                 ],
             ),
             ("MachineForkRequest", &[("fork_from", 1), ("fork_as", 2)]),
@@ -1788,6 +1792,7 @@ mod tests {
             project_id: "prj_demo".into(),
             name: "shop".into(),
             environment: Some(EnvironmentSpec {
+                secret_bindings: Vec::new(),
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),
                 volumes: Vec::new(),
@@ -1838,6 +1843,7 @@ mod tests {
             }),
         };
         let environment = EnvironmentInstance {
+            secret_bindings: Vec::new(),
             network_attachments: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),

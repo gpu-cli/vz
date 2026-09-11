@@ -267,6 +267,31 @@ message VolumeSpec {
   repeated VolumeAttachment attachments = 6;
 }
 
+// A value delivered to exactly one Machine. The VALUE is not here: a
+// declaration names the host-side source, never the bytes.
+message SecretBindingSpec {
+  uint32 schema_version = 1;
+  string name = 2;
+  string machine = 3;
+  string target_path = 4;
+  string source_env = 5;
+  // Present only to be refused: separate Environments are default-deny and a
+  // secret is not among the things a directional grant can cross.
+  optional string from_environment = 6;
+}
+
+// The persisted record of one binding. Identity only -- no value, and no
+// digest of one, because durable state is swept for the secret's bytes.
+message SecretBindingInstance {
+  uint32 schema_version = 1;
+  string binding_id = 2;
+  string environment_id = 3;
+  string machine_id = 4;
+  string name = 5;
+  string target_path = 6;
+  string source_env = 7;
+}
+
 message EnvironmentSpec {
   uint32 schema_version = 1;
   repeated MachineSpec machines = 2;
@@ -277,6 +302,7 @@ message EnvironmentSpec {
   repeated HostExportSpec host_exports = 6;
   repeated HostImportSpec host_imports = 7;
   repeated VolumeSpec volumes = 8;
+  repeated SecretBindingSpec secret_bindings = 9;
 }
 
 message ProjectDefinition {
@@ -655,6 +681,7 @@ message EnvironmentInstance {
   repeated HostImportInstance host_imports = 19;
   repeated EgressInstance egress = 20;
   repeated VolumeInstance volumes = 21;
+  repeated SecretBindingInstance secret_bindings = 22;
 }
 
 message ProjectState {
@@ -780,6 +807,14 @@ message UpEnvironmentRequest {
   // Fork one existing Machine of the selected Environment instead of
   // reconciling the definition alone. A pure append.
   optional MachineForkRequest fork = 9;
+  // The VALUES for this definition's declared SecretBindings, by binding name.
+  //
+  // Carried on the request and nowhere else. The definition names the host
+  // environment variable each value comes from; the CLI reads it and puts the
+  // bytes here, so the value never reaches an argv element -- which every
+  // receipt records -- and never enters the checked-in definition. The daemon
+  // delivers each to the one Machine its binding names and retains none of it.
+  map<string, bytes> secret_values = 10;
 }
 
 // `vz up --fork-from <machine> --as <machine>@<label>`.

@@ -215,6 +215,44 @@ pub struct VolumeSpec {
     #[prost(message, repeated, tag = "6")]
     pub attachments: ::prost::alloc::vec::Vec<VolumeAttachment>,
 }
+/// A value delivered to exactly one Machine. The VALUE is not here: a
+/// declaration names the host-side source, never the bytes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SecretBindingSpec {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub machine: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub target_path: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub source_env: ::prost::alloc::string::String,
+    /// Present only to be refused: separate Environments are default-deny and a
+    /// secret is not among the things a directional grant can cross.
+    #[prost(string, optional, tag = "6")]
+    pub from_environment: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// The persisted record of one binding. Identity only -- no value, and no
+/// digest of one, because durable state is swept for the secret's bytes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SecretBindingInstance {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub binding_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub target_path: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub source_env: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EnvironmentSpec {
     #[prost(uint32, tag = "1")]
@@ -234,6 +272,8 @@ pub struct EnvironmentSpec {
     pub host_imports: ::prost::alloc::vec::Vec<HostImportSpec>,
     #[prost(message, repeated, tag = "8")]
     pub volumes: ::prost::alloc::vec::Vec<VolumeSpec>,
+    #[prost(message, repeated, tag = "9")]
+    pub secret_bindings: ::prost::alloc::vec::Vec<SecretBindingSpec>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProjectDefinition {
@@ -723,6 +763,8 @@ pub struct EnvironmentInstance {
     pub egress: ::prost::alloc::vec::Vec<EgressInstance>,
     #[prost(message, repeated, tag = "21")]
     pub volumes: ::prost::alloc::vec::Vec<VolumeInstance>,
+    #[prost(message, repeated, tag = "22")]
+    pub secret_bindings: ::prost::alloc::vec::Vec<SecretBindingInstance>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProjectState {
@@ -901,6 +943,18 @@ pub struct UpEnvironmentRequest {
     /// reconciling the definition alone. A pure append.
     #[prost(message, optional, tag = "9")]
     pub fork: ::core::option::Option<MachineForkRequest>,
+    /// The VALUES for this definition's declared SecretBindings, by binding name.
+    ///
+    /// Carried on the request and nowhere else. The definition names the host
+    /// environment variable each value comes from; the CLI reads it and puts the
+    /// bytes here, so the value never reaches an argv element -- which every
+    /// receipt records -- and never enters the checked-in definition. The daemon
+    /// delivers each to the one Machine its binding names and retains none of it.
+    #[prost(map = "string, bytes", tag = "10")]
+    pub secret_values: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::vec::Vec<u8>,
+    >,
 }
 /// `vz up --fork-from <machine> --as <machine>@<label>`.
 ///

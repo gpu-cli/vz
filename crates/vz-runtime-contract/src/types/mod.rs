@@ -24,6 +24,7 @@ pub use environment_up::{
 };
 mod operations;
 mod sandbox;
+mod secret;
 mod shared_vm;
 mod space_cache;
 mod space_cache_trust;
@@ -43,6 +44,7 @@ pub use self::machine_fork::*;
 pub use self::machine_health::*;
 pub use self::operations::*;
 pub use self::sandbox::*;
+pub use self::secret::*;
 pub use self::shared_vm::*;
 pub use self::space_cache::*;
 pub use self::space_cache_trust::*;

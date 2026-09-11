@@ -17,6 +17,7 @@ pub(super) fn definition() -> ProjectDefinition {
         project_id: ProjectId::new("prj_fork").unwrap(),
         name: "fork".to_string(),
         environment: EnvironmentSpec {
+            secret_bindings: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             default_machine: None,
             host_exports: Vec::new(),

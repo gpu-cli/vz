@@ -322,6 +322,11 @@ impl ResolvedMachineConfiguration {
             .collect();
         EnvironmentSpec {
             volumes: Vec::new(),
+            // A persisted configuration carries one Machine and no Environment,
+            // so it carries no bindings either: a SecretBinding is Environment
+            // state, and the real EnvironmentSpec is validated against the whole
+            // definition at admission.
+            secret_bindings: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,

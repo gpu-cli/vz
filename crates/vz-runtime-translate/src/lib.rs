@@ -35,11 +35,11 @@ use vz_runtime_contract::{
     OperatingSystem, OwnedResourceKind, OwnershipCleanupStep, OwnershipCleanupStepAcknowledgement,
     OwnershipRecord, ProjectDefinition, ProjectId, ProjectState, RequestMetadata, ResourceOwner,
     RuntimeCapabilities, SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, Sandbox,
-    SandboxBackend, SandboxSpec, SandboxState, SharedCacheConsistency, SharedCacheConsistencyModel,
-    TargetSpec, TopologyCandidate, TopologyLifecycleError, TopologyResolutionError,
-    TopologyValidationError, TransportProtocol, VolumeAccessMode, VolumeAttachment, VolumeId,
-    VolumeInstance, VolumeKind, VolumeSpec, WorkspaceBinding, WorkspaceBindingId,
-    WorkspaceProjection, WorkspaceProjectionMode,
+    SandboxBackend, SandboxSpec, SandboxState, SecretBindingId, SecretBindingInstance,
+    SecretBindingSpec, SharedCacheConsistency, SharedCacheConsistencyModel, TargetSpec,
+    TopologyCandidate, TopologyLifecycleError, TopologyResolutionError, TopologyValidationError,
+    TransportProtocol, VolumeAccessMode, VolumeAttachment, VolumeId, VolumeInstance, VolumeKind,
+    VolumeSpec, WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection, WorkspaceProjectionMode,
 };
 use vz_runtime_proto::runtime_v2;
 
@@ -153,7 +153,64 @@ pub fn environment_spec_to_proto(spec: &EnvironmentSpec) -> runtime_v2::Environm
             .map(host_import_spec_to_proto)
             .collect(),
         volumes: spec.volumes.iter().map(volume_spec_to_proto).collect(),
+        secret_bindings: spec
+            .secret_bindings
+            .iter()
+            .map(secret_binding_spec_to_proto)
+            .collect(),
     }
+}
+
+fn secret_binding_spec_to_proto(spec: &SecretBindingSpec) -> runtime_v2::SecretBindingSpec {
+    runtime_v2::SecretBindingSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        machine: spec.machine.clone(),
+        target_path: spec.target_path.clone(),
+        source_env: spec.source_env.clone(),
+        from_environment: spec.from_environment.clone(),
+    }
+}
+
+fn secret_binding_spec_from_proto(
+    spec: &runtime_v2::SecretBindingSpec,
+) -> Result<SecretBindingSpec, TranslationError> {
+    Ok(SecretBindingSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        machine: spec.machine.clone(),
+        target_path: spec.target_path.clone(),
+        source_env: spec.source_env.clone(),
+        from_environment: spec.from_environment.clone(),
+    })
+}
+
+fn secret_binding_instance_to_proto(
+    instance: &SecretBindingInstance,
+) -> runtime_v2::SecretBindingInstance {
+    runtime_v2::SecretBindingInstance {
+        schema_version: instance.schema_version,
+        binding_id: instance.binding_id.to_string(),
+        environment_id: instance.environment_id.to_string(),
+        machine_id: instance.machine_id.to_string(),
+        name: instance.name.clone(),
+        target_path: instance.target_path.clone(),
+        source_env: instance.source_env.clone(),
+    }
+}
+
+fn secret_binding_instance_from_proto(
+    instance: &runtime_v2::SecretBindingInstance,
+) -> Result<SecretBindingInstance, TranslationError> {
+    Ok(SecretBindingInstance {
+        schema_version: instance.schema_version,
+        binding_id: SecretBindingId::new(instance.binding_id.clone())?,
+        environment_id: EnvironmentId::new(instance.environment_id.clone())?,
+        machine_id: MachineId::new(instance.machine_id.clone())?,
+        name: instance.name.clone(),
+        target_path: instance.target_path.clone(),
+        source_env: instance.source_env.clone(),
+    })
 }
 
 /// Decode an Environment desired topology.
@@ -192,6 +249,11 @@ pub fn environment_spec_from_proto(
             .volumes
             .iter()
             .map(volume_spec_from_proto)
+            .collect::<Result<_, _>>()?,
+        secret_bindings: spec
+            .secret_bindings
+            .iter()
+            .map(secret_binding_spec_from_proto)
             .collect::<Result<_, _>>()?,
     })
 }
@@ -1504,6 +1566,11 @@ pub fn environment_instance_to_proto(
             .iter()
             .map(volume_instance_to_proto)
             .collect(),
+        secret_bindings: environment
+            .secret_bindings
+            .iter()
+            .map(secret_binding_instance_to_proto)
+            .collect(),
         host_imports: environment
             .host_imports
             .iter()
@@ -1578,6 +1645,11 @@ pub fn environment_instance_from_proto(
             .volumes
             .iter()
             .map(volume_instance_from_proto)
+            .collect::<Result<_, _>>()?,
+        secret_bindings: environment
+            .secret_bindings
+            .iter()
+            .map(secret_binding_instance_from_proto)
             .collect::<Result<_, _>>()?,
         host_imports: environment
             .host_imports
@@ -3624,6 +3696,7 @@ mod tests {
             project_id: project_id("prj-roundtrip"),
             name: "roundtrip".to_string(),
             environment: EnvironmentSpec {
+                secret_bindings: Vec::new(),
                 // One volume of each kind: `block` is the only branch carrying
                 // `size_bytes` and `shared_cache` the only one carrying
                 // `consistency`, so a round trip over both is what proves the
@@ -3726,6 +3799,7 @@ mod tests {
         let public_network_id = network_id(&format!("net-{suffix}-public"));
         let private_network_id = network_id(&format!("net-{suffix}-private"));
         EnvironmentInstance {
+            secret_bindings: Vec::new(),
             volumes: vec![
                 VolumeInstance {
                     schema_version: V,

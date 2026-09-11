@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+
+use super::secret::SecretBindingSpec;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -87,6 +89,7 @@ topology_id!(HostExportId, "host_export_id", "hxp_");
 topology_id!(HostImportId, "host_import_id", "hmp_");
 topology_id!(EgressId, "egress_id", "egr_");
 topology_id!(VolumeId, "volume_id", "vol_");
+topology_id!(SecretBindingId, "secret_binding_id", "sec_");
 topology_id!(LifecycleOperationId, "lifecycle_operation_id", "lop_");
 
 /// Host or Machine operating system.
@@ -503,6 +506,14 @@ pub struct EnvironmentSpec {
     pub host_exports: Vec<HostExportSpec>,
     #[serde(default)]
     pub host_imports: Vec<HostImportSpec>,
+    /// Values delivered to exactly one Machine each, by identity.
+    ///
+    /// Declared at the Environment because the Environment is the isolation
+    /// boundary a secret is scoped to, and carried to the single Machine each
+    /// binding names. The VALUE is never here: the definition is a checked-in
+    /// file, so it holds the source's name and never its bytes.
+    #[serde(default)]
+    pub secret_bindings: Vec<SecretBindingSpec>,
     /// Environment-owned storage: block volumes and shared caches.
     ///
     /// Separate from `MachineSpec::workspace` on purpose. A projection shows a
@@ -1171,6 +1182,10 @@ pub struct EnvironmentInstance {
     pub egress: Vec<EgressInstance>,
     #[serde(default)]
     pub volumes: Vec<VolumeInstance>,
+    /// One record per declared SecretBinding. Identity only -- never a value,
+    /// and never a digest of one.
+    #[serde(default)]
+    pub secret_bindings: Vec<super::secret::SecretBindingInstance>,
     #[serde(default)]
     pub ownership: Vec<OwnershipRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1679,6 +1694,28 @@ impl ProjectDefinition {
                     machine_id: Some(attachment.machine_id.clone()),
                 }),
         );
+        // One identity-only record per declared binding, resolved to the
+        // Machine it names. The value is not minted here and never will be:
+        // it is carried once, at Up, to the Machine this record points at.
+        let secret_bindings: Vec<super::secret::SecretBindingInstance> = self
+            .environment
+            .secret_bindings
+            .iter()
+            .filter_map(|binding| {
+                let machine = machines
+                    .iter()
+                    .find(|candidate| candidate.name == binding.machine)?;
+                Some(super::secret::SecretBindingInstance {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    binding_id: SecretBindingId::generate(),
+                    environment_id: environment_id.clone(),
+                    machine_id: machine.machine_id.clone(),
+                    name: binding.name.clone(),
+                    target_path: binding.target_path.clone(),
+                    source_env: binding.source_env.clone(),
+                })
+            })
+            .collect();
         let volumes: Vec<_> = self
             .environment
             .volumes
@@ -1736,6 +1773,7 @@ impl ProjectDefinition {
             host_imports,
             egress,
             volumes,
+            secret_bindings,
             ownership,
             legacy_migration: None,
             created_at: now,
@@ -1889,6 +1927,20 @@ impl EnvironmentSpec {
             }
             if let Some(alias) = &import.alias {
                 validate_name("host_import.alias", alias)?;
+            }
+        }
+        let binding_names = validate_unique_names(
+            "secret_binding",
+            self.secret_bindings.iter().map(|binding| &binding.name),
+        )?;
+        let _ = binding_names;
+        for binding in &self.secret_bindings {
+            super::secret::validate_secret_binding(binding)?;
+            if !machine_names.contains(binding.machine.as_str()) {
+                return Err(TopologyValidationError::MissingReference {
+                    kind: "secret_binding.machine".to_string(),
+                    value: binding.machine.clone(),
+                });
             }
         }
         for volume in &self.volumes {
@@ -5492,6 +5544,45 @@ fn validate_definition_instance(
             );
         }
     }
+    // A SecretBinding instance is identity only, so the comparison is over the
+    // names, the Machine each resolves to, and the coordinates a Machine would
+    // read it by. `source_env` is included because a binding whose source moved
+    // delivers different bytes to the same path, which is a different secret
+    // wearing the same name -- and `target_path` because the path IS how the
+    // Machine addresses it.
+    let secret_bindings: BTreeMap<_, _> = environment
+        .secret_bindings
+        .iter()
+        .map(|binding| (binding.name.as_str(), binding))
+        .collect();
+    if secret_bindings.len() != spec.secret_bindings.len() {
+        return definition_topology_mismatch(
+            &environment_id,
+            "SecretBinding names/count differ from the project definition",
+        );
+    }
+    for desired in &spec.secret_bindings {
+        let Some(actual) = secret_bindings.get(desired.name.as_str()) else {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!("missing SecretBinding `{}`", desired.name),
+            );
+        };
+        if machine_names_by_id.get(actual.machine_id.as_str()).copied()
+            != Some(desired.machine.as_str())
+        {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!("SecretBinding `{}` Machine differs", desired.name),
+            );
+        }
+        if actual.target_path != desired.target_path || actual.source_env != desired.source_env {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!("SecretBinding `{}` coordinate differs", desired.name),
+            );
+        }
+    }
     // A volume instance is identity only, so the definition comparison is over
     // the names and kinds: a definition whose `cache` became a block volume
     // must not be reconciled onto an instance still recorded as a shared cache,
@@ -5880,6 +5971,9 @@ pub fn migrate_legacy_developer_sandbox(
     let environment_spec = EnvironmentSpec {
         host_exports: Vec::new(),
         host_imports: Vec::new(),
+        // And no secrets, for the same reason: a legacy sandbox had no way to
+        // declare one, so migration cannot produce a binding nobody wrote.
+        secret_bindings: Vec::new(),
         // A legacy sandbox declared no Environment-owned storage; migration
         // never invents one, exactly as it never invents a network.
         volumes: Vec::new(),
@@ -5937,6 +6031,7 @@ pub fn migrate_legacy_developer_sandbox(
         host_imports: Vec::new(),
         egress: Vec::new(),
         volumes: Vec::new(),
+        secret_bindings: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         environment_id: environment_id.clone(),
         project_id: project_id.clone(),
@@ -6089,7 +6184,7 @@ fn resource_name_slug(value: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
-fn validate_name(kind: &str, value: &str) -> Result<(), TopologyValidationError> {
+pub(crate) fn validate_name(kind: &str, value: &str) -> Result<(), TopologyValidationError> {
     if value.trim().is_empty() || value.len() > MAX_NAME_LENGTH {
         return Err(TopologyValidationError::InvalidName {
             kind: kind.to_string(),
@@ -6222,6 +6317,7 @@ mod tests {
             project_id: ProjectId::new("prj_shop").unwrap(),
             name: "shop".to_string(),
             environment: EnvironmentSpec {
+                secret_bindings: Vec::new(),
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),
                 volumes: Vec::new(),
