@@ -7372,13 +7372,19 @@ def agent_workspace_definition(release_dir: Path) -> dict:
     for machine, mode, source, target in ((environment["machines"][0], "read_write", AGENT_RW_SOURCE, RW_TARGET),
                                           (environment["machines"][1], "read_only", AGENT_RO_SOURCE, RO_TARGET)):
         machine["workspace"] = {"binding": "source", "target_path": target, "mode": mode, "source_path": source}
-        # The schedule runs one step over an interactive terminal
-        # (`"channel": "pty"`), and a PTY is a NEGOTIATED capability: the
-        # runtime refuses `execution/terminal` to a Machine that never asked
-        # for it. A definition whose driver uses a PTY has to declare one, and
-        # this one did not -- so the step was refused before a byte reached
-        # the Machine, with `unsupported_operation`.
-        machine["requested_capabilities"] = {"capabilities": ["posix_exec", "posix_pty"]}
+        # NOT `posix_pty`, though the schedule has a `"channel": "pty"` step.
+        #
+        # Requesting it is the correct declaration for a driver that opens a
+        # terminal, and it is refused at Up: config/host-target-capabilities-
+        # v0.4.json marks `posix_pty` PLANNED for this host x target pair, and
+        # says why -- "terminal exec requires posix_pty ... so `vz exec --tty`
+        # against a Linux Machine is not negotiable today". The guest agent
+        # has no PTY implementation behind it.
+        #
+        # So asking takes the WHOLE check down rather than one step, which is
+        # worse evidence than the step failing on its own. The PTY clause
+        # needs to report `not_implemented` naming the manifest, the way
+        # criterion 5 reports a missing macOS target. Tracked separately.
     return definition
 
 
