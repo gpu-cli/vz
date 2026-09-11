@@ -7966,8 +7966,22 @@ CROSS_LISTENER_INTERVAL = 1.0
 # that names another Environment's Machine has already answered for it, whatever
 # a lookup would then return.
 CROSS_RESOLVER_FILES = ("/etc/resolv.conf", "/etc/hosts")
+# Absence is DATA, not an exit status.
+#
+# This used to be `cat "$f" 2>/dev/null` in a loop, so the probe's status was
+# whichever file happened to be last. `/etc/hosts` exists only for a Machine
+# with a declared endpoint, and a Machine without one made the whole read
+# report exit 1 -- which the check reported as "its Machine's resolver view is
+# readable (expected exit 0, observed 1)" while `/etc/resolv.conf`, the file
+# the clause is actually about, had been read perfectly well.
+#
+# The `2>/dev/null` already said absence was tolerable; it suppressed the
+# message and not the status. Now an absent file prints `(absent)` under its
+# own header, so the reader still sees which files were there and the exit
+# status means "the probe ran", which is what the caller checks it for.
 CROSS_RESOLVER_PROBE = ("for f in " + " ".join(CROSS_RESOLVER_FILES) + "; do "
-                        'printf "=== %s\\n" "$f"; /bin/busybox cat "$f" 2>/dev/null; done')
+                        'printf "=== %s\\n" "$f"; '
+                        '/bin/busybox cat "$f" 2>/dev/null || printf "(absent)\\n"; done')
 CROSS_ADDRESS_PROBE = ('/bin/busybox ip -o -4 addr show | '
                        '/bin/busybox awk \'$2!="lo"{split($4, a, "/"); print "ADDR", $2, a[1]}\'')
 # The codes a 0.4 lifecycle verb may fail closed with when its selector names an
