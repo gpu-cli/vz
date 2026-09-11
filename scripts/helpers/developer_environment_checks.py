@@ -7372,6 +7372,13 @@ def agent_workspace_definition(release_dir: Path) -> dict:
     for machine, mode, source, target in ((environment["machines"][0], "read_write", AGENT_RW_SOURCE, RW_TARGET),
                                           (environment["machines"][1], "read_only", AGENT_RO_SOURCE, RO_TARGET)):
         machine["workspace"] = {"binding": "source", "target_path": target, "mode": mode, "source_path": source}
+        # The schedule runs one step over an interactive terminal
+        # (`"channel": "pty"`), and a PTY is a NEGOTIATED capability: the
+        # runtime refuses `execution/terminal` to a Machine that never asked
+        # for it. A definition whose driver uses a PTY has to declare one, and
+        # this one did not -- so the step was refused before a byte reached
+        # the Machine, with `unsupported_operation`.
+        machine["requested_capabilities"] = {"capabilities": ["posix_exec", "posix_pty"]}
     return definition
 
 

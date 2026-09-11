@@ -2744,8 +2744,17 @@ class CriterionTwelveAgentWorkerTests(unittest.TestCase):
 
     # -- cancellation --------------------------------------------------------------------
     def test_a_cancellation_filed_as_a_clean_completion_fails(self):
+        """A cancelled step that reports a clean exit is still caught.
+
+        The clause admits two honest outcomes -- `quiesced`, or `completed`
+        with the exit status of whatever the deadline killed -- because a
+        runtime that reaps the process group it killed has proved MORE than
+        one that only proves quiescence. What it must never accept is a
+        cancelled step reporting that it finished normally, which is exactly
+        this fault.
+        """
         _code, _result, sub = self.agent("agent_cancel_unreported")
-        self.assertFailed(sub, "its own deadline cancelled it and the runtime proved no live work remained")
+        self.assertFailed(sub, "a zero exit would mean it ran to completion instead")
 
     def test_a_deadline_that_takes_every_execution_on_the_machine_fails(self):
         _code, _result, sub = self.agent("agent_cancel_machine_wide")
