@@ -204,17 +204,10 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
     // than refusing, because the Machine comes up looking correct.
     let mut secret_values = std::collections::HashMap::new();
     for binding in &discovered.definition.environment.secret_bindings {
-        let value = std::env::var(&binding.source_env).unwrap_or_default();
-        if value.is_empty() {
-            return Err(local_error(
-                "validation_error",
-                format!(
-                    "SecretBinding `{}` reads its value from `{}`, which is unset or empty in this                      environment; set it before `vz up` rather than have the Machine come up                      holding nothing at {}",
-                    binding.name, binding.source_env, binding.target_path
-                ),
-            ));
-        }
-        secret_values.insert(binding.name.clone(), value.into_bytes());
+        secret_values.insert(
+            binding.name.clone(),
+            resolve_secret_value(binding, &request_id, &idempotency_key)?,
+        );
     }
     let mut stream = client
         .up_environment_stream(runtime_v2::UpEnvironmentRequest {
@@ -337,4 +330,91 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
         );
     }
     Ok(())
+}
+
+/// The bytes one declared SecretBinding resolves to on this host.
+///
+/// Failing closed is the whole contract here. A Machine handed an empty file
+/// where its definition promised a secret comes up LOOKING correct, which is
+/// strictly worse than an Up that refuses and says why -- the same failure
+/// shape as a Machine reporting ready with a declared fabric port it never
+/// configured.
+///
+/// The value is never put on a command line and never printed. The gate's
+/// recorder writes every argv it runs into a receipt, so an argument is a
+/// published secret; only the SOURCE's argv is ever named in an error.
+fn resolve_secret_value(
+    binding: &vz_runtime_contract::SecretBindingSpec,
+    request_id: &str,
+    idempotency_key: &str,
+) -> Result<Vec<u8>, UpCommandError> {
+    let refuse = |detail: String| UpCommandError {
+        code: "validation_error".into(),
+        message: format!(
+            "SecretBinding `{}` for {}: {detail}",
+            binding.name, binding.target_path
+        )
+        .into_boxed_str(),
+        request_id: request_id.to_string(),
+        idempotency_key: idempotency_key.to_string(),
+        details: BTreeMap::new(),
+    };
+    if let Some(source_env) = &binding.source_env {
+        let value = env::var(source_env).unwrap_or_default();
+        if value.is_empty() {
+            return Err(refuse(format!(
+                "reads its value from `{source_env}`, which is unset or empty in this environment; \
+                 set it before `vz up`"
+            )));
+        }
+        return Ok(value.into_bytes());
+    }
+    let argv = binding
+        .source_command
+        .as_ref()
+        .ok_or_else(|| refuse("declares neither `source_env` nor `source_command`".to_string()))?;
+    let (program, arguments) = argv
+        .split_first()
+        .ok_or_else(|| refuse("declares an empty `source_command`".to_string()))?;
+    // No shell: the program is spawned directly and the arguments are passed
+    // verbatim, so nothing here is word-split, globbed, or able to become a
+    // second command. stdin is closed because a secret tool that wants to
+    // prompt must fail rather than hang an Up.
+    let produced = std::process::Command::new(program)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| refuse(format!("could not run `{}`: {error}", argv.join(" "))))?;
+    if !produced.status.success() {
+        // stderr is quoted because a secret tool's refusal is the actionable
+        // part ("not signed in", "item not found"); the VALUE only ever arrives
+        // on stdout, which is not echoed here.
+        let stderr = String::from_utf8_lossy(&produced.stderr);
+        return Err(refuse(format!(
+            "`{}` exited {}: {}",
+            argv.join(" "),
+            produced
+                .status
+                .code()
+                .map_or_else(|| "by signal".to_string(), |code| code.to_string()),
+            stderr.trim().chars().take(400).collect::<String>()
+        )));
+    }
+    // A trailing newline is what every one of these tools prints and almost
+    // never part of the secret, so exactly one is removed.
+    let mut value = produced.stdout;
+    if value.last() == Some(&b'\n') {
+        value.pop();
+        if value.last() == Some(&b'\r') {
+            value.pop();
+        }
+    }
+    if value.is_empty() {
+        return Err(refuse(format!(
+            "`{}` succeeded but printed nothing; an empty secret is a Machine that comes up \
+             looking correct while holding nothing",
+            argv.join(" ")
+        )));
+    }
+    Ok(value)
 }

@@ -815,6 +815,35 @@ mod tests {
 
         for (message, fields) in [
             ("HostSpec", &[("os", 1), ("arch", 2)][..]),
+            // Pinned like every other topology message: a SecretBinding's
+            // shape is part of the wire contract, and a field that appears or
+            // moves without being recorded here is exactly what this test
+            // exists to refuse.
+            (
+                "SecretBindingSpec",
+                &[
+                    ("schema_version", 1),
+                    ("name", 2),
+                    ("machine", 3),
+                    ("target_path", 4),
+                    ("source_env", 5),
+                    ("from_environment", 6),
+                    ("source_command", 7),
+                ][..],
+            ),
+            (
+                "SecretBindingInstance",
+                &[
+                    ("schema_version", 1),
+                    ("binding_id", 2),
+                    ("environment_id", 3),
+                    ("machine_id", 4),
+                    ("name", 5),
+                    ("target_path", 6),
+                    ("source_env", 7),
+                    ("source_command", 8),
+                ][..],
+            ),
             (
                 "TargetSpec",
                 &[

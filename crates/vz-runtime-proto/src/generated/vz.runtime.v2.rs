@@ -227,8 +227,14 @@ pub struct SecretBindingSpec {
     pub machine: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub target_path: ::prost::alloc::string::String,
-    #[prost(string, tag = "5")]
-    pub source_env: ::prost::alloc::string::String,
+    /// Exactly one source. `source_env` names a host environment variable;
+    /// `source_command` is an argv vector whose stdout is the value, which is how
+    /// 1Password, Vault, AWS Secrets Manager and pass are integrated without vz
+    /// owning any of their CLI surfaces.
+    #[prost(string, optional, tag = "5")]
+    pub source_env: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "7")]
+    pub source_command: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// Present only to be refused: separate Environments are default-deny and a
     /// secret is not among the things a directional grant can cross.
     #[prost(string, optional, tag = "6")]
@@ -250,8 +256,10 @@ pub struct SecretBindingInstance {
     pub name: ::prost::alloc::string::String,
     #[prost(string, tag = "6")]
     pub target_path: ::prost::alloc::string::String,
-    #[prost(string, tag = "7")]
-    pub source_env: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "7")]
+    pub source_env: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "8")]
+    pub source_command: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EnvironmentSpec {

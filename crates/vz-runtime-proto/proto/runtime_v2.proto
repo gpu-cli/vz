@@ -274,7 +274,12 @@ message SecretBindingSpec {
   string name = 2;
   string machine = 3;
   string target_path = 4;
-  string source_env = 5;
+  // Exactly one source. `source_env` names a host environment variable;
+  // `source_command` is an argv vector whose stdout is the value, which is how
+  // 1Password, Vault, AWS Secrets Manager and pass are integrated without vz
+  // owning any of their CLI surfaces.
+  optional string source_env = 5;
+  repeated string source_command = 7;
   // Present only to be refused: separate Environments are default-deny and a
   // secret is not among the things a directional grant can cross.
   optional string from_environment = 6;
@@ -289,7 +294,8 @@ message SecretBindingInstance {
   string machine_id = 4;
   string name = 5;
   string target_path = 6;
-  string source_env = 7;
+  optional string source_env = 7;
+  repeated string source_command = 8;
 }
 
 message EnvironmentSpec {

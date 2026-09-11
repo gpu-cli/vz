@@ -32,7 +32,32 @@ pub struct SecretBindingSpec {
     /// appears.
     pub target_path: String,
     /// Host environment variable the CLI reads the value from.
-    pub source_env: String,
+    ///
+    /// Exactly one of `source_env` and `source_command` is required. Siblings
+    /// rather than a nested tagged union because the flat spelling is what a
+    /// declaration reads like, and because `source_env` predates the command
+    /// form and stays valid unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_env: Option<String>,
+    /// A host command whose STDOUT is the value, as an argv vector.
+    ///
+    /// This is how a secret manager is integrated: `op read op://vault/item`,
+    /// `vault kv get`, `aws secretsmanager get-secret-value`, `pass show`. vz
+    /// does not own any of their CLI surfaces, auth models or version drift --
+    /// it runs what the declaration names and reads stdout.
+    ///
+    /// An argv VECTOR and never a shell string: no shell means no word
+    /// splitting, no globbing, and no way for a value or an argument to become
+    /// another command.
+    ///
+    /// SECURITY. A definition is a checked-in file, so a declaration naming a
+    /// command is host code execution at `vz up` for anyone who clones the
+    /// repository and runs it. That is a materially different exposure from
+    /// `source_env`, which only reads an environment the caller already has.
+    /// The exact argv is recorded in the audit log on every use, so a
+    /// definition that runs something unexpected is visible afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_command: Option<Vec<String>>,
     /// Another Environment's identity, when the declaration asks to bind a
     /// secret that Environment owns.
     ///
@@ -57,12 +82,17 @@ pub struct SecretBindingInstance {
     pub machine_id: super::topology::MachineId,
     pub name: String,
     pub target_path: String,
-    pub source_env: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_command: Option<Vec<String>>,
 }
 
 /// The longest a binding's target path or source variable may be.
 const MAX_TARGET_PATH: usize = 1024;
 const MAX_SOURCE_ENV: usize = 256;
+const MAX_COMMAND_ARGS: usize = 64;
+const MAX_COMMAND_ARG: usize = 4096;
 
 pub fn validate_secret_binding(spec: &SecretBindingSpec) -> Result<(), TopologyValidationError> {
     validate_name("secret_binding", &spec.name)?;
@@ -82,18 +112,39 @@ pub fn validate_secret_binding(spec: &SecretBindingSpec) -> Result<(), TopologyV
     {
         return Err(invalid("target_path"));
     }
-    // A POSIX-ish environment variable name. Checked rather than assumed
-    // because the CLI reads it out of its own environment and a permissive
-    // spelling is a way to ask for something that is not a variable at all.
-    if spec.source_env.is_empty()
-        || spec.source_env.len() > MAX_SOURCE_ENV
-        || !spec
-            .source_env
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        || spec.source_env.starts_with(|c: char| c.is_ascii_digit())
-    {
-        return Err(invalid("source_env"));
+    // EXACTLY one source. Neither is a declaration that names no value at all;
+    // both is a declaration whose value depends on which one the reader
+    // happens to consult first.
+    match (&spec.source_env, &spec.source_command) {
+        (Some(_), Some(_)) | (None, None) => return Err(invalid("source")),
+        _ => {}
+    }
+    if let Some(source_env) = &spec.source_env {
+        // A POSIX-ish environment variable name. Checked rather than assumed
+        // because the CLI reads it out of its own environment and a permissive
+        // spelling is a way to ask for something that is not a variable at all.
+        if source_env.is_empty()
+            || source_env.len() > MAX_SOURCE_ENV
+            || !source_env
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || source_env.starts_with(|c: char| c.is_ascii_digit())
+        {
+            return Err(invalid("source_env"));
+        }
+    }
+    if let Some(source_command) = &spec.source_command {
+        // An absolute or bare program name and bounded arguments. No shell is
+        // ever involved, so nothing here is parsed: the first element is the
+        // program and the rest are arguments verbatim.
+        if source_command.is_empty()
+            || source_command.len() > MAX_COMMAND_ARGS
+            || source_command.iter().any(|argument| {
+                argument.is_empty() || argument.len() > MAX_COMMAND_ARG || argument.contains('\0')
+            })
+        {
+            return Err(invalid("source_command"));
+        }
     }
     Ok(())
 }

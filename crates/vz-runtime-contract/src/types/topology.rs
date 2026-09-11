@@ -1713,6 +1713,7 @@ impl ProjectDefinition {
                     name: binding.name.clone(),
                     target_path: binding.target_path.clone(),
                     source_env: binding.source_env.clone(),
+                    source_command: binding.source_command.clone(),
                 })
             })
             .collect();
@@ -5576,7 +5577,13 @@ fn validate_definition_instance(
                 format!("SecretBinding `{}` Machine differs", desired.name),
             );
         }
-        if actual.target_path != desired.target_path || actual.source_env != desired.source_env {
+        // The SOURCE is part of the comparison, both forms of it: a binding
+        // whose source moved delivers different bytes to the same path, which
+        // is a different secret wearing the same name.
+        if actual.target_path != desired.target_path
+            || actual.source_env != desired.source_env
+            || actual.source_command != desired.source_command
+        {
             return definition_topology_mismatch(
                 &environment_id,
                 format!("SecretBinding `{}` coordinate differs", desired.name),

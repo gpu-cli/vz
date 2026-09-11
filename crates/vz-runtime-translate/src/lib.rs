@@ -168,6 +168,7 @@ fn secret_binding_spec_to_proto(spec: &SecretBindingSpec) -> runtime_v2::SecretB
         machine: spec.machine.clone(),
         target_path: spec.target_path.clone(),
         source_env: spec.source_env.clone(),
+        source_command: spec.source_command.clone().unwrap_or_default(),
         from_environment: spec.from_environment.clone(),
     }
 }
@@ -181,6 +182,7 @@ fn secret_binding_spec_from_proto(
         machine: spec.machine.clone(),
         target_path: spec.target_path.clone(),
         source_env: spec.source_env.clone(),
+        source_command: (!spec.source_command.is_empty()).then(|| spec.source_command.clone()),
         from_environment: spec.from_environment.clone(),
     })
 }
@@ -196,6 +198,7 @@ fn secret_binding_instance_to_proto(
         name: instance.name.clone(),
         target_path: instance.target_path.clone(),
         source_env: instance.source_env.clone(),
+        source_command: instance.source_command.clone().unwrap_or_default(),
     }
 }
 
@@ -210,6 +213,8 @@ fn secret_binding_instance_from_proto(
         name: instance.name.clone(),
         target_path: instance.target_path.clone(),
         source_env: instance.source_env.clone(),
+        source_command: (!instance.source_command.is_empty())
+            .then(|| instance.source_command.clone()),
     })
 }
 
