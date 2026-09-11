@@ -131,11 +131,15 @@ nothing is labelled shipped until a 0.4 release is published.
   <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer signals,files,ports,snapshot,suspend,checkpoint -->**PLANNED** —
   signals, files, ports, snapshot, suspend and checkpoint capabilities on every
   live pair.
-- <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer network_private,network_simulated_public,endpoint,split_dns,tls_ingress,nat_firewall,host_import,host_export,egress_policy,faults,peering,workspace_read_write,workspace_read_only,workspace_snapshot,secret_bindings -->**PLANNED**
+- <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer network_private,network_simulated_public,endpoint,split_dns,tls_ingress,nat_firewall,host_import,host_export,egress_policy,faults,peering,workspace_read_write,workspace_read_only,workspace_snapshot -->**PLANNED**
   — private/public-like topology networking, per-Machine endpoints, host
-  imports/exports, egress policy, faults, peering, workspace projections and
-  secret bindings; <!-- capability-matrix: macos-arm64/linux/developer volumes -->**PLANNED** — declared volumes for
+  imports/exports, egress policy, faults, peering and workspace projections;
+  <!-- capability-matrix: macos-arm64/linux/developer volumes -->**PLANNED** — declared volumes for
   Linux Developer Machines.
+- <!-- capability-matrix: macos-arm64/linux/developer secret_bindings -->**DEV** — SecretBindings on
+  Linux Developer Machines: a declared value reaches the one Machine that names
+  it and no other, from a host environment variable or a command's stdout, and
+  is absent from status, logs, evidence and durable state.
 - <!-- capability-matrix: linux-*/linux/*,windows-*/linux/*,windows-*/windows/developer pair -->**PLANNED**
   — Linux hosts, then Linux Machines and Environment topologies on Windows, then
   native Windows Developer Machines. Additional placement, collaboration, policy,

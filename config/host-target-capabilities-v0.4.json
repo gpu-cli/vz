@@ -502,11 +502,27 @@
           "note": "No PeerGrant type exists in vz-runtime-contract."
         },
         "secret_bindings": {
-          "status": "PLANNED",
-          "negotiated_by": [],
-          "rejected_by": [],
-          "evidence": [],
-          "note": "SecretBindingSpec/SecretBindingInstance exist in vz-runtime-contract and schemas/vz-project-definition-v1.schema.json declares environment.secret_bindings; the CLI resolves source_env and source_command, the daemon delivers per Machine, refuses from_environment, and appends secret_binding_used to audit.jsonl. Still PLANNED because a DEV claim requires digest-bound evidence from an installed slice and gate.secrets.snapshots_scoped_redacted has not yet been measured against it."
+          "status": "DEV",
+          "negotiated_by": [
+            "crates/vz-runtimed/src/environment_up/supervisor.rs:870",
+            "crates/vz-runtimed/src/environment_up/supervisor.rs:915"
+          ],
+          "rejected_by": [
+            "crates/vz-runtimed/src/environment_up.rs:601"
+          ],
+          "evidence": [
+            {
+              "lane": "topology",
+              "suite": "persisted-recovery/post-wake",
+              "run_id": "sec2-1789164643",
+              "outcome": "passed_dev_installed_secret_binding_slice",
+              "result_path": "planning/developer-environments/secret-bindings-dev-evidence.json",
+              "result_sha256": "aabd41b8b598b91ebf59263a77c0251254f32bef0fd3568074bac93b0881aa03",
+              "checksums_sha256": "c9c549ddbf1176692cb8d263ca1323108c4d86ba4eb8bc117887f2d688eb3b8f",
+              "release_certified": false
+            }
+          ],
+          "note": "Measured on an installed slice: gate.secrets.snapshots_scoped_redacted sub-check secret_bindings_scoped_redacted PASS with zero failed assertions (candidate 0.4.0-rc34). The bound Machine read the planted value and its sibling in the same Environment could not; a foreign Environment could not read the path and a from_environment request was refused; every secret_binding_used record named this Environment, Machine and binding; and the value occurred 0 times across 408 artifacts in 7 groups. DEV rather than ACTIVE because this is a development candidate, not release-certified evidence."
         },
         "volumes": {
           "status": "PLANNED",
