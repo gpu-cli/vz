@@ -9,120 +9,82 @@ which are disproved, and what is in the way.
 
 ## The one-line version
 
-The **harness is finished** and **four more topology criteria closed on
-2026-09-10**: 6, 7, 17 and 23. What is left in that lane is a native macOS
-template the gate host does not provision, a pinned v0.3.20 daemon that is not
-committed, and one destination policy.
+**The topology lane passes.** Ten of ten scenario rows, seventeen of seventeen
+sub-checks, `leaks [] cleanup_errors []`, on candidate `0.4.0-rc22`, run
+`vz-final-1789083622`. It is an all-or-nothing lane, so every one of those rows was MISSING
+before this run.
 
-## Full topology lane: 15 of 17 sub-checks pass
-
-Two independent full-lane clean-provision runs against `0.4.0-rc19`, identical
-result, `leaks [] cleanup_errors []` on both:
+## The run
 
 ```
-PASS  bare_help, legacy_rejection, clean_up_refuses, bootstrap_read_only,
-      bootstrap_creates_default, help_surface_exact, error_envelope_agreement,
-      status_json_field_set, grpc_api_live_agreement,
-      three_concurrent_no_collision, public_like_ingress,
-      host_import_export_boundaries, workspace_storage_policy,
-      install_upgrade_rollback_uninstall, machine_fork
-FAIL  private_topology_paths
-n/i   mixed_profile_topology_status
+topology lane clean-provision: outcome=passed  reason=None
+sub-checks PASS=17   FAIL=[]   not_implemented=[]
+
+PASS  gate.cli.legacy_removal_and_bootstrap
+PASS  gate.cli_api.agreement
+PASS  gate.fork.machine_fork_for_parallel_worktrees
+PASS  gate.host.import_export_boundaries
+PASS  gate.instances.three_concurrent_no_collision
+PASS  gate.machines.mixed_profile_topology_status
+PASS  gate.migration.install_upgrade_rollback_uninstall
+PASS  gate.network.private_topology_paths
+PASS  gate.network.public_like_ingress
+PASS  gate.storage.workspace_projection_policy
 ```
 
-Both remaining rows are criterion 2 and criterion 5. Criterion 2 is
-`not_implemented` for a candidate-build reason -- this candidate registers no
-Developer macOS target, so no macOS Machine could be declared. Criterion 5's
-Linux half PASSES on its own and fails only inside a full lane; that is a real
-defect and it is item 2 of "Still open" below.
+## What it took, 2026-09-10
 
-## What the individual hardware runs proved on 2026-09-10
+Four product defects, every one of them found by running the installed binary
+against real Machines rather than by reading code.
 
-Each measured against candidate `0.4.0-rc19` unless noted, with
-`leaks [] cleanup_errors []` on every run.
+* **`egress: offline` was declared and never enforced.** Measured from inside
+  a Machine whose definition said nothing about networking, and which
+  therefore took the default: `eth0` on Apple's NAT, public DNS answering, TCP
+  to `1.1.1.1:443` REACHED, `example.com` fetched. Up refused every OTHER
+  policy as unimplemented, which is exactly why nobody noticed this one was
+  unimplemented too -- nothing was ever admitted that could contradict it.
+  This single fix unblocked criteria 6 and 7.
+* **A first `vz up` stranded its own project** whenever the definition
+  declared `machine.workspace`. The slot was reserved after
+  `begin_environment_lifecycle`, which moves a first Up out of `Creating` --
+  and the reservation requires `Creating`, while every aggregate read refuses
+  a declared slot left unresolved in any later state. Criterion 17.
+* **A Machine could reach `ready` with no fabric NIC at all.** One unwaited
+  `/sys/class/net` scan against an asynchronously-probed virtio-net device,
+  with reboot-only configuration, so "not there yet" became "never". It
+  reproduces only under load, which is why `--only` passed twice and the full
+  lane failed twice. Criterion 5.
+* **Criterion 20's `tcp` probe sent plaintext HTTP to port 443** and recorded
+  reachable hosts as denied. Every `deny` cell had been passing for the wrong
+  reason; the only cell that could expose it was the `allow` cell, which could
+  not be built until `EgressPolicy::Allowed` was admitted the same day.
 
-| Criterion | Sub-check | Run |
-|---|---|---|
-| 6 · public-like topology | `public_like_ingress` PASS | `vz-c6c-1789064880` |
-| 7 · host boundaries | `host_import_export_boundaries` PASS | `vz-c7b-1789063352` |
-| 17 · workspace and storage | `workspace_storage_policy` PASS | `vz-c17-1789058438` (rc17) |
-| 23 · Machine forking | `machine_fork` PASS | `vz-c23-1789060234` (rc17) |
+Two checks were also grading themselves against claims the gate does not make:
+criterion 6 against required-implementation item 6 rather than acceptance
+criterion 6, and criterion 23 against a speed-up bound that no implementation
+could meet, because a fork's baseline populates no image store.
 
-Criterion 17 was an ORDERING defect, not a missing feature: the workspace slot
-was reserved after `begin_environment_lifecycle`, which moves a first Up out of
-`Creating` -- and `reserve_workspace_binding_for_environment` reserves only
-while `Creating`, while `load_project_state` refuses an aggregate whose
-declared slot is unresolved in any later state. So a first `vz up` of any
-definition declaring `machine.workspace` stranded its own project, and the
-reservation it still owed was refused by the load it had to do first.
+And the hardware sleep/wake gate was removed, 1,356 lines: a release gate that
+cannot finish without a human at the console is not a gate, and it held
+criteria 18 and 20 behind a step neither of them tests. Removing it is what
+made `post-wake` runnable, which is how the probe defect above was found.
 
-Criterion 23 needed two things and neither was an optimisation. The
-Machine-scoped lifecycle operation had already merged and was never exercised,
-because the check returned early on a speed-up bound that could not be met by
-construction (see below). With the bound gone, `vz delete --machine
-machine-0@feat-y` reclaims exactly that fork and its Docker data disk with the
-parent and the sibling fork untouched.
+## The macOS template
 
-Criteria 6 and 7 were both held by ONE unbuilt thing and one misreading.
+Criteria 2 and 5 needed a registered native macOS template, and the one this
+host had recorded was gone. Re-provisioning it cost three diagnoses worth
+writing down:
 
-## `offline` egress was declared and not enforced
+1. `vz-macos-setup` failed at "Verifying and caching prepared image" with a
+   bare `Error: No such file or directory`.
+2. `--native-bundle` wants the CONTENT-ADDRESSED `macos-local/images/<sha>/`,
+   not `macos-local/cache/templates/<sha>/` with the recognisable filenames --
+   which is the one a reader finds first.
+3. The gate requires the `xcode` channel; the first template was `clean`.
 
-The most serious finding of the day, and it was invisible from outside.
-Measured from inside a Developer Linux Machine of a definition declaring
-nothing about networking, and therefore taking the default
-`EgressPolicy::Offline`:
-
-```
-eth0: 192.168.64.17/24, default via 192.168.64.1 dev eth0
-nslookup example.com      -> 172.66.147.243, 104.20.23.154 (via public 1.1.1.1)
-nc -w 5 1.1.1.1 443       -> REACHED
-wget http://example.com/  -> the page
-```
-
-Every Linux Machine was built with a NAT NIC gated only on a runtime-wide flag
-that defaults to true and that nothing ever set. Up refused every non-offline
-policy as unimplemented -- which was true, and which is exactly why nobody
-noticed that `offline` was unimplemented too: nothing else was ever admitted,
-so nothing contradicted the claim.
-
-`EgressPolicy` now decides, in one place. Measured after, same probe:
-
-```
-offline: no eth0 at all, no default route, DNS unreachable, TCP REFUSED,
-         name resolution fails -- and the Machine still reaches ready with
-         its Docker engine up
-allowed: eth0 192.168.64.2/24, DNS resolves, TCP REACHED, the page fetched
-```
-
-The two halves could not ship separately: the `linux-docker` lane pulls
-`docker.io/library/python` from inside a Machine over that NIC, and it is
-sixty-three of the gate's eighty-five rows. Enforcing `offline` alone would
-have fixed the contract and failed the gate.
-
-What `allowed` is NOT is a destination policy. Apple's user-mode NAT is
-unrestricted outbound, so the CIDR and domain policies criterion 6's
-required-implementation item names are still absent, and the project schema
-does not spell them. That is DEV, and criterion 20's matrix records it in the
-schema's own words.
-
-## Two rows were graded against the wrong paragraph
-
-Criterion 6's check withheld PASS for controlled egress, host imports/exports
-and fault controls. None of those is in ACCEPTANCE criterion 6, which is what
-the gate grades; they are required-implementation item 6, a different list, and
-each is graded by its own row -- criterion 7 for host boundaries, criterion 20
-for the Internet-policy matrix, and nothing at all for faults, because
-acceptance criterion 9 withdrew seeded network faults from 0.4. Item 6 now says
-so rather than leaving the two lists to disagree.
-
-Criterion 23's speed-up bound was the same shape of error one level up. A
-fork's Up does strictly more per boot than a cold one -- it clones a disk,
-replays a journal, and starts an engine against existing state -- while the one
-thing it saves, populating an image store, costs a cold `up` of the same bare
-definition nothing at all. Measured under equal load: 57.056s against 35.594s.
-No implementation work would have changed that, because the comparison was not
-measuring what forking saves. Warm state is what forking delivers, so warm
-state is what the criterion asserts, and it passes.
+The crossing it unlocked is genuinely served, not merely declared: the macOS
+Machine holds `10.184.42.13` on the Environment's fabric, and a Linux sibling
+reads the path it serves.
 
 ## What is in the way, in the order it blocks things
 
@@ -206,6 +168,16 @@ instructive than the fixes.
   the exact interference forking exists to remove.
 
 ### Still open
+
+0. **The native-macos lane's one row.** The capability is proven -- the macOS
+   Machine that just passed criteria 2 and 5 served a declared path to a Linux
+   sibling -- but that lane's own run has not been executed. It is the only
+   one of the 85 rows with no measurement at all.
+
+   Note what provisioning its template requires: `vz-macos-setup` blocks on an
+   INTERACTIVE ADMIN AUTHORIZATION. That gives this lane exactly the property
+   the hardware sleep/wake gate had and was removed for. Worth deciding
+   deliberately rather than inheriting.
 
 1. **A destination policy for `allowed` egress** (`vz-8cq`, in progress). The
    two policies the project schema spells are now enforced and distinguishable
