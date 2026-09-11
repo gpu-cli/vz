@@ -7808,9 +7808,32 @@ def check_deterministic_agent_workers(ctx: CheckContext, top: str, established: 
             check.check(isinstance(receipt.get("exit_code"), int) and receipt["exit_code"] != 0,
                         f"{step}: a nonzero exit status (receipt {receipt.get('exit_code')!r})")
         elif kind == "cancelled":
-            check.check(receipt.get("state") == "quiesced",
-                        f"{step}: its own deadline cancelled it and the runtime proved no live work remained "
-                        f"(receipt state {receipt.get('state')!r}, expected 'quiesced')")
+            # Two outcomes are honest here, and this used to accept only the
+            # weaker one.
+            #
+            # `quiesced` is documented as "positive no-live-work proof; command
+            # side effects and exit status MAY BE UNKNOWN". `completed` carries
+            # an exit status as well. A runtime whose guest reaps the process
+            # group it killed on the deadline reports the second, and this
+            # clause failed it for not having done less: measured on hardware,
+            # state `completed` with exit code 143, which is SIGTERM.
+            #
+            # What the criterion is about is that the step did not run to its
+            # own conclusion and nothing of it is still live. So either state
+            # is admitted, and a known exit status must be a violent one --
+            # this step sleeps 600 seconds under a 2-second timeout, so a
+            # natural 0 would mean the cancellation never happened.
+            state, code = receipt.get("state"), receipt.get("exit_code")
+            if state == "completed":
+                check.check(isinstance(code, int) and code != 0,
+                            f"{step}: its own deadline cancelled it, and the runtime reaped what it "
+                            f"killed rather than only proving quiescence (state {state!r}, exit "
+                            f"{code!r}; a zero exit would mean it ran to completion instead)")
+            else:
+                check.check(state == "quiesced",
+                            f"{step}: its own deadline cancelled it and the runtime proved no live work "
+                            f"remained (receipt state {state!r}, expected 'quiesced' or 'completed' "
+                            f"with a nonzero exit)")
     check.check(len(set(executions)) == len(executions),
                 f"every execution carries its own execution id ({len(set(executions))} of {len(executions)})")
 

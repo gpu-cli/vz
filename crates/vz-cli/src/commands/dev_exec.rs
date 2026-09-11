@@ -108,6 +108,13 @@ impl Drop for RawTerminal {
 }
 
 /// Return the actual guest exit status; caller exits after terminal restoration.
+/// The window a guest PTY is given when the caller has no terminal of its own.
+///
+/// The classic VT100 default, and the same one `stty` reports for a pty with
+/// no size set. It matters only until a real resize arrives.
+const DEFAULT_TERMINAL_COLUMNS: u16 = 80;
+const DEFAULT_TERMINAL_ROWS: u16 = 24;
+
 pub async fn cmd_dev_exec(args: DevExecArgs, json_output: bool) -> Result<i32, ExecCommandError> {
     let token = uuid::Uuid::new_v4();
     let request_id = args
@@ -190,8 +197,28 @@ pub async fn cmd_dev_exec(args: DevExecArgs, json_output: bool) -> Result<i32, E
             .map(|workspace| workspace.workspace_key)
     };
     let mut dimensions = if args.tty {
-        let (columns, rows) = crossterm::terminal::size()
-            .map_err(|error| local("terminal_unavailable", error.to_string()))?;
+        // `--tty` asks for a PTY in the GUEST. The local terminal's size is
+        // only the window to mirror into it, and there may not be one: a
+        // caller whose stdout is a pipe -- a CI job, a test driver, anything
+        // capturing the transcript -- still wants the guest to see a terminal.
+        //
+        // `crossterm::terminal::size()` reports 0x0 in that case rather than
+        // failing, and `MachineExecutionSpec::validate` refuses a terminal
+        // with a zero dimension, so the CLI was building a request its own
+        // daemon rejects. Measured: criterion 12's PTY step came back
+        // `validation_error: invalid execution argv, timeout, environment or
+        // terminal dimensions` before a byte reached the Machine.
+        //
+        // So a size we cannot read is a default, not a refusal. 80x24 is what
+        // every terminal falls back to, and a caller that does have a terminal
+        // is unaffected -- it reports its real size here and the resize
+        // handler below keeps the guest in step.
+        let (columns, rows) = crossterm::terminal::size().unwrap_or((0, 0));
+        let (columns, rows) = if columns == 0 || rows == 0 {
+            (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_ROWS)
+        } else {
+            (columns, rows)
+        };
         Some(MachineExecutionTerminal { rows, columns })
     } else {
         None
@@ -259,7 +286,11 @@ pub async fn cmd_dev_exec(args: DevExecArgs, json_output: bool) -> Result<i32, E
                 match event.output {
                     MachineExecOutput::Ready=>{
                         ready=true;
-                        if args.tty {crossterm::terminal::enable_raw_mode().map_err(|error|local("terminal_unavailable",error.to_string()))?;raw.0=true;}
+                        // Raw mode is about THIS process's stdin, not the guest's PTY. A caller
+                        // whose stdin is a pipe has no raw mode to enter and needs none; asking
+                        // anyway fails, and failing there would deny a headless caller the guest
+                        // terminal it legitimately asked for.
+                        if args.tty && std::io::stdin().is_terminal() {crossterm::terminal::enable_raw_mode().map_err(|error|local("terminal_unavailable",error.to_string()))?;raw.0=true;}
                         if args.no_stdin {stream.stdin_eof().await.map_err(client_error)?;}else{reading=true;}
                         if json_output {println!("{}",json!({"schema_version":1,"record_type":"execution_ready","scope":event.scope,"sequence":event.sequence}));}
                     },
