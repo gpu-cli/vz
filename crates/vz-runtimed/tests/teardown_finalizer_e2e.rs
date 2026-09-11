@@ -210,6 +210,7 @@ fn install_stack_authority(store: &StateStore, stack_id: &str) -> MachineWorkloa
             }],
             networks: Vec::new(),
             endpoints: Vec::new(),
+            volumes: Vec::new(),
         },
     };
     let environment = EnvironmentInstance {
@@ -227,6 +228,7 @@ fn install_stack_authority(store: &StateStore, stack_id: &str) -> MachineWorkloa
         active_operation_id: None,
         bindings: Vec::new(),
         machines: vec![MachineInstance {
+            fork: None,
             docker_context: None,
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             machine_id: machine_id.clone(),
@@ -267,6 +269,7 @@ fn install_stack_authority(store: &StateStore, stack_id: &str) -> MachineWorkloa
                 machine_id: Some(machine_id),
             },
         ],
+        volumes: Vec::new(),
         legacy_migration: None,
         created_at: 1,
         updated_at: 1,

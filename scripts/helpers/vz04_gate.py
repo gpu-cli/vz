@@ -202,7 +202,13 @@ def run(args) -> int:
                                            release=release, frozen=frozen)
     if not args.dry_lanes:
         clash = [e for e in index["entries"] if e["candidate_tuple_sha256"] == tuple_value["sha256"] and not e["developer_overrides"]]
-        require(not clash, f"candidate tuple already recorded as run {clash[0]['run_id']}; a new tuple is required")
+        # The message is built ONLY when there is a clash to describe. It used to
+        # be an f-string argument to `require`, which Python evaluates eagerly --
+        # so `clash[0]` raised IndexError on the path where there is no clash,
+        # and the gate could not start a run with a FRESH candidate tuple at all.
+        # The one path that worked was the refusal.
+        if clash:
+            require(False, f"candidate tuple already recorded as run {clash[0]['run_id']}; a new tuple is required")
 
     if args.state_root is None:
         state_root = Path(tempfile.mkdtemp(prefix=f"vz04-{run_id}-")).resolve()
