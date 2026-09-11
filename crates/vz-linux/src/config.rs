@@ -802,6 +802,63 @@ mod tests {
         }
     }
 
+    /// An image that ships NO resolv.conf gets an empty one, not none.
+    ///
+    /// Until `EgressPolicy::Offline` was enforced this could not happen: every
+    /// Machine also had a NAT NIC whose `udhcpc` wrote a resolv.conf as a side
+    /// effect, so the file was always there for reasons nobody had decided.
+    /// Withholding the attachment left readers with ENOENT, and criterion 8's
+    /// resolver clause reported "its Machine's resolver view is readable
+    /// (expected exit 0, observed 1)".
+    ///
+    /// Empty and absent say different things. Empty is "asked, and there is no
+    /// nameserver to ask", which is the truth for an offline Machine and what
+    /// every resolver library handles. Absent is "this image is broken".
+    #[test]
+    fn a_machine_with_no_resolver_and_no_image_file_gets_an_empty_one() {
+        let fixture = tempfile::Builder::new()
+            .prefix("vz-environment-resolver-absent-")
+            .tempdir()
+            .expect("temp root");
+        let root = fixture.path().to_path_buf();
+        for prefix in ["", "merged"] {
+            fs::create_dir_all(root.join(prefix).join("etc")).expect("etc");
+        }
+        fs::write(
+            root.join("cmdline"),
+            "console=hvc0 vz.net.0=02:aa:bb:cc:dd:03,10.9.0.5/24\n",
+        )
+        .expect("fake cmdline");
+        let busybox = cat_only_busybox(&root);
+
+        let mut script = relocated_resolver_block(&root, &busybox);
+        script = script.replace(
+            "write_fabric_resolver \"\"",
+            &format!("write_fabric_resolver \"{}\"", root.display()),
+        );
+        script.push_str(&format!(
+            "\nwrite_fabric_resolver \"{}\"\n",
+            root.join("merged").display()
+        ));
+        let script_path = root.join("resolver.sh");
+        fs::write(&script_path, script).expect("write harness script");
+        let output = std::process::Command::new("/bin/sh")
+            .arg(&script_path)
+            .output()
+            .expect("run the guest resolver block");
+        assert!(output.status.success());
+
+        for prefix in ["", "merged"] {
+            let path = root.join(prefix).join("etc/resolv.conf");
+            assert!(path.is_file(), "prefix {prefix:?}: the file must exist");
+            assert_eq!(
+                fs::read_to_string(&path).expect("resolv.conf"),
+                "",
+                "prefix {prefix:?}: and name no nameserver"
+            );
+        }
+    }
+
     /// Run the endpoint-name block against `cmdline`, with the roots it should
     /// write into already carrying an `etc` directory.
     ///

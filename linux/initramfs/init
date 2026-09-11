@@ -419,7 +419,28 @@ write_fabric_resolver() {
   done
   if [ "$wfr_written" = 1 ]; then
     echo "[vz-init] Environment resolver written to $wfr_root/etc/resolv.conf"
+    return 0
   fi
+  # No declared resolver: the file exists and names no nameserver.
+  #
+  # It used to simply not exist, and nothing noticed, because every Machine
+  # also had a NAT NIC whose `udhcpc` wrote one as a side effect. That was
+  # never a declared behaviour -- nobody had decided the Machine should have a
+  # resolver, it just came with an attachment nobody had decided to withhold.
+  # Enforcing `EgressPolicy::Offline` removed the attachment, and readers
+  # started getting ENOENT.
+  #
+  # Empty rather than absent, because the two say different things. An empty
+  # resolv.conf is "asked, and there is no nameserver to ask" -- which is the
+  # truth for an offline Machine with no declared resolver, and what every
+  # resolver library is built to handle. A missing file is "this image is
+  # broken", and a caller cannot tell that from a Machine that was never
+  # configured.
+  if [ -e "$wfr_root/etc/resolv.conf" ]; then
+    return 0
+  fi
+  : > "$wfr_root/etc/resolv.conf" || return 1
+  echo "[vz-init] no declared resolver; wrote an empty $wfr_root/etc/resolv.conf"
   return 0
 }
 
