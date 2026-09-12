@@ -487,13 +487,32 @@ class Replay:
         row = self.take(args)
         ids = {role: items[0]["Id"] for role, items in services.items()}
         times = {}
+        # `--since` and `--until` are whole SECONDS, and the window they name is
+        # therefore `[since, until + 1)` in nanoseconds: `docker events --until
+        # <second>` returns events from within that second, not only the ones at
+        # its exact instant. Comparing against `until * 10**9` made the last
+        # fraction of the final second foreign, and that is not a hypothetical
+        # -- it rejected the whole linux-docker lane on
+        #   exec_die 1789191564006388623 with --until 1789191564
+        # six milliseconds over. Nothing is loosened at the far end: an event
+        # from the NEXT second is still out of window.
+        since, until = int(args[2]) * 10**9, (int(args[4]) + 1) * 10**9
         for event in map(decode, row["_stdout"].splitlines()):
             if event["Type"] != "container":
                 continue
             actor, stamp = event["Actor"], event["timeNano"]
-            require(actor["ID"] in ids.values() and actor["Attributes"]["com.docker.compose.project"] == project
-                    and type(stamp) is int and int(args[2]) * 10**9 <= stamp <= int(args[4]) * 10**9,
-                    "foreign or out-of-window event")
+            # Named separately, so the next one to fail says which half it
+            # broke and with what. "foreign or out-of-window" sent two runs
+            # looking for the wrong thing.
+            require(actor["ID"] in ids.values(),
+                    f"foreign container in event stream: {actor['ID'][:12]} is none of "
+                    f"{sorted(value[:12] for value in ids.values())}")
+            require(actor["Attributes"]["com.docker.compose.project"] == project,
+                    f"foreign compose project in event stream: "
+                    f"{actor['Attributes'].get('com.docker.compose.project')!r} is not {project!r}")
+            require(type(stamp) is int and since <= stamp < until,
+                    f"out-of-window event: {event['Action']} at {stamp} is outside "
+                    f"[{since}, {until}) for --since {args[2]} --until {args[4]}")
             times.setdefault((actor["ID"], event["Action"]), []).append(stamp)
         def one(role, action):
             values = times.get((ids[role], action), [])
