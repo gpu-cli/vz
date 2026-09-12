@@ -95,6 +95,33 @@ def describe_leaks(leaks: list) -> str:
                      for kind, names in sorted(kinds.items()))
 
 
+def remove_lane_root(root: Path) -> None:
+    """Remove one lane root, including the directories a Machine store sealed.
+
+    A Machine's runtime store stages immutable artifacts -- `vmlinux` among
+    them -- and then drops write permission on the directory holding them, so a
+    plain `rmtree` cannot unlink its contents:
+
+      cannot remove lane root /private/tmp/vzt-d883be7a3a42:
+      [Errno 13] Permission denied: 'vmlinux'
+
+    Every run therefore left its whole lane root behind and reported leaks for a
+    tree it had sealed itself; 1,917 of them had accumulated on this host.
+    Write permission is restored on the DIRECTORIES on the way out -- a file's
+    own mode has no bearing on unlinking it -- and only under a root this lane
+    owns and has already decided to remove.
+    """
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path.is_dir() and not path.is_symlink():
+            try:
+                path.chmod(path.stat().st_mode | 0o700)
+            except OSError:
+                # If it actually matters, the rmtree below says so.
+                pass
+    root.chmod(root.stat().st_mode | 0o700)
+    shutil.rmtree(root)
+
+
 class Rejected(Exception):
     """Argument/contract/release admission failure (exit 2)."""
 

@@ -571,6 +571,28 @@ class TopologyLaneTests(unittest.TestCase):
                 polls = {poll["id"] for poll in crash["readiness_polls"]}
                 self.assertIn("poll.crash.daemon_pid_absent", polls)
 
+    def test_a_sealed_machine_store_does_not_defeat_final_cleanup(self):
+        """`remove_lane_root` removes what a plain `rmtree` cannot.
+
+        A Machine's runtime store stages `vmlinux` and then drops write
+        permission on the directory holding it, so final-cleanup could not
+        unlink its own lane root and reported every file under it as a leak.
+        The control is the first half: a plain `rmtree` must fail on exactly
+        this shape, or the fix is testing nothing.
+        """
+        root = self.tmp / "sealed-lane-root"
+        inner = root / "store" / "artifacts"
+        inner.mkdir(parents=True)
+        (inner / "vmlinux").write_bytes(b"kernel")
+        inner.chmod(0o555)
+        (root / "store").chmod(0o555)
+        self.addCleanup(lambda: e2e.remove_lane_root(root) if root.exists() else None)
+        with self.assertRaises(PermissionError) as refused:
+            shutil.rmtree(root)
+        self.assertEqual(Path(refused.exception.filename).name, "vmlinux")
+        e2e.remove_lane_root(root)
+        self.assertFalse(root.exists())
+
     def test_post_wake_without_a_pre_sleep_record_is_a_prerequisite_failure(self):
         """Post-wake must not invent what should have survived."""
         evidence = self.evidence()
