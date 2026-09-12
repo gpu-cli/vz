@@ -664,7 +664,18 @@ fn assert_boundary_contract(evidence: &Value) {
     let replay = &evidence["replay"];
     let post_store = &evidence["post_replay"]["store"];
     let post_runtime = &evidence["post_replay"]["runtime"];
-    assert_eq!(pre_store["schema_version"], 9);
+    // The store's OWN current version, not a literal. This asserted `9` while
+    // the store had migrated to 12, and nothing said so for as long as nobody
+    // ran the suite: it is `--ignored`, so only the sandbox-vm lane reaches it,
+    // and that lane stopped at `LINUX_DOCKER_CONTEXT` before it ever did.
+    //   assertion `left == right` failed
+    //     left: Number(12)
+    //    right: 9
+    // A literal here re-rots on the next migration; the constant cannot.
+    assert_eq!(
+        pre_store["schema_version"],
+        crate::state_store::StateStore::CURRENT_SCHEMA_VERSION
+    );
     assert_eq!(pre_store["action_schema_version"], 3);
     assert_eq!(pre_store["session_status"], "active");
     assert_eq!(pre_store["session_cursor"], 0);
@@ -675,7 +686,10 @@ fn assert_boundary_contract(evidence: &Value) {
         pre_store["audit_action_hash"]
     );
     assert_eq!(pre_store["ready"], false);
-    assert_eq!(post_store["schema_version"], 9);
+    assert_eq!(
+        post_store["schema_version"],
+        crate::state_store::StateStore::CURRENT_SCHEMA_VERSION
+    );
     assert_eq!(post_store["action_schema_version"], 3);
     assert_eq!(post_store["audit_rows"], 1);
     assert_eq!(
