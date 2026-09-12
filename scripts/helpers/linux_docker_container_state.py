@@ -147,9 +147,22 @@ def new_generation(before, after):
 def stopped(row, exit_code):
     require(type(exit_code) is int and exit_code in (0, 37, 130, 137, 143, 126, 127), 'unexpected exit expectation')
     state = row['State']
-    require(state['Status'] == 'exited' and state['Running'] is False and type(state['Pid']) is int and
-            state['Pid'] == 0 and type(state['ExitCode']) is int and state['ExitCode'] == exit_code and
-            timestamp(state['FinishedAt']) >= timestamp(state['StartedAt']), 'stopped state/exit differs')
+    # Six claims, named one at a time. As one conjunction the message was
+    # 'stopped state/exit differs' and nothing else -- it failed a whole
+    # linux-docker final-cleanup phase, and five gate rows with it, without
+    # saying which clause broke or what it observed. The same repair the
+    # registry startup assertion and the compose event window already needed.
+    require(state['Status'] == 'exited',
+            f"stopped container status: {state.get('Status')!r}, expected 'exited'")
+    require(state['Running'] is False,
+            f"stopped container still running: {state.get('Running')!r}")
+    require(type(state['Pid']) is int and state['Pid'] == 0,
+            f"stopped container pid: {state.get('Pid')!r}, expected 0")
+    require(type(state['ExitCode']) is int and state['ExitCode'] == exit_code,
+            f"stopped container exit code: {state.get('ExitCode')!r}, expected {exit_code}")
+    require(timestamp(state['FinishedAt']) >= timestamp(state['StartedAt']),
+            f"stopped container finished before it started: "
+            f"FinishedAt {state.get('FinishedAt')!r} < StartedAt {state.get('StartedAt')!r}")
     return {'exit_code': exit_code, 'signal_delivery_certified': False, 'host_replay_required': True,
             'youki_process_inventory_required': True}
 
