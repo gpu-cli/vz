@@ -446,9 +446,16 @@ def execute(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
                 pipe.close()
 
 
+# How many bytes `contains_canary` will decode before it gives up and fails
+# closed. Named so a caller can avoid handing it more than it can scan: a
+# larger input comes back True for having exhausted the budget, which is
+# indistinguishable from having found a canary.
+CANARY_SCAN_BUDGET = 128 * 1024 * 1024
+
+
 def contains_canary(streams: tuple[bytes, ...], canaries: list[bytes]) -> bool:
     """Fail closed on private strings or an exhausted bounded decoding budget."""
-    return _contains_canary(streams, canaries, 0, [128 * 1024 * 1024])
+    return _contains_canary(streams, canaries, 0, [CANARY_SCAN_BUDGET])
 
 
 def _contains_canary(streams, canaries, depth, remaining):

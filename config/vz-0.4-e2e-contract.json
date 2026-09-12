@@ -145,6 +145,12 @@
       "condition": "native macOS Machine guest agent answers exec",
       "deadline_seconds": 600,
       "interval_seconds": 5
+    },
+    {
+      "id": "poll.crash.daemon_pid_absent",
+      "condition": "the SIGKILLed daemon's pid is absent from the host process table",
+      "deadline_seconds": 30,
+      "interval_seconds": 1
     }
   ],
   "listener_checks": {

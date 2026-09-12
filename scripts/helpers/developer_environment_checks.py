@@ -2262,7 +2262,13 @@ def check_lifecycle_recovery(ctx: CheckContext, top: str, established: dict) -> 
 CRASH_SIGNAL = 9
 CRASH_GONE_DEADLINE = 30
 CRASH_GONE_POLL = "poll.crash.daemon_pid_absent"
-CRASH_GONE_INTERVAL = 0.1
+# Whole seconds, because `readiness_polls[].interval_seconds` in the contract
+# is an integer and a poll that is not DECLARED there is a gate finding:
+#   lane.undeclared_poll ... readiness poll poll.crash.daemon_pid_absent
+#   not declared in contract
+# It costs nothing: the first sample happens before any sleep, and the
+# measured run saw the process gone on that first sample.
+CRASH_GONE_INTERVAL = 1
 # `nslookup`'s own answer lines, which name the resolver that answered and the
 # port it answered on. Parsed rather than trusted: "the name resolved" does not
 # say WHICH resolver did, and criterion 10's port-state clause is about the

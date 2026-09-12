@@ -44,7 +44,15 @@ KIND_TO_SCHEMA = {
     "vz-0.4-receipt": "receipt", "vz-0.4-run-index": "run-index",
 }
 UNKINDED_ALLOWED = frozenset(("invocation.json", "lane-result.rejected.json"))
-MAX_SCAN = 512 * 1024 * 1024
+# Never larger than what `contains_canary` can actually decode. It fails closed
+# on an exhausted budget, so a file between the two bounds was READ, gave up,
+# and was then reported as
+#   canary.present ...: evidence contains the 'vz04-canary-' canary prefix
+# which accuses the run of leaking a fixture secret when all that happened is
+# that the file was too big to look at. A 288 MB BuildKit cache tar landed in
+# exactly that window. Too large to scan is `canary.unscannable`, which says
+# what is true.
+MAX_SCAN = driver.CANARY_SCAN_BUDGET
 
 
 class Findings:
