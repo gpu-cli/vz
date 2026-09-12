@@ -214,6 +214,20 @@ required E2E scenario and retained evidence:
     is not a gate row. Recovery across sleep/wake remains a product claim and
     is checked by hand when the release is exercised; it is no longer something
     a gate run can block on.
+
+    *What the crash clause injects, and why it is one signal.* The gate
+    SIGKILLs the `vz-runtimed` process hosting a live Environment and requires
+    the next `vz up` to bring routes, sockets, DNS and port state back within
+    the manifest's pinned `up` deadline, with the identity the Environment had
+    and without answering for a foreign Environment's declared name. Two of the
+    three named targets are the same process here and the check measures that
+    rather than assuming it: every Machine runtime is hosted inside the daemon,
+    so nothing of the isolate's runtime outlives it and the daemon crash is
+    also the adapter crash and the guest's power cut. A guest-agent crash with
+    the VM still running is the one case that is NOT injected -- the agent runs
+    in the Machine's root PID namespace and `vz exec` lands in the container's,
+    so no public verb can signal it -- and it is tracked on `vz-d64` rather
+    than claimed.
 11. **Deletion safety:** deleting one Environment removes only its Machines,
     disks, sockets, contexts, routes, DNS, ports, credentials, and faults. The
     other Environments continue serving traffic and retain byte-identical

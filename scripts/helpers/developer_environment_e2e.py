@@ -408,6 +408,13 @@ class Lane:
         subchecks, crash = {CRITERION_10: [], CRITERION_18: [], CRITERION_20: []}, None
         try:
             subchecks[CRITERION_10].append(checks.check_lifecycle_recovery(ctx, CRITERION_10, established))
+            # AFTER the stop/up clause and BEFORE criterion 18/20, deliberately.
+            # It SIGKILLs one of these Environments' daemons, so the clause that
+            # reads all three across a graceful stop/up must run first and get a
+            # clean subject, and the checks that read them afterwards are the
+            # ones that would notice if the recovery this asserts were a
+            # pretence.
+            subchecks[CRITERION_10].append(checks.check_crash_recovery(ctx, CRITERION_10, established))
             subchecks[CRITERION_18].append(checks.check_secret_bindings_scoped_redacted(ctx, CRITERION_18))
             subchecks[CRITERION_18].append(checks.check_snapshot_restore_capability(ctx, CRITERION_18))
             subchecks[CRITERION_20].append(checks.check_exhaustive_denial_matrix(ctx, CRITERION_20, established))

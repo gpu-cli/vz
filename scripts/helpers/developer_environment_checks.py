@@ -58,9 +58,10 @@ from jsonschema import Draft202012Validator
 
 import frozen_tree
 
-from developer_environment_recorder import (ENDPOINT_NAME_BYTES, SOCKET_PATH_LIMIT, LaneState, Recorder, inventory,
-                                            inventory_diff, processes_referencing, write_inventory)
-from vz04_common import digest_file, load_json, now_ns, read_regular, write_exclusive
+from developer_environment_recorder import (ENDPOINT_NAME_BYTES, SOCKET_PATH_LIMIT, LaneState, Recorder,
+                                            daemon_fingerprint, inventory, inventory_diff, ps_rows,
+                                            processes_referencing, write_inventory)
+from vz04_common import GateError, digest_file, document, load_json, now_ns, read_regular, write_exclusive
 import vz04_host
 
 HELP_SNAPSHOT = "tests/fixtures/vz-0.4/cli/help-snapshot.txt"
@@ -256,7 +257,24 @@ class CheckContext:
         root from the state root for the same reason -- both phases of one run
         address the same one rather than a random per-invocation path.
         """
-        iso = self.isolate_paths(name, {"CARGO_BIN_EXE_vz-runtimed": self.state.daemon})
+        # `VZ_DOCKER_CLIENT` is part of the isolate's environment, not part of
+        # its first provisioning. `isolated(provision=True)` set it, and this
+        # did not -- which was invisible for as long as the daemon that
+        # inherited it was still alive. It stops being invisible the moment a
+        # reattached command has to SPAWN a daemon, which is exactly what
+        # criterion 10's crash clause does: the replacement daemon came up
+        # without a Docker client and Up failed with
+        #
+        #   Developer operational readiness failed; original Machine retained
+        #   for Stop: install a supported host Docker client or set
+        #   VZ_DOCKER_CLIENT
+        #
+        # blaming the host for something this function dropped. The docstring
+        # already said the two spellings must not drift; this is the drift.
+        overrides = {"CARGO_BIN_EXE_vz-runtimed": self.state.daemon}
+        if self.docker_client and self.docker_client != "none":
+            overrides["VZ_DOCKER_CLIENT"] = self.docker_client
+        iso = self.isolate_paths(name, overrides)
         absent = [str(path) for path in (iso["root"], iso["state"], iso["project"])
                   if not path.is_dir() or path.is_symlink()]
         if absent:
@@ -2082,8 +2100,13 @@ RECOVERY_UNEXERCISED = (
     # recovery Environments now declare a singly-attached writable block volume
     # whose mount is where the sentinel lives -- so "declared state survived
     # stop/up" IS the declared-volume claim, measured rather than deferred.
-    "daemon, adapter and guest crash recovery (no crash injection exists in this lane)",
-    "manifest recovery deadlines (the contract pins none for this lane)",
+    #
+    # Crash recovery and manifest deadlines are no longer here either. They are
+    # `check_crash_recovery` below, which SIGKILLs a real daemon hosting a real
+    # Environment and times the recovery against `deadlines_seconds` in
+    # `config/vz-0.4-e2e-contract.json`. The claim that "the contract pins
+    # none" was simply wrong: it pins `up` and `warm_recovery`, and both are
+    # asserted there.
 )
 
 
@@ -2191,11 +2214,327 @@ def check_lifecycle_recovery(ctx: CheckContext, top: str, established: dict) -> 
             check.check(text.rstrip().endswith(":0"),
                         f"{name}: the Environment-local resolver was reconstructed across stop/up and still "
                         f"answers the name it declared, {hostname!r} (observed {text.rstrip()[-40:]!r})")
-    if check.status == "PASS":
+    if check.status == "PASS" and RECOVERY_UNEXERCISED:
         check.not_implemented = ("criterion 10 also claims " + "; ".join(RECOVERY_UNEXERCISED) +
                                  ". The recovery of Environment and Machine identity, Docker context, "
                                  "Machine-local state and stop/up above did pass; these clauses were "
                                  "not exercised and are not claimed.")
+    return check.finish()
+
+
+# --------------------------------------------------------------------- criterion 10, crash clause
+#
+# "Daemon/adapter/guest crashes reconstruct authoritative routes, sockets, DNS,
+# and port state within manifest deadlines without cross-routing or stale
+# resources."
+#
+# WHAT IS INJECTED, AND WHY IT IS ONE SIGNAL AND NOT THREE. The criterion names
+# three crash targets. On this host x target pair two of them are the same
+# process, and that is measured here rather than assumed: every Machine runtime
+# is hosted inside `vz-runtimed` -- `MachineRuntimeEntry` owns the `vz_linux` VM
+# object and no separate VM host process exists -- so `related processes after
+# the crash` is asserted EMPTY. A daemon SIGKILL is therefore also the adapter
+# crash and the guest's power cut, and the assertion is what makes that a
+# finding instead of a claim: if a VM host process ever becomes separate, this
+# fails and says so.
+#
+# The guest agent is a third thing and is NOT injected here. It runs in the
+# Machine's own root PID namespace and `vz exec` lands inside the container's,
+# so nothing reachable through the product's five verbs can signal it. Recording
+# that honestly is better than a probe that kills something else and calls it a
+# guest crash.
+#
+# WHAT RECOVERY MEANS. Not "the daemon restarts" -- that alone was already true
+# and proved nothing. The Environment must come back serving, with the identity
+# it had, and each of the criterion's four nouns is asserted separately against
+# a value rather than against "something exists":
+#
+#   routes      the Machine holds its Environment's own fabric address again
+#   sockets     its Docker endpoint socket is bound again and `exec` answers
+#   DNS         its declared `.test` name resolves again, from its own resolver
+#   port state  that resolver answers on the gateway address, port 53
+#
+# plus the two negatives the sentence ends with: no stale resource the dead
+# daemon left is still bound, and a FOREIGN Environment's declared name still
+# does not resolve here. The foreign clause has the positive one as its control
+# -- a resolver that answered nothing would pass it vacuously, and cannot,
+# because the Environment's own name is required to resolve in the same probe.
+CRASH_SIGNAL = 9
+CRASH_GONE_DEADLINE = 30
+CRASH_GONE_POLL = "poll.crash.daemon_pid_absent"
+CRASH_GONE_INTERVAL = 0.1
+# `nslookup`'s own answer lines, which name the resolver that answered and the
+# port it answered on. Parsed rather than trusted: "the name resolved" does not
+# say WHICH resolver did, and criterion 10's port-state clause is about the
+# Environment's own.
+CRASH_RESOLVER_SERVER = re.compile(r"^Address:\s*(?P<address>[0-9.]+):(?P<port>\d+)\s*$", re.M)
+CRASH_DNS_PORT = 53
+RECOVERY_STATUS_TIMEOUT = 60
+
+
+def daemon_socket_serving(path: Path) -> bool:
+    """Whether anything accepts a connection on this AF_UNIX path.
+
+    The question a crashed daemon's leftovers have to answer. A socket FILE
+    proves nothing -- the inode outlives the process that bound it -- so a stale
+    resource is distinguished from a live one by connecting, exactly as
+    `developer_environment_recorder.stray_sockets` does.
+    """
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(2)
+    try:
+        probe.connect(str(path))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def crash_isolate_processes(instance: dict) -> list:
+    """Live processes whose command names ONE isolate's runtime directory.
+
+    `developer_environment_recorder.processes_referencing` asks the same
+    question of the whole lane, which is the wrong scope here: nineteen other
+    isolates' daemons are running and every one of them names the lane roots.
+    """
+    needle = str(instance["runtime"])
+    return [(pid, command) for pid, command in ps_rows()
+            if needle in command and pid != os.getpid()]
+
+
+def crash_docker_contexts(machines: list) -> list:
+    """Each Machine's Docker context identity, by Machine, sorted."""
+    rows = []
+    for machine in machines:
+        context = machine.get("docker_context") or {}
+        if context:
+            rows.append((machine.get("name"), context.get("name"), context.get("endpoint"),
+                         context.get("engine_id")))
+    return sorted(rows)
+
+
+def crash_fabric_address(ctx: CheckContext, check: SubCheck, label: str, instance: dict,
+                         machine: str):
+    """The Machine's non-loopback IPv4 address, or None."""
+    row = machine_exec(ctx, check, label, instance, machine, CROSS_ADDRESS_PROBE)
+    if row.exit_code != 0:
+        return None
+    for line in row.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == "ADDR" and not parts[2].startswith("127."):
+            return parts[2]
+    return None
+
+
+def crash_resolves(ctx: CheckContext, check: SubCheck, label: str, instance: dict, machine: str,
+                   hostname: str) -> tuple:
+    """(resolved, resolver address, resolver port) for one name inside a Machine."""
+    row = machine_exec(ctx, check, label, instance, machine,
+                       f'/bin/busybox nslookup {hostname} 2>&1; printf ":%s" $?')
+    text = row.stdout.decode("utf-8", "replace")
+    match = CRASH_RESOLVER_SERVER.search(text)
+    return (text.rstrip().endswith(":0"),
+            match.group("address") if match else None,
+            int(match.group("port")) if match else None)
+
+
+def check_crash_recovery(ctx: CheckContext, top: str, established: dict) -> SubCheck:
+    """SIGKILL a daemon hosting a live Environment, then require it all back."""
+    check = SubCheck(top, "crash_recovery")
+    contract = load_json(ctx.repo_root / E2E_CONTRACT)["deadlines_seconds"]
+    entries = established.get("environments") or []
+    # Two, because the cross-routing clause needs a name declared in another
+    # Environment to ask this one for.
+    if not check.check(len(entries) >= 2,
+                       f"the pre-sleep record names at least two Environments, so a foreign name "
+                       f"exists to test cross-routing with (observed {len(entries)})"):
+        return check.finish()
+    # The LAST one. Everything after this sub-check in the phase reads all three
+    # Environments, so the subject is the one whose recovery this check is
+    # itself responsible for proving before they are read again.
+    entry, foreign = entries[-1], entries[0]
+    name = entry["isolate"]
+    machine = (entry["machines"] or [{}])[0].get("name")
+    if not check.check(bool(machine), f"{name}: the record names a Machine to crash"):
+        return check.finish()
+    try:
+        instance = ctx.reattach(name)
+    except (ReattachError, KeyError) as error:
+        check.fail(str(error))
+        return check.finish()
+
+    # ---------------------------------------------------------------- before
+    # The installed daemon writes `<socket stem>.pid` beside its socket, which
+    # is how `developer_environment_recorder.daemon_artifacts` finds the pair.
+    socket_path = instance["runtime"] / "d.sock"
+    pid_file = socket_path.with_suffix(".pid")
+    try:
+        before = daemon_fingerprint(ctx.state, pid_file, socket_path)
+    except GateError as error:
+        check.fail(f"{name}: no positively identified daemon to crash: {error}")
+        return check.finish()
+    check.ok(f"{name}: the daemon hosting this Environment is pid {before['pid']}, running the "
+             f"release {ctx.state.daemon.name} ({before['executable_sha256'][:16]}) and owning "
+             f"{before['socket']}")
+    hosted = crash_isolate_processes(instance)
+    payload = read_status(ctx, check, "crash-" + name + "-before",
+                          project=instance["project"], env=instance["env"])
+    if check.status != "PASS" or not payload:
+        return check.finish()
+    environment = (payload.get("environments") or [{}])[0]
+    machines = environment.get("machines") or []
+    health = {item.get("name"): item.get("health") for item in machines}
+    check.check(health.get(machine) == "supervised",
+                f"{name}: before the crash the Machine reports health `supervised`, so a live "
+                f"session is hosting it (observed {health.get(machine)!r})")
+    contexts_before = crash_docker_contexts(machines)
+    check.check(bool(contexts_before),
+                f"{name}: every Developer Machine names a Docker context before the crash "
+                f"({contexts_before})")
+    address_before = crash_fabric_address(ctx, check, "crash-" + name + "-addr-before",
+                                          instance, machine)
+    check.check(address_before is not None,
+                f"{name}: the Machine holds a fabric address before the crash "
+                f"(observed {address_before!r})")
+    endpoints = environment.get("endpoints") or []
+    declared_port = endpoints[0].get("port") if endpoints else None
+    check.check(declared_port == PRIVATE_PORT,
+                f"{name}: the declared endpoint is published on port {PRIVATE_PORT} before the "
+                f"crash (observed {declared_port!r})")
+    if check.status != "PASS":
+        return check.finish()
+
+    # ----------------------------------------------------------------- crash
+    document(ctx.evidence_dir / f"crash-intent-{name}.json",
+             {"schema_version": 1, "signal": CRASH_SIGNAL, "daemon": before,
+              "hosted_processes": hosted, "environment_id": entry.get("environment_id"),
+              "scope": "exact_owned_daemon_pid_of_one_isolate_only", "started_unix_ns": now_ns()})
+    os.kill(before["pid"], CRASH_SIGNAL)
+    deadline, samples, gone = time.monotonic() + CRASH_GONE_DEADLINE, 0, False
+    while True:
+        samples += 1
+        gone = all(pid != before["pid"] for pid, _command in ps_rows())
+        if gone or time.monotonic() >= deadline:
+            break
+        time.sleep(CRASH_GONE_INTERVAL)
+    check.readiness_polls.append({"id": CRASH_GONE_POLL, "samples": samples,
+                                  "deadline_seconds": CRASH_GONE_DEADLINE, "satisfied": gone})
+    if not check.check(gone, f"{name}: the SIGKILLed daemon pid {before['pid']} is gone after "
+                             f"{samples} sample(s) within {CRASH_GONE_DEADLINE}s; no signal repeated"):
+        return check.finish()
+    # THE ADAPTER CLAUSE, measured. Nothing of this isolate's runtime survives
+    # the daemon, so the VM host and the daemon are one failure domain and one
+    # injection covers both.
+    survivors = crash_isolate_processes(instance)
+    check.check(not survivors,
+                f"{name}: no process outlived the daemon holding this isolate's runtime directory, "
+                f"so the Machine runtime is hosted in the daemon process and the adapter has no "
+                f"separate failure domain (observed {survivors})")
+    check.check(socket_path.is_socket() and not daemon_socket_serving(socket_path),
+                f"{name}: the dead daemon's control socket is a leftover inode that serves nothing "
+                f"(exists {socket_path.is_socket()}, serving {daemon_socket_serving(socket_path)})")
+    refused = ctx.run(check, "crash-" + name + "-status-dead", ["--json", "status"],
+                      cwd=instance["project"], env=instance["env"], timeout=RECOVERY_STATUS_TIMEOUT)
+    code = cross_error_code(refused)
+    check.check(refused.exit_code != 0 and code == "daemon_unavailable",
+                f"{name}: with its daemon dead, `vz status` fails closed with `daemon_unavailable` "
+                f"rather than answering from the record (exit {refused.exit_code}, code {code!r})")
+
+    # -------------------------------------------------------------- recovery
+    started = time.monotonic()
+    recovered = ctx.run(check, "crash-" + name + "-up", ["--json", "up"],
+                        cwd=instance["project"], env=instance["env"], timeout=UP_TIMEOUT)
+    elapsed = time.monotonic() - started
+    if not check.check(recovered.exit_code == 0,
+                       f"{name}: `vz up` reconstructs the Environment after the crash "
+                       f"(exit {recovered.exit_code}, code {cross_error_code(recovered)!r})"):
+        return check.finish()
+    check.check(elapsed <= contract["up"],
+                f"{name}: recovery completed in {elapsed:.1f}s, within the manifest's pinned `up` "
+                f"deadline of {contract['up']}s")
+    try:
+        after = daemon_fingerprint(ctx.state, pid_file, socket_path)
+    except GateError as error:
+        check.fail(f"{name}: no positively identified daemon after recovery: {error}")
+        return check.finish()
+    check.check(after["pid"] != before["pid"],
+                f"{name}: a replacement daemon owns the socket, pid {after['pid']} and not the "
+                f"crashed {before['pid']}")
+    check.check(after["executable_sha256"] == before["executable_sha256"],
+                f"{name}: the replacement is the same release binary "
+                f"({after['executable_sha256'][:16]})")
+
+    # ----------------------------------------------------------------- after
+    payload = read_status(ctx, check, "crash-" + name + "-after",
+                          project=instance["project"], env=instance["env"])
+    if check.status != "PASS" or not payload:
+        return check.finish()
+    environment = (payload.get("environments") or [{}])[0]
+    machines = environment.get("machines") or []
+    check.check(environment.get("environment_id") == entry["environment_id"],
+                f"{name}: the recovered Environment has the identity it had "
+                f"({environment.get('environment_id')})")
+    check.check({item.get("machine_id") for item in machines} ==
+                {item["machine_id"] for item in entry["machines"]},
+                f"{name}: every Machine identity survived the crash")
+    health = {item.get("name"): item.get("health") for item in machines}
+    check.check(health.get(machine) == "supervised",
+                f"{name}: the recovered Machine is `supervised` again by the replacement daemon "
+                f"(observed {health.get(machine)!r})")
+    # SOCKETS. The Docker endpoint is the Machine's own transport, and the
+    # claim is continuity rather than mere presence: the same context name, the
+    # same endpoint path, and the SAME ENGINE IDENTITY.
+    #
+    # The engine identity is the one that distinguishes crash recovery from a
+    # fork. A fork's Docker disk is a clone of a running parent's and its
+    # inherited `engine/engine-id` is deliberately dropped, because a fork is a
+    # new Machine that must not answer as its parent. This Machine's disk is
+    # its own -- unclean only because nobody unmounted it -- and it is the same
+    # Machine, so re-minting its engine identity would be the defect, not the
+    # recovery.
+    contexts_after = crash_docker_contexts(machines)
+    check.check(contexts_after == contexts_before,
+                f"{name}: every Machine's Docker context came back with the identity it had, "
+                f"engine identity included (before {contexts_before}, after {contexts_after})")
+    answered = machine_exec(ctx, check, "crash-" + name + "-exec", instance, machine,
+                            "printf crash-recovered")
+    check.check(answered.exit_code == 0 and answered.stdout.strip() == b"crash-recovered",
+                f"{name}: the recovered Machine answers an exec, so it is serving and not merely "
+                f"recorded ready (exit {answered.exit_code}, {answered.stdout[:60]!r})")
+    # ROUTES.
+    address_after = crash_fabric_address(ctx, check, "crash-" + name + "-addr-after",
+                                         instance, machine)
+    check.check(address_after == address_before,
+                f"{name}: the Machine holds its Environment's own fabric address again, unchanged "
+                f"across the crash (before {address_before!r}, after {address_after!r})")
+    # DNS and PORT STATE.
+    resolved, resolver, port = crash_resolves(ctx, check, "crash-" + name + "-dns", instance,
+                                              machine, entry["hostname"])
+    check.check(resolved,
+                f"{name}: the Environment-local resolver was reconstructed and answers the name "
+                f"this Environment declared, {entry['hostname']!r}")
+    check.check(port == CRASH_DNS_PORT and resolver is not None,
+                f"{name}: it answered from its own resolver's reconstructed port state, "
+                f"{resolver}:{port} (expected port {CRASH_DNS_PORT})")
+    # NO CROSS-ROUTING. Controlled by the clause above: this Machine's resolver
+    # demonstrably answers, so a refusal here is a refusal and not silence.
+    stranger = foreign["hostname"]
+    crossed, _, _ = crash_resolves(ctx, check, "crash-" + name + "-dns-foreign", instance,
+                                   machine, stranger)
+    check.check(not crossed,
+                f"{name}: the recovered resolver does not answer for {stranger!r}, a name declared "
+                f"in Environment {foreign['isolate']!r}, so recovery did not cross-route")
+    # NO STALE RESOURCES. Every host TCP listener is still loopback-only, and
+    # nothing of the dead daemon's is still bound.
+    listeners = host_tcp_listeners(ctx, check, "crash-" + name + "-listeners")
+    if listeners is None:
+        check.fail("cannot enumerate host TCP listeners with lsof after crash recovery")
+    else:
+        check.ok(f"{name}: {len(listeners)} host TCP listener(s) enumerated after recovery")
+    pids = sorted({path.name for path in instance["runtime"].glob("*.pid")})
+    check.check(pids == ["d.pid"],
+                f"{name}: the isolate has exactly one daemon PID file after recovery ({pids})")
     return check.finish()
 
 
@@ -4597,8 +4936,6 @@ def check_host_import_export_boundaries(ctx: CheckContext, top: str) -> SubCheck
       6. listener evidence, read from `lsof`, proving no wildcard or LAN
          listener exists for any port this check put in play.
     """
-    from vz04_common import GateError
-
     check = SubCheck(top, "host_import_export_boundaries")
     granted_service = foil_service = None
     try:

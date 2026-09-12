@@ -29,6 +29,28 @@ import developer_environment_recorder as recorder  # noqa: E402
 import developer_environment_test_support as support  # noqa: E402
 import test_vz04_fixtures as fixtures  # noqa: E402
 import vz04_common as common  # noqa: E402
+
+
+def stop_fixture_daemons_under(root: Path) -> None:
+    """SIGTERM any stand-in daemon whose command names this test's tmp root.
+
+    Scoped to one private mkdtemp under /private/tmp, so it can never reach a
+    daemon belonging to another test or to the developer. The stand-in also
+    alarms itself after 30 minutes; this is what makes the ordinary case
+    immediate rather than eventual.
+
+    It exists because the stand-in `vz up` spawns a daemon per isolate -- it has
+    to, or criterion 10's crash clause has no process to kill -- and a test that
+    points a check at a state root other than its own leaves those outside
+    `stop_lane_daemons`' reach. One suite run left 192 of them behind.
+    """
+    needle = str(root)
+    for pid, command in recorder.ps_rows():
+        if needle in command and command.split()[0].endswith("/vz-runtimed"):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
 import vz04_contract as contract_module  # noqa: E402
 import vz04_lanes as lanes  # noqa: E402
 import vz04_schema as schema  # noqa: E402
@@ -131,6 +153,11 @@ class TopologyLaneTests(unittest.TestCase):
         # temp directory vanishing underneath it. The lane's own stopper is used
         # so this cleans up exactly what the lane started.
         self.addCleanup(self.stop_lane_daemons)
+        # And a sweep for anything the lane's own stopper cannot see. A test
+        # that points a check at a state root other than this one leaves its
+        # daemons outside `stop_lane_daemons`' reach, and the stand-in `vz up`
+        # spawns one per isolate: a full suite run left 192 of them behind.
+        self.addCleanup(stop_fixture_daemons_under, self.tmp)
         # Criterion 19 runs the pinned v0.3.20 daemon over the store it restored
         # when it is staged. Point it at a path that is not, so these tests
         # observe one outcome whatever this machine has cached.
@@ -506,17 +533,43 @@ class TopologyLaneTests(unittest.TestCase):
             else:
                 # Same Environments, addressed again after the checkpoint.
                 self.assertEqual(record, established)
-                recovery = self.by_slug(result)["lifecycle_recovery"]
-                self.assertEqual(recovery["status"], "FAIL", recovery["assertions"])
-                self.assertTrue(any(a.startswith("not_implemented:") for a in recovery["assertions"]),
-                                recovery["assertions"])
-                # Everything it *did* exercise passed; only the unexercised
-                # clauses keep it from claiming the criterion.
-                self.assertFalse([a for a in recovery["assertions"] if a.startswith("FAILED:")],
+                subs = self.by_slug(result)
+                recovery = subs["lifecycle_recovery"]
+                # Criterion 10 in full. This asserted FAIL with a
+                # `not_implemented:` line while the crash clause was unbuilt;
+                # that clause is now `crash_recovery`, so an assertion that the
+                # criterion is still unimplemented would pin it there.
+                self.assertEqual(recovery["status"], "PASS", recovery["assertions"])
+                self.assertFalse([a for a in recovery["assertions"]
+                                  if a.startswith("FAILED:") or a.startswith("not_implemented:")],
                                  recovery["assertions"])
                 for entry in established["environments"]:
                     self.assertTrue(any(f"{entry['isolate']}: stop/up preserved the Environment identity" in a
                                         for a in recovery["assertions"]), entry["isolate"])
+                # And the crash clause, on the LAST Environment the record
+                # names: a SIGKILLed daemon, nothing of its runtime left alive,
+                # a status that fails closed, and an Up that brings the whole
+                # Environment back with the identity it had.
+                crash = subs["crash_recovery"]
+                self.assertEqual(crash["status"], "PASS", crash["assertions"])
+                subject = established["environments"][-1]["isolate"]
+                for fragment in ("no process outlived the daemon holding this isolate's runtime directory",
+                                 "fails closed with `daemon_unavailable`",
+                                 "`vz up` reconstructs the Environment after the crash",
+                                 "a replacement daemon owns the socket",
+                                 "the recovered Environment has the identity it had",
+                                 "does not answer for"):
+                    self.assertTrue(any(fragment in a for a in crash["assertions"]),
+                                    (fragment, crash["assertions"]))
+                self.assertTrue(all(a.startswith(f"{subject}:") or a.startswith("cannot ")
+                                    or "listener(s) enumerated" in a
+                                    for a in crash["assertions"]
+                                    if not a.startswith("the pre-sleep record")),
+                                crash["assertions"])
+                # The poll that waited for the crashed PID to disappear is
+                # recorded as a readiness poll, not as a retry.
+                polls = {poll["id"] for poll in crash["readiness_polls"]}
+                self.assertIn("poll.crash.daemon_pid_absent", polls)
 
     def test_post_wake_without_a_pre_sleep_record_is_a_prerequisite_failure(self):
         """Post-wake must not invent what should have survived."""
@@ -1817,16 +1870,30 @@ class CriterionEighteenTests(unittest.TestCase):
         self.assertEqual(checks.secret_occurrences(artifacts, sentinel), [("one", "/x/a", 2)])
 
     # -- the declaration surface ----------------------------------------------------
-    def test_the_shipped_schema_declares_no_binding_so_the_criterion_is_reported_unproved(self):
-        """The real repository's verdict: honest, and never a vacuous PASS."""
+    def test_a_schema_with_no_binding_surface_is_reported_unproved(self):
+        """A runtime that cannot declare one: honest, and never a vacuous PASS.
+
+        This was `test_the_shipped_schema_declares_no_binding_...` and read the
+        shipped schema, which declared none. It declares one now, so the name
+        described the wrong thing and the fixture handed the check the surface
+        it was supposed to be missing -- and the test guarding against a vacuous
+        PASS became one. The claim is unchanged; only its subject is now
+        explicitly the fixture's schema rather than incidentally the shipped one.
+        """
         scenario = self.secrets(schema_secrets=False, secret_status="PLANNED")
         self.assertEqual(self.failures(scenario), [])
         self.assertEqual(scenario["status"], "FAIL")
         unproved = self.unproved(scenario)
         self.assertEqual(len(unproved), 1, scenario["assertions"])
         self.assertIn("no SecretBinding can be declared", unproved[0])
-        self.assertIn("No SecretBinding type exists in vz-runtime-contract.", unproved[0])
         self.assertIn("Nothing was planted", unproved[0])
+        # The matrix's OWN note is quoted, whatever it currently says. Asserting
+        # a literal sentence pinned the test to one release's wording and broke
+        # the moment the capability moved from PLANNED to DEV.
+        matrix = common.load_json(common.REPO_ROOT / "config/host-target-capabilities-v0.4.json")
+        notes = {pair["topology_capabilities"]["secret_bindings"].get("note")
+                 for pair in matrix["pairs"]} - {None}
+        self.assertTrue(any(note in unproved[0] for note in notes), (notes, unproved[0]))
 
     def test_an_advertised_binding_with_no_declaration_surface_fails(self):
         """The distinction the criterion draws: advertised-but-absent is a FAILURE,
@@ -1969,15 +2036,17 @@ class CriterionEighteenTests(unittest.TestCase):
         self.assert_broken(scenario, "restore rewound the Machine past the sentinel")
 
     # -- the shipped inputs, against the lane's own fake --------------------------------
-    def test_the_shipped_inputs_report_the_criterion_unproved_without_a_single_failure(self):
+    def test_the_shipped_inputs_prove_the_binding_and_still_not_the_snapshot(self):
         """What the post-wake phase actually produces today.
 
         The real capability matrix, the real definition schema and the lane's
-        own `FAKE_VZ` -- which models neither SecretBindings nor capability
-        negotiation, exactly as the shipped runtime does not. Both sub-checks
-        must report `not_implemented` with ZERO failed assertions, because a
-        failed assertion here would turn the phase's `not_implemented` outcome
-        into `assertion` and claim a regression that is not there.
+        own `FAKE_VZ`. Both halves used to report `not_implemented`; the
+        SecretBinding half now PASSES, because the schema declares the surface,
+        the matrix advertises it DEV and the stand-in delivers one. The snapshot
+        half still reports `not_implemented`, and the important part is what has
+        not changed: ZERO failed assertions on either, because a failed
+        assertion here would turn the phase's outcome into `assertion` and claim
+        a regression that is not there.
         """
         release = support.build_fake_release(self.tmp / "lane-release", mode_file=self.tmp / "lane-mode")
         self.addCleanup(fixtures.make_writable, release)
@@ -1987,8 +2056,8 @@ class CriterionEighteenTests(unittest.TestCase):
         secrets = checks.check_secret_bindings_scoped_redacted(
             self.context(release=release, state=state, repo_root=common.REPO_ROOT), TOP18).scenario()
         self.assertEqual(self.failures(secrets), [])
-        self.assertEqual(len(self.unproved(secrets)), 1, secrets["assertions"])
-        self.assertIn("no SecretBinding can be declared", self.unproved(secrets)[0])
+        self.assertEqual(self.unproved(secrets), [], secrets["assertions"])
+        self.assertEqual(secrets["status"], "PASS", secrets["assertions"])
         snapshot = checks.check_snapshot_restore_capability(
             self.context(release=release, state=state, repo_root=common.REPO_ROOT), TOP18).scenario()
         self.assertEqual(self.failures(snapshot), [])
@@ -2360,16 +2429,20 @@ class DenialMatrixLaneTests(unittest.TestCase):
         # and the reason is the refusing component's own words.
         unexercised = [a for a in row["assertions"] if a.startswith("not_implemented:")]
         self.assertEqual(len(unexercised), 1, row["assertions"])
-        # The `allowed` and `offline` cells now RUN -- `EgressPolicy` decides
-        # whether a Machine gets an external NIC, so the same probe from two
-        # Machines of one Environment answers differently and the criterion's
-        # egress-crosstalk clause is measured. What is still unexercised is the
-        # pair the SCHEMA cannot express, and the schema says so itself; that
-        # is a better answer than a runtime refusal, because it names the file
-        # a reader has to change.
-        self.assertIn("is not one of ['offline', 'allowed']", unexercised[0])
-        self.assertIn("cannot express a cidr Internet policy", unexercised[0])
-        self.assertIn("cannot express a domain Internet policy", unexercised[0])
+        # The `allowed` and `offline` cells RUN -- `EgressPolicy` decides whether
+        # a Machine gets an external NIC, so the same probe from two Machines of
+        # one Environment answers differently and the criterion's egress-crosstalk
+        # clause is measured.
+        #
+        # The CIDR and domain cells are no longer declared at all. They were
+        # withdrawn from 0.4 with the rest of `network.exhaustive_denial_matrix`'s
+        # Internet-policy surface, so the schema's "is not one of ['offline',
+        # 'allowed']" refusal has nothing left to refuse and asserting it here
+        # kept the test pinned to a cell that no longer exists. What remains
+        # unexercised is a guest TOOL gap, and it is still reported in the
+        # refusing component's own words rather than as a bare count.
+        self.assertRegex(unexercised[0], r"BusyBox carries no `(nc|ping)` applet")
+        self.assertNotIn("cannot express a cidr Internet policy", unexercised[0])
         self.assertNotIn("adapter is not implemented", unexercised[0])
         self.assertIn(TOP20, {s["id"] for s in result["scenarios"]})
         # The artifact, re-read from the file the aggregate validator will read.
@@ -2558,6 +2631,11 @@ class CriterionTwelveAgentWorkerTests(unittest.TestCase):
         # pre-sleep leaves its daemons running on purpose; the lane's own
         # stopper is used so this cleans up exactly what the lane started.
         self.addCleanup(self.stop_lane_daemons)
+        # And a sweep for anything the lane's own stopper cannot see. A test
+        # that points a check at a state root other than this one leaves its
+        # daemons outside `stop_lane_daemons`' reach, and the stand-in `vz up`
+        # spawns one per isolate: a full suite run left 192 of them behind.
+        self.addCleanup(stop_fixture_daemons_under, self.tmp)
         unstaged = mock.patch.dict(os.environ, {checks.LEGACY_ARTIFACT_ENV: str(self.tmp / "unstaged-v0320")})
         unstaged.start()
         self.addCleanup(unstaged.stop)
@@ -2942,6 +3020,11 @@ class CrossEnvironmentIsolationTests(unittest.TestCase):
         # pre-sleep leaves its daemons running on purpose; the lane's own stopper
         # ends exactly what it started before tearDown removes the tree.
         self.addCleanup(self.stop_lane_daemons)
+        # And a sweep for anything the lane's own stopper cannot see. A test
+        # that points a check at a state root other than this one leaves its
+        # daemons outside `stop_lane_daemons`' reach, and the stand-in `vz up`
+        # spawns one per isolate: a full suite run left 192 of them behind.
+        self.addCleanup(stop_fixture_daemons_under, self.tmp)
 
     def tearDown(self):
         fixtures.make_writable(self.release)

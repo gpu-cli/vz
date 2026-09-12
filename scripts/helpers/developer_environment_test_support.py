@@ -126,6 +126,37 @@ for arg in "$@"; do
     *) ;;
   esac
 done
+# The daemon a lifecycle verb needs, spawned if it is not already serving.
+#
+# This exists for criterion 10's crash clause, which SIGKILLs the daemon hosting
+# an Environment and requires the next Up to bring everything back. Without a
+# real process holding a real socket there is nothing to kill and the clause
+# cannot be exercised at all -- and the compiled `bin/vz-runtimed` stand-in
+# already binds a socket, writes a PID file and removes both on SIGTERM, so a
+# SIGKILL leaves exactly what a crash leaves: an inert socket inode and a PID
+# file naming a process that is gone.
+#
+# Liveness is decided by signalling the recorded PID, not by the socket file:
+# after a SIGKILL the inode is still there and testing for it would report a
+# dead daemon as healthy, which is the very confusion the clause is about.
+vz_daemon_live() {
+  sock="$VZ_RUNTIME_DAEMON_SOCKET"; pidf="${sock%.sock}.pid"
+  [ -f "$pidf" ] || return 1
+  dpid=$(cat "$pidf" 2>/dev/null)
+  [ -n "$dpid" ] || return 1
+  kill -0 "$dpid" 2>/dev/null
+}
+vz_daemon_start() {
+  sock="$VZ_RUNTIME_DAEMON_SOCKET"; pidf="${sock%.sock}.pid"; logf="${sock%.sock}.log"
+  vz_daemon_live && return 0
+  mkdir -p "$(dirname "$sock")"
+  rm -f "$sock" "$pidf"
+  "$(dirname "$0")/vz-runtimed" "$sock" "$pidf" "$logf" </dev/null >/dev/null 2>&1 &
+  echo $! > "$pidf"
+  n=0
+  while [ ! -S "$sock" ] && [ "$n" -lt 200 ]; do sleep 0.05; n=$((n + 1)); done
+  [ -S "$sock" ]
+}
 if [ -n "$verb" ]; then
   if [ "$sawhelp" = 1 ]; then printf 'Usage: vz %s [OPTIONS]\n\nOptions:\n  -h, --help  Print help\n' "$verb"; exit 0; fi
   if [ "$verb" = up ] && [ "$mode" = provisions ]; then
@@ -181,6 +212,7 @@ if [ -n "$verb" ]; then
   # (topology removed by `delete`) mints new ones, which is what criterion 16
   # reads.
   if [ "$verb" = up ] && [ -f "$topology" ]; then
+    vz_daemon_start || { printf '{"error":{"code":"backend_unavailable","message":"no daemon"},"schema_version":1}\n' >&2; exit 2; }
     sed 's/^E stopped$/E ready/' "$topology" > "$topology.next" && mv "$topology.next" "$topology"
     printf '{"schema_version":1,"progress":{"completion":{}}}\n'
     exit 0
@@ -203,6 +235,7 @@ if [ -n "$verb" ]; then
     fi
     pid=$(grep -o '"project_id"[^,]*' vz.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
     mkdir -p "$VZ_RUNTIME_DATA_DIR"
+    vz_daemon_start || { printf '{"error":{"code":"backend_unavailable","message":"no daemon"},"schema_version":1}\n' >&2; exit 2; }
     # A Developer Machine's Docker endpoint is an AF_UNIX socket bound in the
     # runtime directory under the longest name the runtime mints
     # (`vzr1-ot-<32 hex>.sock`). Bind it for real rather than trusting a length:
@@ -233,8 +266,55 @@ if [ -n "$verb" ]; then
       exit 1
     fi
     rm -f "$VZ_RUNTIME_DATA_DIR/storage.err"
-    : > "$VZ_RUNTIME_STATE_DB"
+    # This Environment's identity suffix, minted here rather than below because
+    # the SecretBinding refusal needs to compare `from_environment` against it.
     inc=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+    # Declared SecretBindings, delivered into the BOUND Machine's guest root and
+    # no other. Criterion 18 asks whether the bound Machine can read the value
+    # and its sibling cannot, and per-Machine guest roots are what make that a
+    # real answer rather than an arranged one.
+    if ! HOME="$VZ_RUNTIME_DATA_DIR" /usr/bin/python3 -c '
+import json, os, pathlib, sys
+guest, runtime = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+declaration = json.load(open("vz.json"))
+environment_id = "env_" + sys.argv[3]
+declared = declaration.get("environment", {}).get("secret_bindings") or []
+for binding in declared:
+    # A binding naming ANOTHER Environment is refused, and refused before any
+    # Environment exists: the criterion asks that the request fail closed and
+    # leave nothing behind, so this cannot be a cleanup afterwards.
+    foreign = binding.get("from_environment")
+    if foreign and foreign != environment_id:
+        json.dump({"schema_version": 1, "error": {"code": "cross_environment_denied", "message":
+                   "SecretBinding %r names Environment %s, which is not this Environment; "
+                   "cross-Environment access requires an explicit directional grant"
+                   % (binding.get("name"), foreign)}}, sys.stdout)
+        raise SystemExit(3)
+    source = binding.get("source_env") or ""
+    if source not in os.environ:
+        sys.stderr.write("secret source %s is not set" % source)
+        raise SystemExit(1)
+    target = guest / binding["machine"] / binding["target_path"].lstrip("/")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(os.environ[source])
+    target.chmod(0o600)
+(runtime / "bindings.json").write_text(json.dumps(
+    [{"name": b["name"], "machine": b["machine"], "target_path": b["target_path"]} for b in declared]))
+' "$VZ_RUNTIME_DATA_DIR/guest" "$VZ_RUNTIME_DATA_DIR" "$inc" \
+        >"$VZ_RUNTIME_DATA_DIR/secret.out" 2>"$VZ_RUNTIME_DATA_DIR/secret.err"; then
+      code=$?
+      if [ "$code" = 3 ]; then
+        cat "$VZ_RUNTIME_DATA_DIR/secret.out" >&2; echo >&2
+      else
+        printf '{"error":{"code":"validation_error","message":"%s"},"schema_version":1}\n' \
+          "$(tr -d '\n' < "$VZ_RUNTIME_DATA_DIR/secret.err" | sed 's/"/\\"/g')" >&2
+      fi
+      rm -rf "$VZ_RUNTIME_DATA_DIR/guest" "$VZ_RUNTIME_DATA_DIR/volumes"
+      rm -f "$VZ_RUNTIME_DATA_DIR/secret.err" "$VZ_RUNTIME_DATA_DIR/secret.out" "$VZ_RUNTIME_STATE_DB" "$ep"
+      exit 2
+    fi
+    rm -f "$VZ_RUNTIME_DATA_DIR/secret.err" "$VZ_RUNTIME_DATA_DIR/secret.out"
+    : > "$VZ_RUNTIME_STATE_DB"
     # Status must reflect the topology the definition declares, not a fixed one:
     # every Machine with its own profile and target OS, plus the declared
     # networks and endpoints. Reading it out of vz.json is what stops the fake
@@ -367,6 +447,7 @@ if [ -n "$verb" ]; then
             -e "s#/usr/local/bin/vz-guest-fetch#$(dirname "$0")/guest-fetch-shim#g" \
             -e "s#/bin/busybox#$(dirname "$0")/busybox-shim#g" \
             -e "s#/vz-storage#$VZ_RUNTIME_DATA_DIR/guest/$machine/vz-storage#g" \
+            -e "s#/run/vz-secrets#$VZ_RUNTIME_DATA_DIR/guest/$machine/run/vz-secrets#g" \
             -e "s#/run/vz-edge#$VZ_RUNTIME_DATA_DIR/vz-edge#g" \
             -e "s#/tmp/vz-fetch-#$VZ_RUNTIME_DATA_DIR/fetch-#g" \
             -e "s#/www#$VZ_RUNTIME_DATA_DIR/www#g" > "$script"
@@ -378,6 +459,31 @@ if [ -n "$verb" ]; then
     VZ_FAKE_MACHINE="$machine" VZ_FAKE_NETWORKS="$nets" VZ_FAKE_MODE="$mode" \
       VZ_FAKE_MODE_FILE="$MODE_FILE" /bin/sh "$script"
     code=$?
+    # Using a declared SecretBinding is auditable. One record per use, naming
+    # the Environment, the Machine that read it and the binding -- and never
+    # the value, which is the whole point of the record existing.
+    if [ -f "$VZ_RUNTIME_DATA_DIR/bindings.json" ]; then
+      HOME="$VZ_RUNTIME_DATA_DIR" /usr/bin/python3 -c '
+import json, os, pathlib, sys, time
+runtime, machine, environment = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+command = sys.argv[4]
+guest = runtime / "guest" / machine
+audit = runtime / "audit.jsonl"
+for binding in json.loads((runtime / "bindings.json").read_text()):
+    if binding["target_path"] not in command:
+        continue
+    if not (guest / binding["target_path"].lstrip("/")).is_file():
+        continue
+    record = {"event": "secret_binding_used", "environment_id": environment,
+              "machine": machine, "machine_id": "mch_%s_%s" % (environment[4:], machine),
+              "binding": binding["name"],
+              "binding_id": "sbn_" + binding["name"], "unix_ns": time.time_ns()}
+    with open(audit, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
+    os.chmod(audit, 0o600)
+' "$VZ_RUNTIME_DATA_DIR" "$machine" "env_$(awk '$1=="S"{print $2}' "$topology")" "$command_tail" 2>/dev/null
+    fi
     rm -f "$script"
     exit $code
   fi
@@ -401,6 +507,13 @@ if [ -n "$verb" ]; then
   # fail the way the installed CLI fails it.
   if [ -n "$selected" ] && [ "$selected" != default ] && [ -f "$topology" ]; then
     printf '{"error":{"code":"environment_not_found","message":"no Environment named %s in this project"},"schema_version":1}\n' "$selected" >&2
+    exit 2
+  fi
+  if [ "$verb" = status ] && [ -f "$topology" ] && ! vz_daemon_live; then
+    # Exactly what the installed CLI answers when the socket it was told to use
+    # has no daemon behind it. Answering from the persisted record instead
+    # would report a crashed Environment as healthy.
+    printf '{"error":{"code":"daemon_unavailable","message":"no compatible runtime daemon is listening on the configured socket"}}\n' >&2
     exit 2
   fi
   if [ "$verb" = status ] && [ -f "$topology" ]; then
@@ -542,11 +655,13 @@ if [ -n "$verb" ]; then
   if [ "$verb" = status ]; then
     sock="$VZ_RUNTIME_DAEMON_SOCKET"; pidf="${sock%.sock}.pid"; logf="${sock%.sock}.log"
     if [ "$mode" = autospawn ]; then
-      mkdir -p "$(dirname "$sock")"
-      daemon="$(dirname "$0")/vz-runtimed"
-      "$daemon" "$sock" "$pidf" "$logf" </dev/null >/dev/null 2>&1 &
-      echo $! > "$pidf"
-      while [ ! -S "$sock" ]; do sleep 0.05; done
+      # Through the shared helper, which returns early when a daemon is already
+      # serving this isolate. Spawning unconditionally wrote the PID of a second
+      # daemon that then failed to bind and exited, so the PID file named a dead
+      # process while the live one kept running -- and the cleanup sweep
+      # reported an artifact it could not attribute rather than the read-only
+      # violation this mode exists to produce.
+      vz_daemon_start
     fi
     if [ "$mode" = bogus_pid ]; then mkdir -p "$(dirname "$sock")"; echo 99999999 > "$pidf"; fi
     printf '{"error":{"code":"daemon_unavailable","message":"no compatible runtime daemon is listening on the configured socket"}}\n' >&2
@@ -1033,6 +1148,22 @@ int main(int argc, char **argv) {
         close(descriptor);
         unlink(socket_path);
         return 0;
+    }
+    /* A fixture must not outlive its test session, for the same reason
+       `serve_export` sets an alarm: a stand-in daemon whose test never reached
+       its cleanup is a process nobody will ever stop, and one unit-test run
+       leaves dozens. Far longer than any stand-in lane phase, so nothing in a
+       running test can trip over it. */
+    alarm(1800);
+    /* A started daemon says so in its own log. Criterion 18's redaction sweep
+       reads the daemon log as one of its declared artifact groups, and a group
+       that never exists is a group the sweep cannot fail on. */
+    {
+        FILE *log = fopen(log_path, "a");
+        if (log != NULL) {
+            fprintf(log, "runtime daemon listening on %s\n", socket_path);
+            fclose(log);
+        }
     }
     signal(SIGTERM, on_term);
     for (;;) {
@@ -2483,10 +2614,10 @@ case "$applet" in
 esac
 '''
 
-# One SecretBinding declaration surface, added to a copy of the shipped schema.
-# The shipped one declares none, which is why the check reports the criterion
-# not implemented against the real repository; these tests give it the surface
-# so every claim below it can be exercised and broken.
+# One SecretBinding declaration surface, imposed on a copy of the shipped
+# schema. The shipped schema now declares its own; this is the fixture's, kept
+# separate so a test can hold the surface fixed while the shipped one changes,
+# and so `schema_secrets=False` has something definite to take away.
 SECRET_BINDING_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "required": ["schema_version", "name", "machine", "target_path", "source_env"],
@@ -2530,8 +2661,15 @@ def build_secret_repo_root(root: Path, *, secret_status: str = "DEV", snapshot_s
 
     Both are copies of the checked-in files with one field changed, so a test
     that advertises a capability is testing the real matrix shape rather than an
-    invented one, and a schema without the SecretBinding surface is the shipped
-    schema exactly.
+    invented one.
+
+    `schema_secrets=False` REMOVES the SecretBinding surface rather than leaving
+    the shipped schema alone. It used to leave it alone, and the docstring said
+    "a schema without the SecretBinding surface is the shipped schema exactly" --
+    which was true only while the shipped schema declared none. It now declares
+    one, so that spelling silently handed every "no way to declare a binding"
+    test a schema that declares one, and the test that exists to catch a vacuous
+    PASS became the vacuous PASS.
     """
     (root / "config").mkdir(mode=0o700, parents=True)
     (root / "schemas").mkdir(mode=0o700, parents=True)
@@ -2546,6 +2684,9 @@ def build_secret_repo_root(root: Path, *, secret_status: str = "DEV", snapshot_s
         schema["$defs"]["secretBinding"] = json.loads(json.dumps(SECRET_BINDING_SCHEMA))
         schema["$defs"]["environment"]["properties"]["secret_bindings"] = {
             "type": "array", "items": {"$ref": "#/$defs/secretBinding"}}
+    else:
+        schema["$defs"].pop("secretBinding", None)
+        schema["$defs"]["environment"]["properties"].pop("secret_bindings", None)
     (root / "schemas/vz-project-definition-v1.schema.json").write_bytes(
         json.dumps(schema, indent=2, sort_keys=True).encode() + b"\n")
     return root
