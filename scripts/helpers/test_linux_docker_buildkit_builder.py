@@ -327,6 +327,37 @@ class LifecycleTests(unittest.TestCase):
             self.b.remove_owned()
         self.assertEqual(len(self.harness.calls), before)
 
+    def test_the_retained_archive_is_named_by_content_not_by_builder(self):
+        """One copy per distinct payload, not one per builder.
+
+        `rootfs_payload` derives the archive from the release's pinned Developer
+        probe bundle, so every builder in a run writes the same bytes. While the
+        file was keyed on the builder token it was written once per builder:
+        48 archives of 95 MB in one measured lane, ONE distinct sha256 between
+        them, 4.41 GB of a 6.95 GB evidence root on a host the gate had already
+        driven to 100% full.
+
+        Naming it by digest is what makes the second builder reuse the first
+        one's file, so that is what this asserts. Every claim the image-input
+        proof makes survives and is checked here too: it names an archive that
+        exists, with the digest it records.
+        """
+        self.b.prepare()
+        proof = json.loads((self.harness.evidence / (self.b.token + "-image-input.json")).read_bytes())
+        archive = proof["rootfs_archive"]
+        self.assertEqual(archive, "rootfs-" + proof["rootfs_sha256"] + ".tar")
+        self.assertNotIn(self.b.token, archive)
+        retained = self.harness.evidence / archive
+        self.assertEqual(retained.read_bytes(), b"fixture rootfs")
+        self.assertEqual(builder.startup.digest(retained), proof["rootfs_sha256"])
+        # A second builder whose payload is identical resolves to this same
+        # path and writes nothing further.
+        self.assertEqual(sorted(p.name for p in self.harness.evidence.glob("*rootfs*.tar")), [archive])
+        # And it stays a single-link regular file: `vz04_common.tree_entries`
+        # rejects any evidence file with st_nlink != 1, so sharing by hard link
+        # would have failed the run's own checksum pass.
+        self.assertEqual(retained.stat().st_nlink, 1)
+
     def test_exact_precreated_builder_has_no_pull_default_or_runtime_fallback(self):
         mapping = self.b.prepare()
         self.assertEqual(mapping["container_id"], "b" * 64)

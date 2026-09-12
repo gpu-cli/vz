@@ -300,8 +300,30 @@ class Builder:
         require(self.name not in [line.strip().rstrip("*") for line in raw.decode().splitlines()],
                 "builder name preexists")
         payload, self.inventory = rootfs_payload(self.harness)
-        rootfs = self.harness.evidence / (self.token + "-rootfs.tar")
-        startup.write(rootfs, payload)
+        # Named by CONTENT, not by builder token, so the run holds one copy
+        # rather than one per builder.
+        #
+        # `rootfs_payload` derives this archive from the release's pinned
+        # Developer probe bundle, so every builder in a run produces the same
+        # bytes -- measured: 48 archives in one lane, 95 MB each, ONE distinct
+        # sha256 between them. That was 4.41 GB of a 6.95 GB evidence root, on
+        # a host the gate had already driven to 100% full.
+        #
+        # Nothing about the evidence weakens. Each builder's image-input
+        # document still names an archive that exists, still records its
+        # digest, and that digest still verifies against those bytes; the
+        # archive is simply shared instead of duplicated. A hard link per
+        # builder would do the same, except `vz04_common.tree_entries` rejects
+        # any evidence file with `st_nlink != 1`, so one name it is.
+        rootfs = self.harness.evidence / ("rootfs-" + sha(payload) + ".tar")
+        if not rootfs.exists():
+            try:
+                startup.write(rootfs, payload)
+            except FileExistsError:
+                # Another builder in this run won the race. Its bytes are this
+                # archive's bytes -- the digest is in the name -- and the
+                # verification after the import checks that regardless.
+                pass
         startup.document(self.harness.evidence / (self.token + "-ownership.json"), self.ownership)
         startup.document(self.harness.evidence / (self.token + "-image-input.json"),
                          {"owner": self.descriptor["owner"], "context": self.descriptor["name"],
