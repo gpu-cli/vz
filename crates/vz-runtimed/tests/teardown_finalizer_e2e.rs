@@ -211,6 +211,7 @@ fn install_stack_authority(store: &StateStore, stack_id: &str) -> MachineWorkloa
             networks: Vec::new(),
             endpoints: Vec::new(),
             volumes: Vec::new(),
+            secret_bindings: Vec::new(),
         },
     };
     let environment = EnvironmentInstance {
@@ -218,6 +219,7 @@ fn install_stack_authority(store: &StateStore, stack_id: &str) -> MachineWorkloa
         host_exports: Vec::new(),
         host_imports: Vec::new(),
         egress: Vec::new(),
+        secret_bindings: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         environment_id: environment_id.clone(),
         project_id: project_id.clone(),
