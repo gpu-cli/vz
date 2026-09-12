@@ -22,8 +22,20 @@ import vz04_decisions as decisions
 import vz04_host as host
 import vz04_lanes as lanes
 import vz04_schema as schema
-from vz04_common import (CANARY_PREFIX, REPO_ROOT, GateError, canonical_digest, canonical_path, digest_file, load_json,
-                         read_regular, tree_entries, verify_checksums)
+from vz04_common import (CANARY_PREFIX, MAX_EVIDENCE_TREE_BYTES, MAX_EVIDENCE_TREE_ENTRIES, REPO_ROOT, GateError,
+                         canonical_digest, canonical_path, digest_file, load_json, read_regular, tree_entries,
+                         verify_checksums)
+
+
+def evidence_entries(root: Path) -> list:
+    """Every file under an evidence root, at the evidence tree's own bounds.
+
+    The validator walks the same tree the gate wrote, so it needs the same
+    bounds; at the source-tree defaults it refused to read back a run it had
+    just produced.
+    """
+    return tree_entries(root, excluded_dirs=frozenset(),
+                        max_entries=MAX_EVIDENCE_TREE_ENTRIES, max_bytes=MAX_EVIDENCE_TREE_BYTES)
 
 KIND_TO_SCHEMA = {
     "vz-0.4-gate-manifest": "gate-manifest", "vz-0.4-lane-result": "lane-result", "vz-0.4-summary": "summary",
@@ -72,7 +84,7 @@ def _load_evidence(root: Path, relative, kind_schema: str, findings: Findings, s
 
 def scan_canaries(root: Path, prefix: str, findings: Findings) -> None:
     canaries = [prefix.encode("utf-8")]
-    for relative, _mode, size, _digest in tree_entries(root, excluded_dirs=frozenset()):
+    for relative, _mode, size, _digest in evidence_entries(root):
         if size > MAX_SCAN:
             findings.add("canary.unscannable", relative, "evidence file exceeds scan bound")
             continue
@@ -82,7 +94,7 @@ def scan_canaries(root: Path, prefix: str, findings: Findings) -> None:
 
 
 def schema_check_all(root: Path, findings: Findings) -> None:
-    for relative, _mode, _size, _digest in tree_entries(root, excluded_dirs=frozenset()):
+    for relative, _mode, _size, _digest in evidence_entries(root):
         if not relative.endswith(".json"):
             continue
         name = relative.rsplit("/", 1)[-1]

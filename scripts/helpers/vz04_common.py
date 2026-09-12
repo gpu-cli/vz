@@ -27,6 +27,24 @@ MAX_JSON = 4 * 1024 * 1024
 MAX_FILE = 2 * 1024 ** 3
 MAX_TREE_ENTRIES = 20000
 MAX_TREE_BYTES = 4 * 1024 ** 3
+# The evidence root's own bounds, an order of magnitude above the source-tree
+# ones, because the two trees are nothing alike.
+#
+# A gate run records every harness command as four files -- intent, result,
+# stdout, stderr -- and the linux-docker lane runs thousands per Machine per
+# phase. One measured run came to 81,475 files and 4.8 GB while that lane was
+# still ABORTING early in two of its three phases; a run whose suites all
+# complete is larger. Against `MAX_TREE_ENTRIES = 20000` the aggregate gate
+# could not write its own `checksums.sha256`, so it ended with
+#   error: tree entry count exceeds bound
+# after every lane had run -- the bound had never been reached before because
+# no full run had ever got this far.
+#
+# Kept as a separate pair rather than by raising the shared ones: 20,000 files
+# is still the right ceiling for a source tree or a release directory, and
+# nothing is served by loosening those to fit an evidence root.
+MAX_EVIDENCE_TREE_ENTRIES = 250000
+MAX_EVIDENCE_TREE_BYTES = 32 * 1024 ** 3
 EXCLUDED_TREE_DIRS = frozenset(("__pycache__",))
 
 CONFIG_FILES = {
@@ -229,11 +247,15 @@ def canonical_path(value, must_exist: bool = True) -> Path:
     return resolved
 
 
-def tree_entries(root: Path, excluded_dirs=EXCLUDED_TREE_DIRS) -> list:
+def tree_entries(root: Path, excluded_dirs=EXCLUDED_TREE_DIRS, *,
+                 max_entries: int = MAX_TREE_ENTRIES, max_bytes: int = MAX_TREE_BYTES) -> list:
     """Sorted [relative-path, mode, size, sha256] rows over a real directory.
 
     Symlinks, special files and hardlinks are rejected. Directories named in
     `excluded_dirs` (build products such as __pycache__) are not inventoried.
+
+    `max_entries`/`max_bytes` default to the source-tree bounds; an evidence
+    root passes the larger `MAX_EVIDENCE_TREE_*` pair.
     """
     require(root.is_dir() and not root.is_symlink(), f"tree root is not a real directory: {root}")
     rows = []
@@ -260,9 +282,10 @@ def tree_entries(root: Path, excluded_dirs=EXCLUDED_TREE_DIRS) -> list:
             finally:
                 os.close(descriptor)
             total += metadata.st_size
-            require(total <= MAX_TREE_BYTES, "tree bytes exceed bound")
+            require(total <= max_bytes, "tree bytes exceed bound")
             rows.append(["/".join((*prefix, name)), mode, metadata.st_size, digest])
-            require(len(rows) <= MAX_TREE_ENTRIES, "tree entry count exceeds bound")
+            require(len(rows) <= max_entries,
+                    f"tree entry count exceeds bound ({max_entries}) under {root}")
 
     walk(root, (), 0)
     return sorted(rows)
@@ -285,7 +308,9 @@ def files_digest(repo_root: Path, relative_paths) -> dict:
 
 def write_checksums(root: Path, name: str = "checksums.sha256") -> Path:
     rows = []
-    for relative, _mode, _size, digest in tree_entries(root, excluded_dirs=frozenset()):
+    for relative, _mode, _size, digest in tree_entries(
+            root, excluded_dirs=frozenset(),
+            max_entries=MAX_EVIDENCE_TREE_ENTRIES, max_bytes=MAX_EVIDENCE_TREE_BYTES):
         if relative != name:
             rows.append(f"{digest}  {relative}\n")
     target = root / name
@@ -300,7 +325,10 @@ def verify_checksums(root: Path, name: str = "checksums.sha256") -> list:
     if not target.is_file() or target.is_symlink():
         return [f"{name} missing"]
     declared = {}
-    for line in read_regular(target, MAX_JSON).decode("utf-8").splitlines():
+    # Not `MAX_JSON`: one row per evidence file at ~80 bytes, and a gate run
+    # writes six figures of them, so a 4 MiB cap refused to read back the file
+    # the run had just written.
+    for line in read_regular(target, MAX_EVIDENCE_TREE_ENTRIES * 128).decode("utf-8").splitlines():
         try:
             digest, relative = line.split("  ", 1)
             checked_text(digest, DIGEST_PATTERN, "checksum digest")
@@ -310,8 +338,10 @@ def verify_checksums(root: Path, name: str = "checksums.sha256") -> list:
         if relative in declared:
             findings.append(f"{name}: duplicate row {relative}")
         declared[relative] = digest
-    actual = {relative: digest for relative, _m, _s, digest in tree_entries(root, excluded_dirs=frozenset())
-              if relative != name}
+    actual = {relative: digest for relative, _m, _s, digest in tree_entries(
+        root, excluded_dirs=frozenset(),
+        max_entries=MAX_EVIDENCE_TREE_ENTRIES, max_bytes=MAX_EVIDENCE_TREE_BYTES)
+        if relative != name}
     for relative in sorted(set(declared) - set(actual)):
         findings.append(f"{name}: declared file absent {relative}")
     for relative in sorted(set(actual) - set(declared)):
