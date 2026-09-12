@@ -10,6 +10,8 @@ still moves when anything about it moves.
 """
 import hashlib
 import os
+import shutil
+import signal
 import re
 import socket
 import stat
@@ -401,3 +403,39 @@ class StraySocketTests(unittest.TestCase):
             listener.bind(str(served))
             listener.listen(1)
             self.assertEqual(subject.stray_sockets(state), [served])
+
+
+class ReleaseGraceTests(unittest.TestCase):
+    """A held invocation that ends itself keeps its own exit code."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="vz-release-grace-", dir="/private/tmp"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        evidence = self.root / "evidence"
+        evidence.mkdir()
+        self.recorder = subject.Recorder(evidence, "release-grace")
+
+    def hold(self, name, script):
+        return self.recorder.start(name, ["/bin/sh", "-c", script], cwd=self.root,
+                                   env={"PATH": "/usr/bin:/bin"}, scenario_id="scenario", timeout=30)
+
+    def test_a_self_ending_invocation_is_not_signalled(self):
+        """Criterion 8's observer exits 0 on seeing its own event, and the check
+        reads that exit code as the proof. Releasing on the instant made it a
+        race with the observer's own exit, which reported -15 for a stream that
+        had demonstrably carried the event."""
+        held = self.hold("self-exit", "sleep 0.3; echo done; exit 0")
+        released = self.recorder.release(held)
+        self.assertEqual(released.exit_code, 0)
+        self.assertEqual(released.stdout, b"done\n")
+
+    def test_an_invocation_that_never_ends_is_still_signalled(self):
+        """The control. The grace must not turn release into a wait for a
+        process that was never going to stop."""
+        held = self.hold("forever", "while :; do /bin/sleep 1; done")
+        started = time.monotonic()
+        released = self.recorder.release(held)
+        elapsed = time.monotonic() - started
+        self.assertEqual(released.exit_code, -signal.SIGTERM)
+        self.assertLess(elapsed, subject.RELEASE_GRACE_SECONDS + 10)
+

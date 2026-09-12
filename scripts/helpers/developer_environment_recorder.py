@@ -180,7 +180,31 @@ class Held:
                 pass
 
     def terminate(self) -> tuple:
-        """`(stdout, stderr, signal)`; `signal` is `None` if it outlived SIGKILL."""
+        """`(stdout, stderr, signal)`; `signal` is `None` if it outlived SIGKILL.
+
+        A held invocation that ends ITSELF is allowed to finish first. Some of
+        them are written to do exactly that -- criterion 8's event observer
+        exits 0 the moment it sees its own Environment's event -- and the check
+        then asserts on that exit code as the proof it ended on the event and
+        did not merely time out. Signalling on the instant of release made that
+        assertion a race with the observer's own exit:
+
+          FAILED: rec-a's stream was live and ended on its own Environment's
+          event (expected exit 0, observed -15)
+
+        in a run where every other assertion in the check passed, including the
+        one that the released stream carried the event. It had seen it, written
+        its marker, and was a few milliseconds from exiting.
+
+        The grace is short and is only ever paid in full by an invocation that
+        was never going to stop on its own, which is the case SIGTERM is for.
+        """
+        deadline = time.monotonic() + RELEASE_GRACE_SECONDS
+        while self.process.poll() is None and time.monotonic() < deadline:
+            time.sleep(RELEASE_GRACE_INTERVAL)
+        if self.process.poll() is not None:
+            stdout, stderr = self.process.communicate(timeout=self.timeout)
+            return stdout, stderr, 0
         self._signal(signal.SIGTERM)
         try:
             stdout, stderr = self.process.communicate(timeout=self.timeout)
@@ -193,6 +217,12 @@ class Held:
             return stdout, stderr, signal.SIGKILL
         except subprocess.TimeoutExpired:
             return b"", b"", None
+
+
+# How long a released invocation is given to end on its own before it is
+# signalled, and how often that is checked.
+RELEASE_GRACE_SECONDS = 5
+RELEASE_GRACE_INTERVAL = 0.05
 
 
 class Recorder:
