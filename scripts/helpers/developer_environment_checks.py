@@ -4630,8 +4630,18 @@ def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
         check.ok(f"{len(unattributed)} new non-loopback listener(s) this run could not attribute to any "
                  f"process and which bind no port it declared, recorded rather than charged to vz: "
                  f"{[(row.get('address'), row.get('port')) for row in unattributed][:5]}")
-    check.ok(f"every listener that appeared during the run, with attribution: "
-             f"{sorted((row.get('scope'), row.get('command'), row.get('pid') in scoped) for row in appeared)[:10]}")
+    # Sorted through a key that tolerates absent fields. The same unprivileged
+    # `lsof` that leaves rows without a pid leaves rows without a command or a
+    # scope, and sorting tuples containing `None` beside tuples containing
+    # strings raises -- which crashed the whole topology lane, and all eighteen
+    # of its rows, inside the line that merely RECORDS attribution:
+    #   TypeError: '<' not supported between instances of 'str' and 'NoneType'
+    # The rows are still reported; only the ordering stopped assuming they are
+    # fully populated.
+    attribution = sorted(((row.get("scope"), row.get("command"), row.get("pid") in scoped)
+                          for row in appeared),
+                         key=lambda row: (row[0] or "", row[1] or "", row[2]))
+    check.ok(f"every listener that appeared during the run, with attribution: {attribution[:10]}")
     # And the edge itself is not on the host at all. It is a station on one
     # Environment's fabric; an address of it appearing in the host's own
     # listener table would mean it had been given a second, unowned identity.
