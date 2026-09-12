@@ -30,6 +30,15 @@ REGISTRY_GO_VERSION = 'go1.25.9'
 # a context carrying instance.id/version/go.version; our config sets no log.fields,
 # so startup rows carry exactly these keys.
 STARTUP_KEYS = frozenset({'time', 'level', 'msg', 'go.version', 'instance.id', 'version'})
+# ... except the upload-purge goroutine's, which are NOT written on that context.
+# `PurgeUploads` is started by registry/handlers/app.go before the listener and
+# logs through a plain logger, so its two rows carry only time/level/msg. They
+# land inside the startup window whenever the purge finishes before the snapshot
+# is taken, which is a race: this assertion has rejected whole 45-minute runs on
+# timing alone. Recognised by their exact message shapes rather than waved
+# through, so an unfamiliar identity-less row is still a fault.
+PURGE_KEYS = frozenset({'time', 'level', 'msg'})
+PURGE_MESSAGES = ('PurgeUploads starting:', 'Purge uploads finished.')
 # Request/response/error keys from internal/dcontext/http.go GetRequestLogger and
 # GetResponseLogger, registry/handlers/app.go (auth.user.name, err.*, vars.*) and the
 # optional log.fields service key. Anything else is not a Distribution 3.1.1 record.
@@ -143,24 +152,35 @@ def startup_identity(raw, *, authority):
     # retaining the rows it rejected, so the one fact needed to fix it -- WHICH
     # key or value is wrong -- was destroyed with the run. An exact key set over
     # a third party's log is worth keeping; discarding the counter-example is not.
-    faults = []
+    faults, identity_rows = [], []
     for index, row in enumerate(rows):
         if type(row) is not dict:
             faults.append({'row': index, 'reason': 'not an object', 'observed': repr(row)[:200]})
             continue
-        if set(row) != STARTUP_KEYS:
+        keys = set(row)
+        purge = keys == PURGE_KEYS and isinstance(row.get('msg'), str) and \
+            row['msg'].startswith(PURGE_MESSAGES)
+        if not purge and keys != STARTUP_KEYS:
             faults.append({'row': index, 'reason': 'key set differs',
-                           'unexpected': sorted(set(row) - STARTUP_KEYS),
-                           'missing': sorted(STARTUP_KEYS - set(row))})
+                           'unexpected': sorted(keys - STARTUP_KEYS),
+                           'missing': sorted(STARTUP_KEYS - keys),
+                           'msg': str(row.get('msg'))[:120]})
         wrong = {key: type(value).__name__ for key, value in row.items() if type(value) is not str}
         if wrong:
             faults.append({'row': index, 'reason': 'non-string values', 'observed': wrong})
+        if not purge:
+            identity_rows.append(row)
     require(not faults, 'registry startup fields: ' + json.dumps(faults[:5], sort_keys=True))
-    instances = {row['instance.id'] for row in rows}
+    # The identity is asserted over the rows that carry one. Requiring it of
+    # every row made the purge goroutine's output a failure of the registry's
+    # identity, which it says nothing about either way.
+    require(identity_rows, 'registry startup carries no identified row')
+    instances = {row['instance.id'] for row in identity_rows}
     require(len(instances) == 1, 'one registry process instance required')
     instance_id = route.token(next(iter(instances)), route.UUID)
-    require(all(row['version'] == REGISTRY_VERSION and row['go.version'] == REGISTRY_GO_VERSION and
-                row['level'] == 'info' for row in rows), 'registry startup identity')
+    require(all(row['version'] == REGISTRY_VERSION and row['go.version'] == REGISTRY_GO_VERSION
+                for row in identity_rows), 'registry startup identity')
+    require(all(row['level'] == 'info' for row in rows), 'registry startup level')
     for row in rows:
         route.timestamp_ns(row['time'])
     listening = 'listening on ' + authority + ', tls'
