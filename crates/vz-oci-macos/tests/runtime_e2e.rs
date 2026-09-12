@@ -29,7 +29,7 @@ use vz_oci_macos::{
     MacosRuntimeBackend, MountAccess, MountSpec, MountType, RunConfig, Runtime, RuntimeConfig,
     RuntimeLifecycleAdmissionEvent, RuntimeLifecycleAdmissionKind, RuntimeLifecycleObserver,
 };
-use vz_runtime_contract::RuntimeBackend as _;
+use vz_runtime_contract::{EgressPolicy, RuntimeBackend as _, StackResourceHint};
 
 /// Preserve the strict harness's raw stderr markers without depending on tracing.
 fn write_test_stderr(arguments: std::fmt::Arguments<'_>) {
@@ -1023,9 +1023,24 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
 
     // Stack: enter setup deterministically, then issue a duplicate while the
     // complete contract-backend create transaction is still in progress.
-    rt.boot_shared_vm(STACK_ID, vec![], Default::default())
-        .await
-        .unwrap();
+    //
+    // `egress: Allowed` because this test waits for `eth0` to acquire an IPv4
+    // address and a default route before it snapshots the guest's network. That
+    // interface is Apple's shared NAT NIC, and since `EgressPolicy` began
+    // deciding whether a Machine gets one at all, the default hint is `Offline`
+    // and attaches none -- so the precondition could only ever fail with
+    // `ip: can't find device 'eth0'`. Declaring the policy the test depends on
+    // is the fix; waiting longer for an interface nothing attaches is not.
+    rt.boot_shared_vm(
+        STACK_ID,
+        vec![],
+        StackResourceHint {
+            egress: EgressPolicy::Allowed,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     // Guest init starts DHCP asynchronously. Wait for the host-provided base
     // network to converge before snapshotting it, so the cleanup oracle only
     // compares topology owned by this test rather than DHCP timing.
