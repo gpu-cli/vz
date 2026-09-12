@@ -1436,6 +1436,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 };
                 vz_runtime_contract::StackResourceHint {
                     docker_data_seeded_by_fork: false,
+                    docker_data_after_host_crash: false,
                     // The legacy Compose path declares no Machine and so
                     // no egress policy; it keeps the reachability it has
                     // always had, named rather than defaulted.

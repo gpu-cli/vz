@@ -34,11 +34,35 @@ pub struct MachineBootNonDispatchProof {
     pub expected_incarnation: Option<MachineIncarnation>,
 }
 
+/// Positive authority that the daemon which last dispatched this Machine's VM
+/// is gone, established outside the state store and carried in here.
+///
+/// The state store cannot observe processes, so it cannot make this finding
+/// itself; what it can do is refuse to accept it in any state where it would
+/// not be a finding about a dead VM. `record_machine_boot_non_dispatch_after_host_crash`
+/// is that refusal, and this value is retained in the boot record so the reason
+/// a VM was re-dispatched over a `Ready` Machine stays readable afterwards.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostCrashAuthority {
+    pub schema_version: u32,
+    /// The control-owner identity of the daemon proven gone.
+    pub previous_daemon_id: String,
+    /// The digest of that daemon's own owner record, so the claim names an
+    /// exact durable document rather than a process id that can be reused.
+    pub previous_owner_sha256: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
     proof: MachineBootNonDispatchProof,
     consumed: bool,
+    /// Absent for every ordinary fresh/stopped/failed-predecessor arming. A
+    /// record written before this field existed decodes with `None`, which is
+    /// the accurate reading: it was not armed by a crash authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_crash: Option<HostCrashAuthority>,
 }
 
 fn conflict(message: &str) -> StackError {
@@ -320,6 +344,81 @@ impl StateStore {
             store.write_boot_record(&Record {
                 proof: proof.clone(),
                 consumed: false,
+                host_crash: None,
+            })?;
+            Ok(proof)
+        })
+    }
+
+    /// Record positive authority to re-dispatch a `Ready` Machine whose hosting
+    /// daemon is proven gone.
+    ///
+    /// This is criterion 10's crash clause and nothing wider. The ordinary
+    /// authority above answers "has this Machine ever been dispatched, or was
+    /// it positively stopped"; after a host crash both answers are "it was
+    /// dispatched and never stopped", and they stay true forever, so an
+    /// Environment whose daemon was killed could never be brought up again.
+    ///
+    /// What makes re-dispatch safe is a fact this store cannot see: on the
+    /// macOS backend every Machine runtime is hosted inside the daemon process,
+    /// so a daemon proven dead took its VMs with it. The caller establishes
+    /// that from the control-socket handover -- which refuses to start while
+    /// the recorded predecessor process is live -- and passes it in.
+    ///
+    /// Everything the store CAN check, it checks: the exact current pending Up
+    /// fence, a Machine the record still calls `Ready` with both identity
+    /// fields present, and a step whose expected incarnation is the one the
+    /// Machine actually carries. A Machine in any other state has a different
+    /// recovery path and is refused here rather than swept into this one.
+    pub fn record_machine_boot_non_dispatch_after_host_crash(
+        &self,
+        operation: &EnvironmentLifecycleOperation,
+        machine: &MachineId,
+        authority: &HostCrashAuthority,
+    ) -> Result<MachineBootNonDispatchProof, StackError> {
+        if authority.schema_version != 1
+            || authority.previous_daemon_id.is_empty()
+            || authority.previous_owner_sha256.len() != 64
+        {
+            return Err(conflict("malformed host crash authority"));
+        }
+        self.with_immediate_transaction(|store| {
+            let environment = store.boot_pending_up(operation, machine)?;
+            let machine_step = step(operation, machine)?;
+            let proof = proof_for(operation, machine_step);
+            if let Some(record) = store.boot_record(&environment.environment_id, machine)?
+                && record.proof.operation_id == operation.operation_id
+            {
+                // The same attempt, armed again. Identical to the ordinary
+                // path: idempotent, and never re-armed after consumption.
+                store.validate_boot_record(&record, &environment, machine)?;
+                if record.consumed {
+                    return Err(conflict("attempt already consumed; dispatch is uncertain"));
+                }
+                if record.proof != proof {
+                    return Err(conflict("same-attempt authority changed"));
+                }
+                return Ok(proof);
+            }
+            let instance = environment
+                .machines
+                .iter()
+                .find(|item| &item.machine_id == machine)
+                .ok_or_else(|| conflict("Machine absent"))?;
+            if instance.state != MachineState::Ready
+                || instance.incarnation.is_none()
+                || instance.runtime_identity.is_none()
+                || machine_step.initial_state != MachineState::Ready
+                || machine_step.expected_incarnation != instance.incarnation
+            {
+                return Err(conflict(
+                    "host crash authority requires a Ready Machine at its own incarnation",
+                ));
+            }
+            store.write_boot_record(&Record {
+                proof: proof.clone(),
+                consumed: false,
+                host_crash: Some(authority.clone()),
             })?;
             Ok(proof)
         })

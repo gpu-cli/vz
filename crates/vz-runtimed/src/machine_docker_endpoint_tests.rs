@@ -701,3 +701,67 @@ async fn endpoint_drop_requests_joined_cleanup_and_releases_connector() {
     .await
     .expect("bounded Drop cleanup test");
 }
+
+/// Criterion 10's endpoint reclamation, and the three things that stop it from
+/// being a licence to delete whatever is in the way.
+mod crash_reclamation {
+    use super::*;
+
+    #[test]
+    fn a_socket_nobody_serves_is_removed() {
+        let root = private_root();
+        let path = root.path().join("dead.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // The daemon died: its listener is gone, the inode is not.
+        drop(listener);
+        assert!(
+            path.symlink_metadata()
+                .expect("stat")
+                .file_type()
+                .is_socket()
+        );
+        let parent = private_parent(&path).expect("private parent");
+        reclaim_dead_endpoint(&parent, &path).expect("a socket nobody serves is a leftover");
+        assert!(!path.exists());
+        // Idempotent: an already-absent path is the state this wanted.
+        reclaim_dead_endpoint(&parent, &path).expect("absence needs no reclamation");
+    }
+
+    #[test]
+    fn a_socket_that_still_serves_is_refused() {
+        // THE CONTROL. If this passed, the reclamation would be able to unbind
+        // a live Engine's transport and put two owners on one Machine.
+        let root = private_root();
+        let path = root.path().join("live.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let parent = private_parent(&path).expect("private parent");
+        let error = reclaim_dead_endpoint(&parent, &path)
+            .expect_err("a serving endpoint is not a dead daemon's leftover");
+        assert!(error.to_string().contains("still serving"), "{error}");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_socket_is_refused() {
+        let root = private_root();
+        for (name, make) in [
+            (
+                "regular",
+                (|path: &Path| std::fs::write(path, b"")) as fn(&Path) -> std::io::Result<()>,
+            ),
+            ("directory", |path: &Path| std::fs::create_dir(path)),
+            ("symlink", |path: &Path| symlink("/dev/null", path)),
+        ] {
+            let path = root.path().join(name);
+            make(&path).expect("fixture");
+            let parent = private_parent(&path).expect("private parent");
+            let error = reclaim_dead_endpoint(&parent, &path)
+                .expect_err("only a socket can be a dead endpoint");
+            assert!(
+                error.to_string().contains("not this user's socket"),
+                "{error}"
+            );
+            assert!(path.symlink_metadata().is_ok());
+        }
+    }
+}

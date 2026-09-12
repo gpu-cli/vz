@@ -154,6 +154,24 @@ struct RecoveryRecord {
     scope: String,
 }
 
+/// What this daemon inherited when its predecessor left no closure receipt.
+///
+/// The control-socket handover already establishes the whole of this fact and
+/// then discards it: a predecessor with no `*.closed.json` is either proven not
+/// to be the recorded process or proven to be a zombie, because a live match
+/// refuses the handover outright. Retaining it is what lets the rest of the
+/// daemon reason about the Machines that predecessor was hosting. Absent when
+/// this daemon is the first, or when its predecessor shut down gracefully --
+/// which is not a crash and leaves nothing to reconstruct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CrashedPredecessor {
+    pub(crate) daemon_id: String,
+    pub(crate) owner_sha256: String,
+    /// `None` when the PID no longer resolves at all; `Some` when it resolves
+    /// to something that is not the recorded process, or to its zombie.
+    pub(crate) observation: Option<ProcessObservation>,
+}
+
 #[derive(Debug)]
 struct Directory {
     path: PathBuf,
@@ -440,6 +458,11 @@ pub(crate) struct ControlSocket {
     listener: Mutex<Option<UnixListener>>,
     socket_lock: StartupLock,
     database_lock: Arc<StartupLock>,
+    /// Retained from the handover, never recomputed: the proof that the
+    /// previous owner is gone is made once, under the exclusion the handover
+    /// holds, and a later lookup of the same PID could answer about a different
+    /// process.
+    crashed_predecessor: Option<CrashedPredecessor>,
     #[cfg(test)]
     simulate_crash: bool,
 }
@@ -843,6 +866,16 @@ impl ControlSocket {
             listener: Mutex::new(Some(listener)),
             socket_lock,
             database_lock,
+            crashed_predecessor: recovery.as_ref().and_then(|recovery: &RecoveryRecord| {
+                recovery
+                    .graceful_closed
+                    .is_none()
+                    .then(|| CrashedPredecessor {
+                        daemon_id: recovery.previous_daemon_id.clone(),
+                        owner_sha256: recovery.previous_owner_sha256.clone(),
+                        observation: recovery.previous_process_observation.clone(),
+                    })
+            }),
             #[cfg(test)]
             simulate_crash: false,
         };
@@ -929,6 +962,10 @@ impl ControlSocket {
     }
     pub(crate) fn daemon_id(&self) -> &str {
         &self.record.daemon_id
+    }
+    /// The predecessor this daemon took over from without a closure receipt.
+    pub(crate) fn crashed_predecessor(&self) -> Option<&CrashedPredecessor> {
+        self.crashed_predecessor.as_ref()
     }
     pub(crate) fn open_log(&self) -> io::Result<File> {
         self.validate()?;

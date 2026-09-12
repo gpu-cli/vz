@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! The redaction claim, measured rather than asserted.
 //!
 //! Criterion 18's last group sweeps seven artifact groups for the exact planted

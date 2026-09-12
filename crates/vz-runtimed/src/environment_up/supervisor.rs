@@ -209,7 +209,7 @@ impl RuntimeDaemon {
         // no fork ever starts against an empty Docker disk and is handed its
         // parent's underneath itself. The parent is quiesced immediately before
         // each clone and never stopped -- see `crate::machine_fork` for why.
-        self.seed_environment_forks(&prepared, &environment, &existing)
+        self.seed_environment_forks(&prepared, &environment, &existing.activations)
             .await
             .map_err(|error| backend_error(error.to_string()))?;
         self.with_state_store(|store| {
@@ -321,13 +321,34 @@ impl RuntimeDaemon {
         // VM non-dispatch only, never absence of pinned stores/disks.
         self.with_state_store(|store| {
             for step in &operation.machine_steps {
-                if !existing.contains_key(&step.machine_id)
+                if !existing.activations.contains_key(&step.machine_id)
                     && matches!(
                         step.status,
                         LifecycleStepStatus::Pending | LifecycleStepStatus::Running
                     )
                 {
-                    store.record_machine_boot_non_dispatch(&operation, &step.machine_id)?;
+                    // A Machine whose hosting daemon crashed is not
+                    // never-dispatched and was never stopped, so the ordinary
+                    // authority cannot describe it. Its own authority carries
+                    // the proof that made it reconstructable in the first
+                    // place, and is refused by the store in any Machine state
+                    // where that proof would not mean a dead VM.
+                    if existing.reconstructed.contains(&step.machine_id) {
+                        let authority = self
+                            .machine_live_sessions
+                            .host_crash_authority()
+                            .ok_or_else(|| StackError::Machine {
+                                code: MachineErrorCode::StateConflict,
+                                message: "crash reconstruction without host crash authority".into(),
+                            })?;
+                        store.record_machine_boot_non_dispatch_after_host_crash(
+                            &operation,
+                            &step.machine_id,
+                            &authority,
+                        )?;
+                    } else {
+                        store.record_machine_boot_non_dispatch(&operation, &step.machine_id)?;
+                    }
                 }
             }
             Ok(())
@@ -342,7 +363,7 @@ impl RuntimeDaemon {
             .install_environment_fabric(
                 prepared.lease(),
                 &environment,
-                &existing.keys().cloned().collect(),
+                &existing.activations.keys().cloned().collect(),
             )
             .await
             .map_err(|error| backend_error(error.to_string()))?;
@@ -368,7 +389,7 @@ impl RuntimeDaemon {
         })?;
         host_exports::probe_exportable_host_ports(
             &resolved_host_exports,
-            &existing.keys().cloned().collect(),
+            &existing.activations.keys().cloned().collect(),
         )
         .await
         .map_err(|error| {
@@ -513,7 +534,7 @@ impl RuntimeDaemon {
                 let pin=prepared.pins().iter().find(|pin|pin.store().owner().machine_id.as_ref()==Some(&step.machine_id));
                 let native_pin=prepared.native_pins().iter().find(|pin|pin.store().owner().machine_id.as_ref()==Some(&step.machine_id));
                 if pin.is_none() && native_pin.is_none() {return Err(backend_error("prepared Machine pin missing".into()));}
-                let activation=if let Some(activation)=existing.get(&step.machine_id) {
+                let activation=if let Some(activation)=existing.activations.get(&step.machine_id) {
                     if !Arc::ptr_eq(activation.entry(),&entry) { return Err(backend_error("Up attachment changed original Runtime object".into())); }
                     Arc::clone(activation)
                 } else {
@@ -586,8 +607,14 @@ impl RuntimeDaemon {
                     let seeded_by_fork = machine.fork.is_some()
                         && machine.incarnation.is_none()
                         && machine.runtime_identity.is_none();
+                    // And only the FIRST boot after a crash, for the same
+                    // reason: this Machine's disk was left mounted by the
+                    // daemon that died. Once this boot has run and stopped, the
+                    // disk is cleanly unmounted like any other.
+                    let after_host_crash = existing.reconstructed.contains(&step.machine_id);
                     let (activation,start_error)=match entry.boot_or_inspect_machine(&reservation,export_ports,attachments,StackResourceHint {
                         docker_data_seeded_by_fork: seeded_by_fork,
+                        docker_data_after_host_crash: after_host_crash,
                         egress: declared_egress(machine)?,
                         cpus:Some(cpus),memory_mb:Some(memory_mb),
                         volume_mounts,
@@ -641,11 +668,12 @@ impl RuntimeDaemon {
                 if machine.target.os==OperatingSystem::Linux && machine.profile==MachineProfile::Developer && self.machine_live_sessions.docker_endpoint_path(prepared.lease(),&activation)
                     .map_err(|error|backend_error(error.to_string()))?.is_none() {
                     let path=MachineDockerEndpoint::socket_path_for(&self.config.runtime_data_dir,activation.owner()).map_err(|error|backend_error(error.to_string()))?;
-                    let mut endpoint=Some(MachineDockerEndpoint::start(Arc::clone(&activation),&path).await.map_err(|error|backend_error(error.to_string()))?);
+                    let reclaim=if existing.reconstructed.contains(&step.machine_id) {crate::machine_docker_endpoint::EndpointReclaim::AfterHostCrash} else {crate::machine_docker_endpoint::EndpointReclaim::Refuse};
+                    let mut endpoint=Some(MachineDockerEndpoint::start(Arc::clone(&activation),&path,reclaim).await.map_err(|error|backend_error(error.to_string()))?);
                     self.machine_live_sessions.attach_docker_endpoint(prepared.lease(),&activation,&mut endpoint).map_err(|error|backend_error(error.to_string()))?;
                 }
                 if tokio::time::Instant::now()>=deadline { return Err(failure(&metadata,MachineErrorCode::Timeout,"Machine boot retained, but Up readiness deadline elapsed")); }
-                let reused_incarnation=existing.contains_key(&step.machine_id).then(||machine.incarnation.clone()).flatten();
+                let reused_incarnation=existing.activations.contains_key(&step.machine_id).then(||machine.incarnation.clone()).flatten();
                 let incarnation=if let Some(incarnation)=reused_incarnation { incarnation } else {MachineIncarnation {
                     schema_version:1, incarnation_id:MachineIncarnationId::new(format!("inc_runtime_{}",activation.runtime_identity().incarnation_id)).map_err(|error|backend_error(error.to_string()))?,
                     machine_id:machine.machine_id.clone(),generation:machine.incarnation.as_ref().map_or(Some(1),|value|value.generation.checked_add(1))
@@ -950,10 +978,8 @@ impl RuntimeDaemon {
             })?;
         let deadline = tokio::time::Instant::now() + SECRET_DELIVERY_TIMEOUT;
         let target = binding.target_path.clone();
-        let script = format!(
-            "umask 077; mkdir -p \"$(dirname \"$VZ_SECRET_TARGET\")\" && \
-             printf %s \"$VZ_SECRET_VALUE\" > \"$VZ_SECRET_TARGET\""
-        );
+        let script = "umask 077; mkdir -p \"$(dirname \"$VZ_SECRET_TARGET\")\" && \
+             printf %s \"$VZ_SECRET_VALUE\" > \"$VZ_SECRET_TARGET\"";
         let options = vz_linux::ExecOptions {
             working_dir: None,
             env: vec![
@@ -967,7 +993,7 @@ impl RuntimeDaemon {
                 vz_linux::ContainerExecDispatchGate::new(deadline),
                 ticket,
                 "/bin/sh".into(),
-                vec!["-c".into(), script],
+                vec!["-c".into(), script.to_string()],
                 options,
                 None,
             )

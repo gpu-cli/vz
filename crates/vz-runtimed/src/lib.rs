@@ -544,7 +544,10 @@ impl RuntimeDaemon {
             #[cfg(target_os = "macos")]
             environment_switches: Default::default(),
             #[cfg(target_os = "macos")]
-            machine_live_sessions: Default::default(),
+            machine_live_sessions:
+                machine_live_sessions::MachineLiveSessions::after_predecessor_crash(
+                    control_socket.crashed_predecessor().cloned(),
+                ),
             #[cfg(target_os = "macos")]
             environment_up_runs: Default::default(),
             #[cfg(target_os = "macos")]

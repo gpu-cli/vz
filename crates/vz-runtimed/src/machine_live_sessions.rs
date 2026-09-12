@@ -261,6 +261,12 @@ struct Sessions {
     controller: Option<Arc<()>>,
     machines: HashMap<MachineId, Arc<Session>>,
     retired: HashMap<MachineId, RetiredDelete>,
+    /// Every Machine this daemon has ever registered a session for, retained
+    /// after the session itself is gone. Crash reconstruction below is offered
+    /// exactly once per Machine and only to one this daemon never hosted; a
+    /// Machine whose session this daemon created and then lost is a fault in
+    /// this process, not the predecessor's crash, and stays refused.
+    hosted: std::collections::HashSet<MachineId>,
 }
 
 struct RetiredDelete {
@@ -271,14 +277,53 @@ struct RetiredDelete {
     original_lease: Option<Weak<MachineRuntimeStoreLease>>,
 }
 
+/// What `activations_for_up` resolved for one Up.
+///
+/// Two answers, not one, because a Machine can be absent from `activations` for
+/// two very different reasons and the caller must not confuse them: it has
+/// never been dispatched (or was positively stopped), or it was dispatched by a
+/// daemon that is provably gone. The second needs its own boot authority --
+/// nothing about it is "never dispatched" -- so the finding is carried out of
+/// here rather than recomputed against a registry that has since changed.
+#[derive(Debug, Default)]
+pub(crate) struct UpActivations {
+    pub(crate) activations: HashMap<MachineId, Arc<MachineRuntimeActivation>>,
+    pub(crate) reconstructed: std::collections::BTreeSet<MachineId>,
+}
+
 /// One registry belongs to one daemon/controller. A session must be registered
 /// before publishing its activation or exposing its endpoint to host clients.
 #[derive(Default)]
 pub struct MachineLiveSessions {
     sessions: Mutex<Sessions>,
+    /// Set when this daemon took control ownership from a predecessor that left
+    /// no closure receipt. See `activations_for_up`.
+    crashed_predecessor: Option<crate::control_socket::CrashedPredecessor>,
 }
 
 impl MachineLiveSessions {
+    /// The boot authority this daemon may offer for a Machine its crashed
+    /// predecessor was hosting. `None` when this daemon crashed nothing.
+    pub(crate) fn host_crash_authority(&self) -> Option<vz_stack::HostCrashAuthority> {
+        self.crashed_predecessor
+            .as_ref()
+            .map(|predecessor| vz_stack::HostCrashAuthority {
+                schema_version: 1,
+                previous_daemon_id: predecessor.daemon_id.clone(),
+                previous_owner_sha256: predecessor.owner_sha256.clone(),
+            })
+    }
+
+    /// The registry a daemon that succeeded a crashed predecessor starts with.
+    pub(crate) fn after_predecessor_crash(
+        crashed_predecessor: Option<crate::control_socket::CrashedPredecessor>,
+    ) -> Self {
+        Self {
+            sessions: Mutex::new(Sessions::default()),
+            crashed_predecessor,
+        }
+    }
+
     /// Resolve missing-session authority before beginning Delete. This proof
     /// says nothing about disks, contexts, or runtime-store absence.
     pub(crate) fn prepare_delete_absence<S: EnvironmentStateStore>(
@@ -682,10 +727,10 @@ impl MachineLiveSessions {
         lease: &EnvironmentControllerLease,
         environment: &vz_runtime_contract::EnvironmentInstance,
         non_dispatched: &std::collections::BTreeSet<MachineId>,
-    ) -> Result<HashMap<MachineId, Arc<MachineRuntimeActivation>>, MachineLiveSessionError> {
+    ) -> Result<UpActivations, MachineLiveSessionError> {
         let mut sessions = self.sessions.lock().map_err(error)?;
         require_controller(&mut sessions.controller, lease.controller_identity())?;
-        let mut result = HashMap::new();
+        let mut result = UpActivations::default();
         for machine in &environment.machines {
             let owner = ResourceOwner {
                 project_id: environment.project_id.clone(),
@@ -712,6 +757,38 @@ impl MachineLiveSessions {
                     continue;
                 }
                 if fresh || machine.state == vz_runtime_contract::MachineState::Stopped {
+                    continue;
+                }
+                // CRASH RECONSTRUCTION. The refusal below is right whenever the
+                // previous incarnation might still be running: adopting a
+                // Machine this daemon cannot see would leave two owners of one
+                // VM, one of them unable to stop it.
+                //
+                // It is wrong in exactly one case, and that case is criterion
+                // 10's. Every Machine runtime on this backend is hosted inside
+                // the daemon process -- `MachineRuntimeEntry` owns the
+                // `vz_linux` VM object, and there is no separate VM host
+                // process to outlive it -- so a daemon that is provably dead
+                // took its Machines with it. The control-socket handover
+                // already establishes precisely that: it refuses to start at
+                // all while the recorded predecessor process is live, so a
+                // `CrashedPredecessor` is the durable proof that the previous
+                // owner, and therefore every VM it was hosting, is gone.
+                //
+                // Offered only to a Machine this daemon has never hosted. A
+                // session this process created and then lost says nothing about
+                // the predecessor and is still an unknown live VM.
+                if let Some(predecessor) = &self.crashed_predecessor
+                    && !sessions.hosted.contains(&machine.machine_id)
+                {
+                    tracing::info!(
+                        machine_id = %machine.machine_id,
+                        previous_daemon_id = %predecessor.daemon_id,
+                        previous_owner_sha256 = %predecessor.owner_sha256,
+                        previous_process = ?predecessor.observation,
+                        "Up reconstructs a Machine whose hosting daemon crashed"
+                    );
+                    result.reconstructed.insert(machine.machine_id.clone());
                     continue;
                 }
                 return Err(error(
@@ -773,7 +850,7 @@ impl MachineLiveSessions {
             } else if machine.incarnation.is_some() {
                 return Err(error("Up incarnation has no persisted runtime identity"));
             }
-            result.insert(
+            result.activations.insert(
                 machine.machine_id.clone(),
                 Arc::clone(&resources.activation),
             );
@@ -1115,6 +1192,7 @@ impl MachineLiveSessions {
             activation,
             endpoint: endpoint.take(),
         };
+        sessions.hosted.insert(machine.clone());
         sessions.machines.insert(
             machine,
             Arc::new(Session {
@@ -2097,7 +2175,7 @@ mod tests {
         let activations = sessions
             .activations_for_up(&lease, &environment, &Default::default())
             .expect("a never-started Machine needs no prior activation to reconstruct");
-        assert!(activations.is_empty());
+        assert!(activations.activations.is_empty() && activations.reconstructed.is_empty());
     }
 
     #[tokio::test]
@@ -2124,6 +2202,90 @@ mod tests {
         let error = sessions
             .activations_for_up(&lease, &environment, &Default::default())
             .expect_err("a Machine that ran has no business being treated as fresh");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown previously active Machine"),
+            "{error}"
+        );
+    }
+
+    /// The Machine fixture criterion 10's crash clause is about: one that was
+    /// `Ready` under a daemon that is now provably gone.
+    fn crashed_environment() -> vz_runtime_contract::EnvironmentInstance {
+        let (mut environment, _stop, _delete) = delete_fixture();
+        environment.state = EnvironmentState::Ready;
+        environment.lifecycle_generation = 4;
+        environment.machines[0].state = MachineState::Ready;
+        environment.machines[0].runtime_identity =
+            Some(vz_runtime_contract::MachineRuntimeIdentity {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                opaque_id: "vm-was-running".into(),
+            });
+        environment
+    }
+
+    fn crashed_predecessor() -> crate::control_socket::CrashedPredecessor {
+        crate::control_socket::CrashedPredecessor {
+            daemon_id: "runtimed-previous".into(),
+            owner_sha256: "a".repeat(64),
+            // The shape the handover records when the PID no longer resolves.
+            observation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn up_reconstructs_a_machine_whose_hosting_daemon_crashed() {
+        // Criterion 10: "Daemon/adapter/guest crashes reconstruct authoritative
+        // routes, sockets, DNS, and port state." Every Machine runtime on this
+        // backend lives in the daemon process, so a predecessor proven dead
+        // cannot still be hosting this VM, and the next Up boots a new
+        // incarnation instead of refusing forever.
+        let environment = crashed_environment();
+        let sessions = MachineLiveSessions::after_predecessor_crash(Some(crashed_predecessor()));
+        let controller = EnvironmentRuntimeController::default();
+        let lease = controller
+            .acquire(&environment.project_id, &environment.environment_id)
+            .await
+            .unwrap();
+        let activations = sessions
+            .activations_for_up(&lease, &environment, &Default::default())
+            .expect("a Machine hosted by a proven-dead daemon is reconstructable");
+        // Nothing is ADOPTED -- the activation map stays empty -- and the
+        // Machine is named as reconstructed, which is what tells the caller to
+        // arm crash boot authority rather than the never-dispatched kind.
+        assert!(activations.activations.is_empty());
+        assert_eq!(
+            activations.reconstructed,
+            [environment.machines[0].machine_id.clone()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn up_refuses_to_reconstruct_a_machine_this_daemon_itself_hosted() {
+        // The control that keeps the clause above from becoming "a crashed
+        // predecessor excuses every missing session for the rest of this
+        // daemon's life". A session THIS daemon registered and then lost says
+        // nothing about the predecessor's VMs, so it is still an unknown live
+        // VM and still refused.
+        let environment = crashed_environment();
+        let sessions = MachineLiveSessions::after_predecessor_crash(Some(crashed_predecessor()));
+        sessions
+            .sessions
+            .lock()
+            .unwrap()
+            .hosted
+            .insert(environment.machines[0].machine_id.clone());
+        let controller = EnvironmentRuntimeController::default();
+        let lease = controller
+            .acquire(&environment.project_id, &environment.environment_id)
+            .await
+            .unwrap();
+        let error = sessions
+            .activations_for_up(&lease, &environment, &Default::default())
+            .expect_err("a Machine this daemon hosted is not the predecessor's to reconstruct");
         assert!(
             error
                 .to_string()

@@ -192,6 +192,7 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
     }];
     let resources = vz_runtime_contract::StackResourceHint {
         docker_data_seeded_by_fork: false,
+        docker_data_after_host_crash: false,
         egress: vz_runtime_contract::EgressPolicy::Allowed,
         cpus: Some(4),
         memory_mb: Some(8192),

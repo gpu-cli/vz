@@ -394,7 +394,8 @@ fn copied_corrupt_or_foreign_record_fails_closed() {
                 key(&operation.environment_id, b).unwrap(),
                 serde_json::to_string(&Record {
                     proof,
-                    consumed: false
+                    consumed: false,
+                    host_crash: None
                 })
                 .unwrap()
             ],
@@ -624,7 +625,8 @@ fn delete_successor_rejects_missing_and_foreign_original_proof_without_writes() 
                 params![
                     serde_json::to_string(&Record {
                         proof: changed,
-                        consumed: false
+                        consumed: false,
+                        host_crash: None
                     })
                     .unwrap(),
                     key(&up.environment_id, a).unwrap()
@@ -668,4 +670,173 @@ fn failed_up_proof_does_not_skip_an_intervening_lifecycle_to_delete() {
             .require_machine_boot_non_dispatch(&environment(&store, &delete), machine)
             .is_err()
     );
+}
+
+/// Bring one Machine all the way to `Ready` through a successful Up, which is
+/// the only state criterion 10's crash authority accepts.
+fn boot_to_ready(
+    store: &StateStore,
+    operation: &EnvironmentLifecycleOperation,
+    machine: &MachineId,
+    generation: u64,
+) -> MachineIncarnation {
+    let item = step(operation, machine).unwrap();
+    let incarnation = MachineIncarnation {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        incarnation_id: MachineIncarnationId::generate(),
+        machine_id: machine.clone(),
+        generation,
+        created_at: 10,
+    };
+    store
+        .record_machine_boot_non_dispatch(operation, machine)
+        .unwrap();
+    store
+        .consume_machine_boot_non_dispatch(operation, machine)
+        .unwrap();
+    store
+        .acknowledge_environment_machine_step(
+            &MachineLifecycleStepAcknowledgement {
+                operation_id: operation.operation_id.clone(),
+                generation: operation.generation,
+                machine_id: machine.clone(),
+                initial_state: item.initial_state,
+                target_state: item.target_state,
+                expected_incarnation: item.expected_incarnation.clone(),
+                resulting_incarnation: Some(incarnation.clone()),
+                resulting_activation: Some(MachineActivationEvidence {
+                    docker_context: None,
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    backend: MachineBackend::MacosVirtualizationLinux,
+                    // Empty: this fixture's Machines are Hardened, and a
+                    // Hardened Machine may not declare a Docker capability.
+                    negotiated_capabilities: CapabilitySet::new([]),
+                    runtime_identity: MachineRuntimeIdentity {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        opaque_id: format!("crash-fixture:{}", incarnation.incarnation_id),
+                    },
+                    incarnation: incarnation.clone(),
+                }),
+                result: LifecycleStepResult::Succeeded,
+            },
+            10,
+        )
+        .unwrap();
+    incarnation
+}
+
+fn crash_authority() -> HostCrashAuthority {
+    HostCrashAuthority {
+        schema_version: 1,
+        previous_daemon_id: "runtimed-previous".into(),
+        previous_owner_sha256: "b".repeat(64),
+    }
+}
+
+/// Criterion 10: a Machine left `Ready` by a daemon that is now gone can be
+/// re-dispatched, and nothing else about it can.
+#[test]
+fn host_crash_authority_rearms_a_ready_machine_and_nothing_else() {
+    let (_directory, store, operation) = fixture();
+    let machine = operation.machine_steps[0].machine_id.clone();
+    let sibling = operation.machine_steps[1].machine_id.clone();
+    let incarnation = boot_to_ready(&store, &operation, &machine, 1);
+    // The sibling never booted, so the whole Up fails and leaves one Ready
+    // Machine behind -- the shape a crash leaves, reached without one.
+    acknowledge(
+        &store,
+        &operation,
+        &sibling,
+        LifecycleStepResult::Failed {
+            reason: "sibling never dispatched".into(),
+        },
+    );
+    store
+        .finish_environment_lifecycle(operation.operation_id.as_str(), operation.generation, 11)
+        .unwrap();
+    let before = environment(&store, &operation);
+    let ready = before
+        .machines
+        .iter()
+        .find(|item| item.machine_id == machine)
+        .unwrap();
+    assert_eq!(ready.state, MachineState::Ready);
+    assert_eq!(ready.incarnation.as_ref(), Some(&incarnation));
+    assert!(ready.runtime_identity.is_some());
+
+    let next = begin(
+        &store,
+        &operation.environment_id,
+        EnvironmentLifecycleKind::Up,
+        2,
+    );
+    // THE CONTROL. Without the crash authority this is precisely the refusal
+    // that wedged a crashed Environment forever: the Machine was dispatched and
+    // never stopped, so no ordinary authority describes it.
+    assert!(
+        store
+            .record_machine_boot_non_dispatch(&next, &machine)
+            .is_err()
+    );
+    let proof = store
+        .record_machine_boot_non_dispatch_after_host_crash(&next, &machine, &crash_authority())
+        .unwrap();
+    assert_eq!(proof.generation, next.generation);
+    assert_eq!(proof.expected_incarnation.as_ref(), Some(&incarnation));
+    // Idempotent within the attempt, and still unrepeatable after dispatch.
+    assert_eq!(
+        store
+            .record_machine_boot_non_dispatch_after_host_crash(&next, &machine, &crash_authority())
+            .unwrap(),
+        proof
+    );
+    store
+        .consume_machine_boot_non_dispatch(&next, &machine)
+        .unwrap();
+    assert!(
+        store
+            .record_machine_boot_non_dispatch_after_host_crash(&next, &machine, &crash_authority())
+            .is_err()
+    );
+}
+
+/// The crash authority is not a skeleton key: it describes one Machine state,
+/// and a malformed claim is not a claim at all.
+#[test]
+fn host_crash_authority_refuses_every_state_that_is_not_a_dispatched_machine() {
+    let (_directory, store, operation) = fixture();
+    let machine = operation.machine_steps[0].machine_id.clone();
+    // A never-dispatched Machine. Its own authority exists and is the right
+    // one; this must not be an alternative route to it.
+    assert!(
+        store
+            .record_machine_boot_non_dispatch_after_host_crash(
+                &operation,
+                &machine,
+                &crash_authority()
+            )
+            .is_err()
+    );
+    let before = store.total_changes_for_test();
+    for malformed in [
+        HostCrashAuthority {
+            schema_version: 2,
+            ..crash_authority()
+        },
+        HostCrashAuthority {
+            previous_daemon_id: String::new(),
+            ..crash_authority()
+        },
+        HostCrashAuthority {
+            previous_owner_sha256: "short".into(),
+            ..crash_authority()
+        },
+    ] {
+        assert!(
+            store
+                .record_machine_boot_non_dispatch_after_host_crash(&operation, &machine, &malformed)
+                .is_err()
+        );
+    }
+    assert_eq!(store.total_changes_for_test(), before);
 }

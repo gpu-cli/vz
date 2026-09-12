@@ -2755,6 +2755,41 @@ impl EnvironmentInstance {
                 });
             }
         }
+        // SecretBindings are validated here for the same reasons as every
+        // other Environment-owned collection above, and this loop is also the
+        // only caller of `SecretBindingId::validate`: without it a persisted
+        // instance could carry an identifier no constructor would have minted.
+        let mut secret_binding_ids = BTreeSet::new();
+        let mut secret_binding_names = BTreeSet::new();
+        for binding in &self.secret_bindings {
+            validate_schema(binding.schema_version)?;
+            binding.binding_id.validate()?;
+            validate_name("secret_binding", &binding.name)?;
+            if binding.environment_id != self.environment_id {
+                return Err(TopologyValidationError::OwnershipMismatch {
+                    kind: "secret_binding.environment".to_string(),
+                    value: binding.binding_id.to_string(),
+                });
+            }
+            if !machine_ids.contains(binding.machine_id.as_str()) {
+                return Err(TopologyValidationError::MissingReference {
+                    kind: "secret_binding.machine_id".to_string(),
+                    value: binding.machine_id.to_string(),
+                });
+            }
+            if !secret_binding_ids.insert(binding.binding_id.as_str()) {
+                return Err(TopologyValidationError::Duplicate {
+                    kind: "secret_binding_id".to_string(),
+                    value: binding.binding_id.to_string(),
+                });
+            }
+            if !secret_binding_names.insert(binding.name.as_str()) {
+                return Err(TopologyValidationError::Duplicate {
+                    kind: "secret_binding_name".to_string(),
+                    value: binding.name.clone(),
+                });
+            }
+        }
         let mut import_ids = BTreeSet::new();
         let mut import_names = BTreeSet::new();
         for import in &self.host_imports {

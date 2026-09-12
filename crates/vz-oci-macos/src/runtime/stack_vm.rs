@@ -1346,6 +1346,7 @@ impl Runtime {
         allow_unformatted: bool,
         docker_data: bool,
         seeded_by_fork: bool,
+        after_host_crash: bool,
     ) -> Result<(), OciError> {
         let phase = GuestDiskPhase::Probe;
         let started = std::time::Instant::now();
@@ -1395,6 +1396,13 @@ impl Runtime {
                     }
                     if seeded_by_fork {
                         Self::prepare_seeded_docker_disk(vm, device).await?;
+                    } else if after_host_crash {
+                        // The same replay, and deliberately WITHOUT the engine
+                        // identity drop a fork needs: this is the same Machine
+                        // coming back, so it keeps the engine it minted. The
+                        // disk is unclean for the same reason a fork's is --
+                        // nobody unmounted it -- and for no other.
+                        Self::replay_crashed_docker_disk(vm, device).await?;
                     }
                     Self::verify_guest_docker_filesystem(vm, device).await?;
                 }
@@ -1421,23 +1429,43 @@ impl Runtime {
             budget_seconds = phase.timeout().as_secs(),
             "guest disk phase started"
         );
-        let (formatter, arguments) = if docker_data {
-            (
-                "/sbin/mke2fs",
-                vec![
-                    "-t",
-                    "ext4",
-                    "-F",
-                    "-O",
-                    "has_journal,extent,64bit,metadata_csum",
-                    "-E",
-                    "lazy_itable_init=0,lazy_journal_init=0",
-                    device,
-                ],
-            )
+        // Journaled ext4 for every disk this formats, not only the Docker one.
+        //
+        // `busybox mke2fs -F` makes ext2, which has no journal, and that is
+        // what declared block volumes and named volumes were getting. It is
+        // visible in the guest's own log the first time one is mounted:
+        //
+        //   EXT4-fs (vdb): warning: mounting unchecked fs, running e2fsck is
+        //   recommended
+        //   EXT4-fs (vdb): mounted filesystem ... r/w without journal
+        //
+        // A volume is durable declared state -- Stop preserves it and Delete is
+        // what reclaims it -- so "survives only a graceful shutdown" is not the
+        // promise. Without a journal an unclean stop loses recent writes and
+        // leaves a filesystem nothing may repair, which is exactly the state a
+        // crashed daemon leaves behind and the reason this was found.
+        //
+        // Only new disks are affected. Nothing here reformats an existing
+        // filesystem, so a volume already made as ext2 stays ext2 and stays
+        // mountable; it simply does not gain a journal it was never given.
+        let arguments = if docker_data {
+            vec![
+                "-t",
+                "ext4",
+                "-F",
+                "-O",
+                "has_journal,extent,64bit,metadata_csum",
+                "-E",
+                "lazy_itable_init=0,lazy_journal_init=0",
+                device,
+            ]
         } else {
-            ("/bin/busybox", vec!["mke2fs", "-F", device])
+            // Without `lazy_journal_init=0`: a volume disk may be as small as
+            // the schema's 1 MiB minimum, and eagerly zeroing a journal that
+            // mke2fs may then decline to create wastes the whole disk.
+            vec!["-t", "ext4", "-F", "-O", "has_journal,extent", device]
         };
+        let formatter = "/sbin/mke2fs";
         let output = vm
             .exec_collect(
                 formatter.to_string(),
@@ -1508,12 +1536,52 @@ impl Runtime {
     /// Removing the file makes the engine mint a fresh one at start, which is
     /// the same thing it does on a Machine that never had one.
     async fn prepare_seeded_docker_disk(vm: &LinuxVm, device: &str) -> Result<(), OciError> {
-        const MOUNTPOINT: &str = "/run/vz-oci/forked-journal-replay";
-        let timeout = GuestDiskPhase::Probe.timeout();
         tracing::info!(
             device,
             "replaying a forked Docker filesystem's journal and dropping its inherited engine identity"
         );
+        Self::replay_docker_journal(vm, device, "forked", true).await
+    }
+
+    /// Replay the journal of a Docker disk whose Machine's hosting daemon was
+    /// killed. Criterion 10's crash clause.
+    ///
+    /// Identical in mechanism to a fork's replay and identical in what it does
+    /// NOT do: no `e2fsck`, no reformat, and the admission that follows is
+    /// unchanged, so a disk with recorded errors is still refused. The
+    /// difference is the engine identity, which is kept. A fork is a NEW
+    /// Machine that must not answer as its parent; a Machine coming back from
+    /// its host's crash is the SAME Machine, and re-minting its engine id would
+    /// discard the identity its own Docker state is written against.
+    ///
+    /// The provenance is what authorises this, exactly as for a fork. A
+    /// declared Machine whose disk is unclean for no reason anyone can name is
+    /// still a fault to fail closed on; this one's reason is a daemon proven
+    /// dead, established by the control-socket handover long before any disk
+    /// was touched.
+    async fn replay_crashed_docker_disk(vm: &LinuxVm, device: &str) -> Result<(), OciError> {
+        tracing::info!(
+            device,
+            "replaying the Docker filesystem journal of a Machine whose hosting daemon crashed"
+        );
+        Self::replay_docker_journal(vm, device, "crash-recovered", false).await
+    }
+
+    /// Mount-then-unmount, which IS ext4's journal replay: it recovers on a
+    /// read-write mount and marks the superblock clean on unmount.
+    async fn replay_docker_journal(
+        vm: &LinuxVm,
+        device: &str,
+        what: &str,
+        drop_engine_identity: bool,
+    ) -> Result<(), OciError> {
+        const MOUNTPOINT: &str = "/run/vz-oci/docker-journal-replay";
+        let timeout = GuestDiskPhase::Probe.timeout();
+        let drop_identity = if drop_engine_identity {
+            format!("/bin/busybox rm -f {MOUNTPOINT}/engine/engine-id; ")
+        } else {
+            String::new()
+        };
         let replay = vm
             .exec_collect(
                 "/bin/busybox".to_string(),
@@ -1523,7 +1591,7 @@ impl Runtime {
                     format!(
                         "set -e; /bin/busybox mkdir -p {MOUNTPOINT}; \
                          /bin/busybox mount -t ext4 {device} {MOUNTPOINT}; \
-                         /bin/busybox rm -f {MOUNTPOINT}/engine/engine-id; \
+                         {drop_identity}\
                          /bin/busybox umount {MOUNTPOINT}"
                     ),
                 ],
@@ -1532,7 +1600,7 @@ impl Runtime {
             .await?;
         if replay.exit_code != 0 {
             return Err(OciError::InvalidConfig(format!(
-                "forked Docker disk preparation failed for {device}: exit {}: {}{}",
+                "{what} Docker disk preparation failed for {device}: exit {}: {}{}",
                 replay.exit_code, replay.stdout, replay.stderr
             )));
         }
@@ -1989,6 +2057,7 @@ esac
                 *disposition == PrivateDiskDisposition::FormatAuthorized,
                 true,
                 resources.docker_data_seeded_by_fork,
+                resources.docker_data_after_host_crash,
             )
             .await?;
             complete_private_disk_format(
@@ -2013,6 +2082,7 @@ esac
                 volume_device,
                 "persistent named-volume",
                 true,
+                false,
                 false,
                 false,
             )
@@ -2072,6 +2142,7 @@ esac
                     &device,
                     "declared block volume",
                     true,
+                    false,
                     false,
                     false,
                 )

@@ -44,7 +44,7 @@ use vz_runtime_contract::{
 use vz_runtimed::environment_runtime_controller::EnvironmentRuntimeController;
 use vz_runtimed::machine_artifact_store::{PinnedMachineArtifacts, pin_machine_artifacts};
 use vz_runtimed::machine_backend::MachineBackendRuntime as MacosRuntimeBackend;
-use vz_runtimed::machine_docker_endpoint::MachineDockerEndpoint;
+use vz_runtimed::machine_docker_endpoint::{EndpointReclaim, MachineDockerEndpoint};
 use vz_runtimed::machine_live_sessions::MachineLiveSessions;
 use vz_runtimed::machine_runtime_activation::MachineRuntimeActivation;
 use vz_runtimed::machine_runtime_registry::{
@@ -383,6 +383,7 @@ fn fixtures(
             artifact,
             resources: StackResourceHint {
                 docker_data_seeded_by_fork: false,
+                docker_data_after_host_crash: false,
                 cpus: Some(2),
                 memory_mb: Some(memory_mb),
                 ..StackResourceHint::default()
@@ -823,35 +824,52 @@ async fn host_endpoint_proof(
     let decoy = root.join("unrelated.sock");
     fs::write(&decoy, b"unrelated-host-file")?;
     let hardened_path = MachineDockerEndpoint::socket_path_for(root, hardened.owner())?;
-    let hardened_refusal =
-        match MachineDockerEndpoint::start(Arc::clone(&hardened), &hardened_path).await {
-            Err(error) => error.to_string(),
-            Ok(endpoint) => {
-                endpoint.shutdown().await?;
-                return Err(anyhow!("Hardened Machine acquired a Docker endpoint"));
-            }
-        };
+    let hardened_refusal = match MachineDockerEndpoint::start(
+        Arc::clone(&hardened),
+        &hardened_path,
+        EndpointReclaim::Refuse,
+    )
+    .await
+    {
+        Err(error) => error.to_string(),
+        Ok(endpoint) => {
+            endpoint.shutdown().await?;
+            return Err(anyhow!("Hardened Machine acquired a Docker endpoint"));
+        }
+    };
     ensure!(!hardened_path.exists());
     let target_a = MachineDockerEndpoint::socket_path_for(root, a.owner())?;
     let target_b = MachineDockerEndpoint::socket_path_for(root, b.owner())?;
     fs::write(&target_a, b"do-not-adopt-this-endpoint")?;
     let collision_before = fs::symlink_metadata(&target_a)?;
-    let preexisting_path_refusal =
-        match MachineDockerEndpoint::start(Arc::clone(&a), &target_a).await {
-            Err(error) => error.to_string(),
-            Ok(endpoint) => {
-                endpoint.shutdown().await?;
-                return Err(anyhow!("endpoint adopted a preexisting host file"));
-            }
-        };
+    let preexisting_path_refusal = match MachineDockerEndpoint::start(
+        Arc::clone(&a),
+        &target_a,
+        EndpointReclaim::Refuse,
+    )
+    .await
+    {
+        Err(error) => error.to_string(),
+        Ok(endpoint) => {
+            endpoint.shutdown().await?;
+            return Err(anyhow!("endpoint adopted a preexisting host file"));
+        }
+    };
     ensure!(
         fs::read(&target_a)? == b"do-not-adopt-this-endpoint"
             && fs::symlink_metadata(&target_a)?.ino() == collision_before.ino()
     );
     // Only remove the fixture file whose identity and bytes were just verified.
     fs::remove_file(&target_a)?;
-    let endpoint_a = MachineDockerEndpoint::start(Arc::clone(&a), &target_a).await?;
-    let endpoint_b = match MachineDockerEndpoint::start(Arc::clone(&b), &target_b).await {
+    let endpoint_a =
+        MachineDockerEndpoint::start(Arc::clone(&a), &target_a, EndpointReclaim::Refuse).await?;
+    let endpoint_b = match MachineDockerEndpoint::start(
+        Arc::clone(&b),
+        &target_b,
+        EndpointReclaim::Refuse,
+    )
+    .await
+    {
         Ok(endpoint) => endpoint,
         Err(error) => {
             endpoint_a.shutdown().await?;
@@ -1868,7 +1886,10 @@ async fn run_inner(
         (&retained_h, None),
     ] {
         let mut endpoint = match path {
-            Some(path) => Some(MachineDockerEndpoint::start(Arc::clone(activation), path).await?),
+            Some(path) => Some(
+                MachineDockerEndpoint::start(Arc::clone(activation), path, EndpointReclaim::Refuse)
+                    .await?,
+            ),
             None => None,
         };
         sessions.register(&first_stop_lease, Arc::clone(activation), &mut endpoint)?;

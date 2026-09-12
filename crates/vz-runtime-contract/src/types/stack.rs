@@ -1700,6 +1700,16 @@ pub struct StackResourceHint {
     /// arrived this way: a DECLARED Machine whose disk is unclean is a fault to
     /// fail closed on, not a routine recovery.
     pub docker_data_seeded_by_fork: bool,
+    /// This Machine's Docker data disk was left mounted by a daemon that was
+    /// killed, so its filesystem is crash-consistent rather than cleanly
+    /// unmounted.
+    ///
+    /// Criterion 10's crash clause. Same disk state as a fork's clone and the
+    /// same journal replay answers it, but the engine identity is KEPT: this is
+    /// the same Machine coming back, not a new one. Set only for the first boot
+    /// after the crash, and only for a Machine the control-socket handover
+    /// proved its predecessor was hosting.
+    pub docker_data_after_host_crash: bool,
     /// Optional path to a disk image to attach as a VirtioBlock device.
     ///
     /// Used for persistent named volumes: the image contains an ext4

@@ -108,6 +108,7 @@ impl MachineDockerEndpoint {
     pub async fn start(
         activation: Arc<MachineRuntimeActivation>,
         socket_path: &Path,
+        reclaim: EndpointReclaim,
     ) -> Result<Self, MachineDockerEndpointError> {
         if activation.verified_profile() != Some(KernelProfile::Developer) {
             return Err(MachineDockerEndpointError::Conflict(
@@ -124,6 +125,9 @@ impl MachineDockerEndpoint {
         }
         // Refuse existing paths before even lazy-starting this Machine's Engine.
         let _parent = private_parent(socket_path)?;
+        if reclaim == EndpointReclaim::AfterHostCrash {
+            reclaim_dead_endpoint(&_parent, socket_path)?;
+        }
         require_absent(&_parent, socket_path)?;
         activation.ensure_docker_ready().await?;
         let socket = OwnedSocket::bind(socket_path)?;
@@ -293,6 +297,58 @@ fn private_parent(path: &Path) -> Result<File, MachineDockerEndpointError> {
         ));
     }
     Ok(parent)
+}
+
+/// Whether this Up may reclaim an endpoint path its predecessor left behind.
+///
+/// `Refuse` is the rule for every ordinary boot and the reason is unchanged: an
+/// endpoint path that already exists may belong to a live Engine, and adopting
+/// or replacing it would put two owners on one Machine's Docker transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointReclaim {
+    Refuse,
+    /// Criterion 10. The daemon that bound this path is proven dead -- the
+    /// control-socket handover refuses to start while the recorded predecessor
+    /// process is live -- so the socket file is a leftover inode rather than a
+    /// second owner. Reclaiming it is what keeps a crash from leaving a stale
+    /// resource that wedges the Machine forever.
+    AfterHostCrash,
+}
+
+/// Remove an endpoint socket a dead daemon left, and nothing else.
+///
+/// Three things must hold, each checked rather than assumed: the path is a
+/// socket (not a regular file, directory or symlink someone else put there),
+/// it belongs to this effective user, and NOTHING IS SERVING IT. The last is
+/// the one that matters -- a live Engine accepts the connection and is refused
+/// here, so this cannot silently displace an owner that is still working.
+fn reclaim_dead_endpoint(parent: &File, path: &Path) -> Result<(), MachineDockerEndpointError> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| MachineDockerEndpointError::Conflict("socket name missing".into()))?;
+    let stat = match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Ok(stat) => stat,
+        Err(error) => return Err(error.into()),
+    };
+    if !FileType::from_raw_mode(stat.st_mode).is_socket()
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+    {
+        return Err(MachineDockerEndpointError::Conflict(
+            "crash-left endpoint path is not this user's socket; it will not be removed".into(),
+        ));
+    }
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return Err(MachineDockerEndpointError::Conflict(
+            "endpoint is still serving connections, so it was not left by a dead daemon".into(),
+        ));
+    }
+    unlinkat(parent, name, AtFlags::empty())?;
+    tracing::info!(
+        path = %path.display(),
+        "reclaimed a Machine Docker endpoint socket left by a crashed daemon"
+    );
+    Ok(())
 }
 
 fn require_absent(parent: &File, path: &Path) -> Result<(), MachineDockerEndpointError> {

@@ -596,6 +596,7 @@ fn the_supervisors_pre_boot_sequence_resolves_shares_from_durable_state() {
     //    can be handed, and VirtioFS shares are fixed at VM creation.
     let hint = vz_runtime_contract::StackResourceHint {
         docker_data_seeded_by_fork: false,
+        docker_data_after_host_crash: false,
         cpus: Some(2),
         memory_mb: Some(2048),
         volume_mounts: shares.clone(),
