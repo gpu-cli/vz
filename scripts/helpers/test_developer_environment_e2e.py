@@ -593,6 +593,21 @@ class TopologyLaneTests(unittest.TestCase):
         e2e.remove_lane_root(root)
         self.assertFalse(root.exists())
 
+    def test_final_cleanup_removes_its_roots_through_remove_lane_root(self):
+        """The helper must be WIRED IN, not merely present.
+
+        I committed `remove_lane_root` with its own passing unit test and left
+        the call site calling `shutil.rmtree` -- so the next run failed with the
+        identical `Permission denied: 'vmlinux'` and 1,900 leaks. A test that
+        exercises a helper directly says nothing about whether anything uses it,
+        which is the same shape as every unexercised path this gate has turned
+        up.
+        """
+        source = (common.REPO_ROOT / "scripts/helpers/developer_environment_e2e.py").read_text()
+        body = source.split("if not cleanup_errors and not leaks:", 1)[1].split("remaining = [", 1)[0]
+        self.assertIn("remove_lane_root(root)", body)
+        self.assertNotIn("shutil.rmtree(root)", body)
+
     def test_post_wake_without_a_pre_sleep_record_is_a_prerequisite_failure(self):
         """Post-wake must not invent what should have survived."""
         evidence = self.evidence()

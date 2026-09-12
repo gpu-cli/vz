@@ -532,7 +532,7 @@ class Lane:
                 if not root.exists():
                     continue
                 try:
-                    shutil.rmtree(root)
+                    remove_lane_root(root)
                 except OSError as error:
                     cleanup_errors.append(f"cannot remove lane root {root}: {error}")
         remaining = [(root, row) for root in state.roots() for row in inventory(root)]
