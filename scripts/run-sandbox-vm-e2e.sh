@@ -3486,12 +3486,19 @@ run_and_log() {
 
     echo "running [$label/$suite]: $binary ${args[*]}"
 
-    # The pipeline group execs the test binary, so $BASHPID recorded before the
+    # The pipeline group execs the test binary, so the PID recorded before the
     # exec is the binary's own PID (env execs it in place as well).
+    #
+    # `$BASHPID` would be the direct way to read it and is not available: this
+    # runs under macOS's system bash 3.2, where it is unset, and `set -u` turns
+    # that into "BASHPID: unbound variable" -- which failed the whole runtime
+    # suite the first time this line was ever reached. A command substitution
+    # forks a child of THIS subshell, so the `sh` it execs reports this
+    # subshell as its parent, which is exactly the PID wanted.
     LANE_STAGE="suites"
     set +e
     {
-        printf '%s\t%s\t%s\n' "$label" "$BASHPID" "$binary" >> "$PROCESS_STARTS_RECORD"
+        printf '%s\t%s\t%s\n' "$label" "$(sh -c 'echo $PPID')" "$binary" >> "$PROCESS_STARTS_RECORD"
         exec env "${cmd_env[@]}" "$binary" "${args[@]}"
     } 2>&1 | tee "$log_file"
     local pipeline_status=("${PIPESTATUS[@]}")
