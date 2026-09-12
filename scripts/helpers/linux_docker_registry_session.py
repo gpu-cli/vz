@@ -14,6 +14,7 @@ import uuid
 
 import docker_host_driver as driver
 import installed_developer_startup as startup
+import linux_docker_registry_machine as machine
 import linux_docker_registry_fixture as fixture
 import linux_docker_registry_guest as guest
 import linux_docker_registry_credentials as credentials
@@ -37,8 +38,8 @@ STARTUP_KEYS = frozenset({'time', 'level', 'msg', 'go.version', 'instance.id', '
 # is taken, which is a race: this assertion has rejected whole 45-minute runs on
 # timing alone. Recognised by their exact message shapes rather than waved
 # through, so an unfamiliar identity-less row is still a fault.
-PURGE_KEYS = frozenset({'time', 'level', 'msg'})
-PURGE_MESSAGES = ('PurgeUploads starting:', 'Purge uploads finished.')
+PURGE_KEYS = machine.PURGE_KEYS
+PURGE_MESSAGES = machine.PURGE_MESSAGES
 # Request/response/error keys from internal/dcontext/http.go GetRequestLogger and
 # GetResponseLogger, registry/handlers/app.go (auth.user.name, err.*, vars.*) and the
 # optional log.fields service key. Anything else is not a Distribution 3.1.1 record.

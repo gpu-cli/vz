@@ -35,6 +35,23 @@ REQUIRED_HELPERS = ('linux_docker_registry_acquire.py', 'linux_docker_registry_a
 BINARY_SHA256 = '669f0d9892da6ccd44a40954f39a3b929f4455d7ed02a806828346feac572834'
 GO_VERSION = 'go1.25.9'
 VERSION = 'v3.1.1'
+# Distribution's upload-purge rows, which do NOT carry the app-level fields.
+#
+# `PurgeUploads` is started by registry/handlers/app.go before the listener and
+# logs through a plain logger, so its two rows have only time/level/msg -- no
+# instance.id, version or go.version. They land inside the startup window
+# whenever the purge finishes before the snapshot is taken, which is a race.
+#
+# Defined once and imported, because three modules assert over this same
+# third-party log and each held its own copy of the key set.
+PURGE_KEYS = frozenset({'time', 'level', 'msg'})
+PURGE_MESSAGES = ('PurgeUploads starting:', 'Purge uploads finished.')
+
+
+def is_purge_row(row) -> bool:
+    """Whether a decoded registry log row is one of the purge goroutine's."""
+    return (isinstance(row, dict) and set(row) == PURGE_KEYS
+            and isinstance(row.get('msg'), str) and row['msg'].startswith(PURGE_MESSAGES))
 MANIFEST_DIGEST = 'sha256:bc68ba48dae0e0423bb885c8d07d20c3210febbe996d38d54d32c574fda690ae'
 REGISTRY_KEYS = frozenset(('schema_version', 'scope', 'pin', 'layout', 'layout_inventory_sha256', 'pins_sha256',
                            'reference', 'manifest_digest', 'config_digest', 'upstream_index_digest',

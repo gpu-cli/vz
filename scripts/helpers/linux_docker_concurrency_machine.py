@@ -379,10 +379,13 @@ def registry_records(raw, *, instance_id):
         require(0 < len(line) <= MAX_LOG_LINE, 'registry log line bounds')
         require(line.startswith(b'{'), 'registry log line is not a Distribution record: ' + repr(line[:120]))
         row = parse(line + b'\n')
-        require(type(row) is dict and STARTUP_KEYS <= set(row) <= RECORD_KEYS, 'registry log record fields')
-        require(all(type(row[key]) is str for key in STARTUP_KEYS), 'registry log record scalars')
-        require(row['instance.id'] == instance_id and row['version'] == REGISTRY_LOG_VERSION and
-                row['go.version'] == registry.GO_VERSION, 'registry log record identity')
+        purge = registry.is_purge_row(row)
+        require(purge or (type(row) is dict and STARTUP_KEYS <= set(row) <= RECORD_KEYS),
+                'registry log record fields: ' + repr(sorted(row))[:200] if type(row) is dict else 'not an object')
+        if not purge:
+            require(all(type(row[key]) is str for key in STARTUP_KEYS), 'registry log record scalars')
+            require(row['instance.id'] == instance_id and row['version'] == REGISTRY_LOG_VERSION and
+                    row['go.version'] == registry.GO_VERSION, 'registry log record identity')
         require(row['level'] in ('info', 'warning', 'error'), 'registry log record level')
         timestamp_ns(row['time'])
         rows.append(row)
@@ -393,8 +396,12 @@ def registry_startup(raw):
     """The startup prefix: one instance, and a listener actually announced."""
     rows = [parse(line + b'\n') for line in raw.split(b'\n')[:-1] if line.startswith(b'{')]
     require(rows and len(rows) == len(raw.split(b'\n')[:-1]), 'registry startup log is not all JSON')
-    identities = {row.get('instance.id') for row in rows}
-    require(len(identities) == 1, 'registry startup log names more than one instance')
+    # The purge goroutine's rows carry no instance at all, so they are not
+    # evidence about how many registry processes ran. Counting them made
+    # `{uuid, None}` two instances and rejected a perfectly ordinary startup.
+    identities = {row.get('instance.id') for row in rows if not registry.is_purge_row(row)}
+    require(len(identities) == 1,
+            f'registry startup log names more than one instance: {sorted(map(str, identities))}')
     instance_id = identities.pop()
     require(type(instance_id) is str and re.fullmatch(UUID_PATTERN, instance_id), 'registry instance id')
     listening = [row for row in rows if type(row.get('msg')) is str and row['msg'].startswith('listening on ')]
