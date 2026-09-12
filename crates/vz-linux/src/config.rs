@@ -668,6 +668,16 @@ mod tests {
             .replace("/dev/console", &root.join("console").display().to_string())
     }
 
+    /// The `vz.nat` NIC-wait block, relocated the same way.
+    fn relocated_nat_block(root: &std::path::Path, busybox: &std::path::Path) -> String {
+        relocated_init_block(
+            root,
+            busybox,
+            "# --- BEGIN vz.nat NIC wait (extracted verbatim by vz-linux tests) ---",
+            "# --- END vz.nat NIC wait ---",
+        )
+    }
+
     /// The `vz.host.N` block, which resolves declared endpoint names.
     fn relocated_hosts_block(root: &std::path::Path, busybox: &std::path::Path) -> String {
         relocated_init_block(
@@ -1276,6 +1286,115 @@ mod tests {
         assert!(
             guard_at < sleep_at,
             "the bound must be checked before sleeping"
+        );
+    }
+
+    /// A NAT NIC that finishes probing late is waited for, not missed.
+    ///
+    /// The same asynchronous virtio-net probe that
+    /// `a_fabric_nic_that_finishes_probing_late_is_waited_for_and_then_configured`
+    /// covers, one interface over. `eth0` was sampled exactly once before
+    /// starting DHCP, so a slow probe meant no DHCP and a Machine that believes
+    /// it has egress and has none:
+    ///   base eth0 did not acquire an IPv4 address and default route:
+    ///   stdout="address:\n\nroutes:\n\n"
+    #[test]
+    fn a_nat_nic_that_finishes_probing_late_is_waited_for() {
+        let root = tempfile::Builder::new()
+            .prefix("vz-nat-init-late-")
+            .tempdir()
+            .expect("temp root");
+        let root = root.path();
+        fs::create_dir_all(root.join("net")).expect("fake sysfs");
+        fs::write(root.join("cmdline"), "console=hvc0 vz.nat=1\n").expect("fake cmdline");
+        // `sleep` is the probe: the first call creates the device.
+        let log = root.join("sleep.log");
+        let busybox = root.join("busybox");
+        fs::write(
+            &busybox,
+            format!(
+                "#!/bin/sh\napplet=\"$1\"; shift\ncase \"$applet\" in\n\
+                 cat) exec /bin/cat \"$@\" ;;\n\
+                 sleep) echo slept >> {log}; mkdir -p {net}/eth0 ;;\n\
+                 *) exit 127 ;;\nesac\n",
+                net = root.join("net").display(),
+                log = log.display()
+            ),
+        )
+        .expect("write busybox stub");
+        fs::set_permissions(
+            &busybox,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("make busybox stub executable");
+
+        let script = root.join("nat.sh");
+        fs::write(&script, relocated_nat_block(root, &busybox)).expect("write harness script");
+        let output = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .output()
+            .expect("run the guest NAT block");
+        assert!(output.status.success());
+        assert!(
+            root.join("net/eth0").is_dir(),
+            "the stubbed probe must have created the device"
+        );
+        assert_eq!(
+            fs::read_to_string(&log).unwrap_or_default().lines().count(),
+            1,
+            "exactly one wait: the first scan misses, the second finds"
+        );
+        let console = fs::read_to_string(root.join("console")).unwrap_or_default();
+        assert!(
+            !console.contains("no eth0 after"),
+            "a NIC that arrives late must be waited for, not reported absent: {console}"
+        );
+    }
+
+    /// THE CONTROL. Without `vz.nat=1` the block waits for nothing.
+    ///
+    /// A Machine with `offline` egress has no NAT NIC by design, and an
+    /// unconditional wait would cost every one of them the whole budget for a
+    /// device that is never coming. That is why the host declares the NIC
+    /// rather than the guest guessing.
+    #[test]
+    fn no_declared_nat_nic_means_no_wait_at_all() {
+        let root = tempfile::Builder::new()
+            .prefix("vz-nat-init-absent-")
+            .tempdir()
+            .expect("temp root");
+        let root = root.path();
+        fs::create_dir_all(root.join("net")).expect("fake sysfs");
+        fs::write(root.join("cmdline"), "console=hvc0\n").expect("fake cmdline");
+        let log = root.join("sleep.log");
+        let busybox = root.join("busybox");
+        fs::write(
+            &busybox,
+            format!(
+                "#!/bin/sh\napplet=\"$1\"; shift\ncase \"$applet\" in\n\
+                 cat) exec /bin/cat \"$@\" ;;\n\
+                 sleep) echo slept >> {log} ;;\n\
+                 *) exit 127 ;;\nesac\n",
+                log = log.display()
+            ),
+        )
+        .expect("write busybox stub");
+        fs::set_permissions(
+            &busybox,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("make busybox stub executable");
+
+        let script = root.join("nat.sh");
+        fs::write(&script, relocated_nat_block(root, &busybox)).expect("write harness script");
+        let output = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .output()
+            .expect("run the guest NAT block");
+        assert!(output.status.success());
+        assert!(
+            !log.exists(),
+            "an undeclared NAT NIC must cost no wait at all"
         );
     }
 }

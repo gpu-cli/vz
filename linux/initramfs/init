@@ -206,6 +206,37 @@ fi
 
 # Optional DHCP setup if a virtio-net device is present.
 # Run in background so missing network does not block guest-agent startup.
+#
+# `vz.nat=1` says the host attached Apple's NAT NIC. It has to say so, because
+# a single `[ -d /sys/class/net/eth0 ]` cannot distinguish a device that is
+# still being probed from one that was never attached, and virtio-net probing
+# is ASYNCHRONOUS -- the same race `find_fabric_nic` below waits out. Without
+# the parameter the wait would have to be unconditional, and a Machine with
+# `offline` egress has no NAT NIC by design, so every offline boot would pay
+# the whole budget for a device that is never coming.
+#
+# Measured: with the NIC attached and no wait, the guest reached the agent with
+# eth0 present and empty --
+#   base eth0 did not acquire an IPv4 address and default route:
+#   stdout="address:\n\nroutes:\n\n"
+# which is a Machine that believes it has egress and has none.
+# --- BEGIN vz.nat NIC wait (extracted verbatim by vz-linux tests) ---
+VZ_NAT_NIC_WAIT_SECONDS=20
+vz_nat_declared=0
+for vz_param in $(/bin/busybox cat /proc/cmdline); do
+  [ "$vz_param" = "vz.nat=1" ] && vz_nat_declared=1
+done
+if [ "$vz_nat_declared" = 1 ]; then
+  vz_nat_waited=0
+  while [ ! -d /sys/class/net/eth0 ] && [ "$vz_nat_waited" -lt "$VZ_NAT_NIC_WAIT_SECONDS" ]; do
+    /bin/busybox sleep 1
+    vz_nat_waited=$((vz_nat_waited + 1))
+  done
+  if [ ! -d /sys/class/net/eth0 ]; then
+    echo "[vz-init] warning: vz.nat=1 but no eth0 after ${VZ_NAT_NIC_WAIT_SECONDS}s" >/dev/console
+  fi
+fi
+# --- END vz.nat NIC wait ---
 if [ -d /sys/class/net/eth0 ] && [ -x /sbin/udhcpc ]; then
   /bin/ip link set dev eth0 up >/dev/console 2>&1 || true
   /sbin/udhcpc -i eth0 -s /etc/udhcpc.script -q -b -t 5 -T 1 >/dev/console 2>&1 &

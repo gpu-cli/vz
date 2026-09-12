@@ -2021,6 +2021,15 @@ esac
         let mut nics = Vec::with_capacity(usize::from(external) + attachment_nics.len());
         if external {
             nics.push(vz::Nic::nat());
+            // And TELL the guest, because it cannot tell for itself. virtio-net
+            // devices are probed asynchronously, so the guest's single
+            // `[ -d /sys/class/net/eth0 ]` before starting DHCP is the same
+            // race `find_fabric_nic` already waits out -- but it cannot simply
+            // wait, because a Machine with `offline` egress has no NAT NIC BY
+            // DESIGN and would pay the whole budget on every boot. This
+            // parameter is the difference between "not there yet" and "never
+            // coming", and only the host knows which.
+            vm_config.cmdline.push_str(" vz.nat=1");
         }
         nics.extend(attachment_nics);
         vm_config.nics = Some(nics);
