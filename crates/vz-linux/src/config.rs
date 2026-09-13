@@ -1289,6 +1289,49 @@ mod tests {
         );
     }
 
+    /// The unconfigured-fabric record must reach the root the agent runs in.
+    ///
+    /// Readiness refuses a Machine whose declared fabric port the guest could
+    /// not configure by reading `/run/vz-fabric-unconfigured` through the guest
+    /// agent. The agent is chrooted into the overlay root, whose `/run` is a
+    /// fresh empty directory -- so while the file existed only in the
+    /// initramfs root, that probe read nothing whatever happened and the
+    /// refusal could never fire. A Machine with no fabric NIC reached `ready`
+    /// holding only `docker0`.
+    ///
+    /// Asserted against the init source because the copy is a property of the
+    /// script's ORDER: it has to happen inside the switch-root, after the file
+    /// could have been written and before the chroot that hides it.
+    #[test]
+    fn the_unconfigured_fabric_record_is_carried_into_the_chroot() {
+        let source = initramfs_init_source();
+        let (_, body) = source
+            .split_once("switch_root_into_overlay_rootfs() {")
+            .expect("the init defines the switch-root function");
+        let (body, _) = body
+            .split_once("\nROOTFS_READY=")
+            .expect("the switch-root function is bounded by the ROOTFS_READY assignment");
+        let copy = body
+            .find("$ROOTFS$VZ_FABRIC_UNCONFIGURED")
+            .expect("the switch-root copies the unconfigured-fabric record into the overlay root");
+        let chroot = body
+            .find("chroot \"$ROOTFS\"")
+            .expect("the switch-root chroots into the overlay root");
+        assert!(
+            copy < chroot,
+            "the record must be copied before the chroot that hides the initramfs /run"
+        );
+        // And it is written outside this function, before the switch: the copy
+        // is what carries it across, not a second write.
+        let (before, _) = source
+            .split_once("switch_root_into_overlay_rootfs() {")
+            .expect("switch-root marker");
+        assert!(
+            before.contains(">> \"$VZ_FABRIC_UNCONFIGURED\""),
+            "the record is appended before the switch-root, by the fabric block"
+        );
+    }
+
     /// A NAT NIC that finishes probing late is waited for, not missed.
     ///
     /// The same asynchronous virtio-net probe that

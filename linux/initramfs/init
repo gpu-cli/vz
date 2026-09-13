@@ -535,6 +535,27 @@ switch_root_into_overlay_rootfs() {
   cp /etc/udhcpc.script "$ROOTFS/etc/udhcpc.script" || return 1
   /bin/busybox chmod +x "$ROOTFS/etc/udhcpc.script" || return 1
 
+  # The unconfigured-fabric record, carried into the root the agent runs in.
+  #
+  # Readiness refuses a Machine whose declared fabric port the guest could not
+  # configure by running `cat /run/vz-fabric-unconfigured` through the guest
+  # agent. The agent is chrooted into $ROOTFS, and $ROOTFS/run is a fresh empty
+  # directory created a few lines above -- the initramfs /run this file was
+  # written to is not visible from inside it. So the probe read nothing no
+  # matter what happened, and the refusal could never fire.
+  #
+  # Measured: gate94 topology/clean-provision, a Machine whose cmdline carried
+  # `aa:1e:2c:e5:c7:15,10.249.47.76/24` reached ready holding only docker0, and
+  # criterion 2 and criterion 7 both failed on the missing address rather than
+  # on the refusal that was supposed to prevent it.
+  #
+  # Copied rather than bind-mounted: the file is written once before the switch
+  # and never afterwards, and a copy needs no mount to survive teardown.
+  if [ -f "$VZ_FABRIC_UNCONFIGURED" ]; then
+    /bin/busybox mkdir -p "$ROOTFS/run" || return 1
+    cp "$VZ_FABRIC_UNCONFIGURED" "$ROOTFS$VZ_FABRIC_UNCONFIGURED" || return 1
+  fi
+
   # The Machine's own /etc/hosts, in the root it will actually run in. This is
   # the same write as the one above the switch_root and not a copy of its
   # result, so the overlay root's file does not depend on the initramfs write
