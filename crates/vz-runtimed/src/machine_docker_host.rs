@@ -584,6 +584,7 @@ fn executable_digest_with_checkpoint(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 

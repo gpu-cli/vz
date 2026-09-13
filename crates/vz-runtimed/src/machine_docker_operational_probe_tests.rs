@@ -362,3 +362,120 @@ fn image_cleanup_rejects_foreign_labels_and_wrong_architecture() {
     changed[0]["Architecture"] = "amd64".into();
     assert!(owned_image(&serde_json::to_vec(&changed).expect("JSON"), "token").is_err());
 }
+
+/// A completed probe re-attests only when every input it depended on is
+/// unchanged. The first assertion is the one that matters most in practice: the
+/// recorded inventory also carries the incarnation that measured it, so a
+/// whole-value comparison would make this path unreachable on the very boot it
+/// exists for - a fast path that is true, untested and never taken.
+#[test]
+fn reattestation_requires_identical_inputs_and_ignores_the_observing_incarnation() -> Result<()> {
+    let (_root, store, mut journal) = journal_fixture()?;
+    const STDOUT: &str = "vz-startup-runtime-inventory-v1\nyouki-sha256=dddd\n";
+    const SCOPE: &str = "startup_executable_paths_and_pinned_daemon_mounts_not_release_cache_audit";
+    journal.state = "completed".into();
+    journal.resources = json!({
+        "cleanup_scope": "disposable_probe_containers_compose_objects_and_images",
+        "retained_buildkit_cache": true,
+        "engine_id": "11111111-2222-3333-4444-555555555555",
+        // Recorded by an earlier, now-gone incarnation - exactly the situation a
+        // stop and start produces.
+        "runtime_inventory": {
+            "stdout": STDOUT,
+            "scope": SCOPE,
+            "incarnation": {"schema_version": 1, "generation": 1, "incarnation_id": "inc_probe"},
+        },
+    });
+    let digest = store.configuration_digest().to_string();
+    let client = journal.client_sha256.clone();
+    let archive = journal.archive_sha256.clone();
+    let basis = |journal: &Journal, client: &str, context: &str, config: &str, archive: &str| {
+        reattestation_basis_of(journal, client, context, config, archive, STDOUT, SCOPE).is_some()
+    };
+    assert!(
+        basis(&journal, &client, "exact-context", &digest, &archive),
+        "an unchanged tuple must re-attest even though the incarnation that recorded it is gone"
+    );
+
+    // Each input, changed alone, must force the full probe.
+    for (label, changed) in [
+        (
+            "host client",
+            basis(
+                &journal,
+                &"9".repeat(64),
+                "exact-context",
+                &digest,
+                &archive,
+            ),
+        ),
+        (
+            "managed context",
+            basis(&journal, &client, "other-context", &digest, &archive),
+        ),
+        (
+            "guest bundle",
+            basis(
+                &journal,
+                &client,
+                "exact-context",
+                &format!("sha256:{}", "e".repeat(64)),
+                &archive,
+            ),
+        ),
+        (
+            "probe archive",
+            basis(&journal, &client, "exact-context", &digest, &"9".repeat(64)),
+        ),
+    ] {
+        assert!(!changed, "a changed {label} must force the full probe");
+    }
+
+    for (label, mutate) in [
+        (
+            "a different guest runtime",
+            Box::new(|j: &mut Journal| {
+                j.resources["runtime_inventory"]["stdout"] =
+                    "vz-startup-runtime-inventory-v1\nyouki-sha256=other\n".into();
+            }) as Box<dyn Fn(&mut Journal)>,
+        ),
+        (
+            "a different inventory scope",
+            Box::new(|j: &mut Journal| {
+                j.resources["runtime_inventory"]["scope"] = "narrower".into();
+            }),
+        ),
+        (
+            "a missing engine identity",
+            Box::new(|j: &mut Journal| {
+                j.resources["engine_id"] = Value::Null;
+            }),
+        ),
+        (
+            "a narrowed cleanup scope",
+            Box::new(|j: &mut Journal| {
+                j.resources["cleanup_scope"] = "something_else".into();
+            }),
+        ),
+        (
+            "a discarded buildkit cache",
+            Box::new(|j: &mut Journal| {
+                j.resources["retained_buildkit_cache"] = json!(false);
+            }),
+        ),
+        (
+            "no recorded inventory at all",
+            Box::new(|j: &mut Journal| {
+                j.resources["runtime_inventory"] = Value::Null;
+            }),
+        ),
+    ] {
+        let mut changed = journal.clone();
+        mutate(&mut changed);
+        assert!(
+            !basis(&changed, &client, "exact-context", &digest, &archive),
+            "{label} must force the full probe"
+        );
+    }
+    Ok(())
+}

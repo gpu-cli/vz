@@ -29,6 +29,9 @@ impl VerifiedMachineRuntimeInventory {
     pub fn stdout(&self) -> &str {
         &self.stdout
     }
+    pub fn scope(&self) -> &str {
+        self.scope
+    }
 
     pub async fn measure(
         activation: &MachineRuntimeActivation,

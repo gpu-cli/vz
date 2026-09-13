@@ -24,6 +24,7 @@ use crate::machine_docker_runtime_inventory::VerifiedMachineRuntimeInventory;
 use crate::machine_runtime_registry::MachineRuntimeStoreLease;
 
 const JOURNAL: &str = "docker-operational-probe.json";
+const CLEANUP_SCOPE: &str = "disposable_probe_containers_compose_objects_and_images";
 const LABEL: &str = "dev.vz.startup-probe";
 const MARKER: &[u8] = b"vz-developer-probe-v1\n";
 const PAYLOAD: &[u8] = b"vz-buildx-startup-probe-v1\n";
@@ -50,7 +51,7 @@ pub struct MachineDockerOperationalEvidence {
     pub receipt_sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Journal {
     schema_version: u32,
@@ -102,9 +103,19 @@ pub async fn verify(
     probe.metadata.validate()?;
     let lock = open_owned(&store, "docker-operational-probe.lock", true)?;
     fs2::FileExt::try_lock_exclusive(&lock).context("another startup probe owns this Machine")?;
+    let mut reattestation_basis = None;
     let archived_failure = if let Some(previous) = read_journal(&store)? {
         if previous.state == "completed" {
             validate_previous(&previous, store.owner())?;
+            reattestation_basis = reattestation_basis_of(
+                &previous,
+                client.executable_sha256(),
+                context.name(),
+                store.configuration_digest(),
+                &probe.metadata.sha256,
+                inventory.stdout(),
+                inventory.scope(),
+            );
             None
         } else {
             validate_no_mutation(&previous, &store, incarnation, context.name())?;
@@ -149,13 +160,16 @@ pub async fn verify(
         _lock: lock,
     };
     run.persist()?;
-    let result = run.operations(probe).await.and_then(|engine_id| {
-        ensure!(
-            Instant::now() < deadline,
-            "startup probe deadline elapsed before receipt publication"
-        );
-        Ok(engine_id)
-    });
+    let result = run
+        .attest(probe, reattestation_basis.as_ref())
+        .await
+        .and_then(|engine_id| {
+            ensure!(
+                Instant::now() < deadline,
+                "startup probe deadline elapsed before receipt publication"
+            );
+            Ok(engine_id)
+        });
     match result {
         Ok(engine_id) => {
             run.journal.state = "completed".into();
@@ -281,6 +295,71 @@ impl Run<'_> {
             .as_str()
             .context("probe resource name missing")?
             .into())
+    }
+
+    /// Prove this Machine's Docker capabilities, re-attesting a still-valid
+    /// prior proof when there is one and running the full probe otherwise.
+    ///
+    /// Both paths journal their commands, write a receipt and publish the same
+    /// evidence, so a re-attestation is an attestation in its own right - its own
+    /// directory, its own receipt, its own post-measurement - and never a silent
+    /// reuse of the previous run's files.
+    async fn attest(
+        &mut self,
+        probe: &VerifiedDeveloperProbe,
+        basis: Option<&Journal>,
+    ) -> Result<String> {
+        if let Some(basis) = basis
+            && let Some(engine_id) = self.reattest(basis).await?
+        {
+            return Ok(engine_id);
+        }
+        self.operations(probe).await
+    }
+
+    /// Observe the liveness a static comparison cannot: the Engine answers, it is
+    /// the same Engine the capability was demonstrated against, and its inert
+    /// metadata is unchanged. The Engine ID is the load-bearing one, because
+    /// Docker keeps it in the data root - an equal ID means the same Engine over
+    /// the same image, volume and BuildKit stores that were proven.
+    ///
+    /// `Ok(None)` means "not re-attestable", and the caller runs the full probe.
+    /// This is a fast path, never a weaker one: it cannot conclude a capability
+    /// that was not already demonstrated under identical inputs.
+    async fn reattest(&mut self, basis: &Journal) -> Result<Option<String>> {
+        let proven = Path::new(basis.resources["directory"].as_str().unwrap_or_default())
+            .join("receipt.json");
+        let Ok(receipt) = read_private(&proven, 1024 * 1024) else {
+            return Ok(None);
+        };
+        // The receipt is the immutable record of the completed run. A journal that
+        // no longer agrees with it is not authority to skip anything.
+        if serde_json::from_slice::<Journal>(&receipt).ok().as_ref() != Some(basis) {
+            return Ok(None);
+        }
+        let info = self
+            .ok(words(&["info", "--format", "{{json .}}"]), false)
+            .await?;
+        let engine_id = engine_identity(&info)?;
+        let metadata = serde_json::to_value(inert_metadata(&info)?)?;
+        if basis.resources["engine_id"] != json!(engine_id)
+            || basis.resources["inert_stock_runtime_metadata"] != metadata
+        {
+            return Ok(None);
+        }
+        ensure!(
+            self.context
+                .descriptor(&self.journal.incarnation, engine_id.clone())?
+                .owner
+                == *self.store.owner(),
+            "re-attested context belongs to another Environment or Machine"
+        );
+        self.journal.resources["engine_id"] = engine_id.clone().into();
+        self.journal.resources["inert_stock_runtime_metadata"] = metadata;
+        self.journal.resources["reattested_receipt"] =
+            json!({"path": proven, "sha256": hash(&receipt), "token": basis.token});
+        self.persist()?;
+        Ok(Some(engine_id))
     }
 
     async fn operations(&mut self, probe: &VerifiedDeveloperProbe) -> Result<String> {
@@ -683,6 +762,44 @@ fn validate_previous(journal: &Journal, owner: &ResourceOwner) -> Result<()> {
         "unfinished or foreign Docker startup probe requires exact owned recovery; not retrying Engine mutations"
     );
     Ok(())
+}
+
+/// Decide whether a completed probe still proves what a new one would prove.
+///
+/// The expensive half of this probe demonstrates a property of a *configuration*:
+/// that this bundle's Engine, Compose and buildx can import, run, compose and
+/// build. That conclusion is a function of the guest bundle, the probe archive,
+/// the host client, the managed context and the guest runtime inventory - not of
+/// the incarnation that happened to observe it. Stopping and starting a Machine
+/// re-derives it from identical inputs.
+///
+/// Only the inputs are compared here; nothing is concluded about the Engine yet,
+/// because liveness is not a static property. `Run::attest` observes that part.
+///
+/// The inventory is compared by its measured `stdout` and scope rather than as a
+/// whole, because the measurement also carries the incarnation that took it, and
+/// that necessarily differs on the next boot. Comparing the whole value would
+/// make this fast path unreachable forever - true, untested, and useless.
+fn reattestation_basis_of(
+    previous: &Journal,
+    client_sha256: &str,
+    context_name: &str,
+    configuration_digest: &str,
+    archive_sha256: &str,
+    inventory_stdout: &str,
+    inventory_scope: &str,
+) -> Option<Journal> {
+    let recorded = &previous.resources["runtime_inventory"];
+    (previous.configuration_digest == configuration_digest
+        && previous.archive_sha256 == archive_sha256
+        && previous.client_sha256 == client_sha256
+        && previous.context == context_name
+        && previous.resources["cleanup_scope"] == CLEANUP_SCOPE
+        && previous.resources["retained_buildkit_cache"] == json!(true)
+        && previous.resources["engine_id"].is_string()
+        && recorded["stdout"] == json!(inventory_stdout)
+        && recorded["scope"] == json!(inventory_scope))
+    .then(|| previous.clone())
 }
 
 /// This is positive non-dispatch evidence, not absence inferred from failure.
