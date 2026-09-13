@@ -4426,11 +4426,22 @@ def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
                 f"(exit {code}, addresses {addresses}, edge {edge})")
     # The claim that makes this ingress rather than a private shortcut: the
     # client is told the edge, never the Machine that serves behind it.
-    check.check(all(address not in origin for address in addresses),
+    #
+    # `addresses` is required NON-EMPTY here, and in the undeclared clause
+    # below, because both are negative claims and an empty list satisfies them
+    # for the wrong reason. A run where the Machine came up with no fabric
+    # address at all reported
+    #   the published name never resolves to the origin Machine (addresses [])
+    #   an undeclared name in the same Environment does not resolve (addresses [])
+    # as two passes, while the resolver was answering nothing whatsoever. Only
+    # the positive clause above caught it. The control is that clause: it
+    # requires the declared name to resolve to exactly the edge, so a dead
+    # resolver cannot satisfy these two by silence.
+    check.check(bool(addresses) and all(address not in origin for address in addresses),
                 f"the published name never resolves to the origin Machine "
                 f"(addresses {addresses}, machine-0 {origin})")
     undeclared = _resolved(_lookup(ctx, check, "edge-lookup-undeclared", inside, "machine-1", UNDECLARED_NAME))
-    check.check(undeclared[0] != "0" and not undeclared[1],
+    check.check(bool(addresses) and undeclared[0] != "0" and not undeclared[1],
                 f"an undeclared name in the same Environment does not resolve "
                 f"(exit {undeclared[0]}, addresses {undeclared[1]})")
 

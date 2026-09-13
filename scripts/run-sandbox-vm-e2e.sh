@@ -2746,7 +2746,18 @@ validate_stack_crash_reopen_evidence() {
                 "binding", "event_counts", "intent_status", "observed_phase", "ready",
                 "schema_version", "session_actions_hash", "session_cursor", "session_status"
             ]) and
-            (.schema_version == 9) and
+            # NOT a literal. This said `== 9` while STORE_SCHEMA_VERSION had
+            # migrated to 12, so the scenario failed at exit 111 with the test
+            # itself passing and its evidence well formed. 0746ca0e fixed the
+            # same pin in crash_reopen_tests.rs by reading
+            # StateStore::CURRENT_SCHEMA_VERSION; this copy had no constant to
+            # read, and a second literal is how the first fix goes unfinished.
+            #
+            # What this validator can honestly claim is structural: a positive
+            # integer here, and the SAME value either side of the crash/reopen
+            # boundary, which is asserted where both are in scope. Whether it
+            # equals the current version is a claim the Rust test makes.
+            (.schema_version | type == "number" and . > 0 and . == floor) and
             (.action_schema_version == 3) and
             (.session_actions_hash | type == "string" and
                 test("^vzrah2-sha256:[0-9a-f]{64}$")) and
@@ -2787,7 +2798,8 @@ validate_stack_crash_reopen_evidence() {
             (.replay.failed + .replay.succeeded == 1) and
             (.replay.runtime_deltas | runtime_deltas) and
             (.pre_replay.store.binding.ownership == .ownership) and
-            (.post_replay.store.binding.ownership == .ownership);
+            (.post_replay.store.binding.ownership == .ownership) and
+            (.pre_replay.store.schema_version == .post_replay.store.schema_version);
         def reserved_creating_pre:
             .store.session_status == "active" and
             .store.session_cursor == 0 and
