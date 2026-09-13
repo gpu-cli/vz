@@ -272,7 +272,12 @@ impl ManagedMachineDockerContext {
         Ok(context)
     }
 
-    pub async fn verify(&self, client: &HostDockerClient) -> Result<()> {
+    /// The part of `verify` that reads only our own private 0700 store: the
+    /// claim is still ours and the client still points at the configuration it
+    /// was built for. Callers that run many commands under one lease use this
+    /// per command and the full `verify` at their boundaries, because the CLI
+    /// round trip below costs more than most of the commands it guards.
+    pub fn verify_claim(&self, client: &HostDockerClient) -> Result<()> {
         self.store.validate_current()?;
         ensure!(
             read_claim(&self.store)?.as_ref() == Some(&self.claim),
@@ -282,6 +287,11 @@ impl ManagedMachineDockerContext {
             client.config_dir().to_str() == Some(&self.claim.config_dir),
             "Docker configuration changed"
         );
+        Ok(())
+    }
+
+    pub async fn verify(&self, client: &HostDockerClient) -> Result<()> {
+        self.verify_claim(client)?;
         let output = client
             .run(
                 None,

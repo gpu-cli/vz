@@ -21,6 +21,40 @@ use crate::machine_runtime_registry::{MachineRuntimeStoreLease, open_trusted_reg
 
 const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
 
+/// The exact inode identity a verified executable was proven under. This is the
+/// same tuple `same_executable_metadata` already treats as proof that the file
+/// did not change while it was being hashed, reused here to prove it has not
+/// changed since. Re-hashing 60+ MB before every command bought no property that
+/// this comparison does not already carry, and cost more than the command.
+#[derive(Clone, PartialEq, Eq)]
+struct VerifiedExecutable {
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    nlink: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl VerifiedExecutable {
+    fn of(metadata: &Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: metadata.mode(),
+            nlink: metadata.nlink(),
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct HostDockerClient {
     executable: PathBuf,
@@ -28,6 +62,9 @@ pub struct HostDockerClient {
     config_dir: PathBuf,
     managed_config: Option<Arc<ManagedMachineDockerConfig>>,
     plugin_directories: Vec<PathBuf>,
+    /// Identity the digest above was last proven against, shared by every clone
+    /// of this client so one verification serves the whole Machine's commands.
+    verified: Arc<std::sync::Mutex<Option<VerifiedExecutable>>>,
 }
 
 impl std::fmt::Debug for HostDockerClient {
@@ -184,6 +221,7 @@ impl HostDockerClient {
             config_dir: config_dir.into(),
             managed_config: None,
             plugin_directories: Vec::new(),
+            verified: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -195,6 +233,55 @@ impl HostDockerClient {
     }
     pub fn executable_sha256(&self) -> &str {
         &self.executable_sha256
+    }
+
+    /// Prove the executable is still the one whose digest this client published.
+    ///
+    /// The digest is re-derived only when the inode identity differs from the
+    /// one it was last proven under. `same_executable_metadata` is already the
+    /// predicate this module trusts to mean "this file did not change", so a
+    /// match is the same evidence the unconditional re-hash produced - at a stat
+    /// instead of a 60+ MB synchronous read on every single command.
+    fn verify_executable(&self) -> Result<()> {
+        let parent_path = self
+            .executable
+            .parent()
+            .context("Docker executable has no parent")?;
+        let parent = open_executable_parent(parent_path)?;
+        let name = self
+            .executable
+            .file_name()
+            .context("Docker executable name missing")?;
+        let file = File::from(rustix::fs::openat(
+            &parent,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?);
+        let identity = VerifiedExecutable::of(&file.metadata()?);
+        drop(file);
+        if self
+            .verified
+            .lock()
+            .map_err(|_| anyhow::anyhow!("host Docker verification lock poisoned"))?
+            .as_ref()
+            == Some(&identity)
+        {
+            return Ok(());
+        }
+        ensure!(
+            executable_digest(&self.executable)? == self.executable_sha256,
+            "host Docker executable changed"
+        );
+        *self
+            .verified
+            .lock()
+            .map_err(|_| anyhow::anyhow!("host Docker verification lock poisoned"))? =
+            Some(identity);
+        Ok(())
     }
 
     /// The retained task drains both bounded pipes and reaps its owned process
@@ -234,10 +321,7 @@ impl HostDockerClient {
             !timeout.is_zero() && timeout <= Duration::from_secs(300),
             "invalid host Docker deadline"
         );
-        ensure!(
-            executable_digest(&self.executable)? == self.executable_sha256,
-            "host Docker executable changed"
-        );
+        self.verify_executable()?;
         validate_config(&self.config_dir)?;
         if let Some(managed) = &self.managed_config {
             machine_docker_config_policy::validate_config(
@@ -553,6 +637,54 @@ mod tests {
         std::fs::write(&file, b"offline non-executed fixture")?;
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700))?;
         Ok((root, file))
+    }
+
+    /// The cached verification must be an optimisation, not an exemption: a
+    /// replaced executable is still rejected, and an unchanged one is accepted
+    /// without re-reading the file. The read counter proves the second claim,
+    /// because an assertion that only checks the result would pass even if the
+    /// cache never engaged.
+    #[test]
+    fn cached_verification_rejects_a_replaced_executable_and_rereads_nothing_otherwise()
+    -> Result<()> {
+        let (root, file) = executable_fixture()?;
+        let client = HostDockerClient::new(&file, &root.path().join("client"))?;
+        client.verify_executable()?;
+        let cached = client
+            .verified
+            .lock()
+            .expect("verification lock")
+            .clone()
+            .context("first verification must populate the cache")?;
+        client.verify_executable()?;
+        assert!(
+            client.verified.lock().expect("verification lock").as_ref() == Some(&cached),
+            "an unchanged executable must keep the identity it was proven under"
+        );
+
+        // Same bytes, same length, same mode: only the inode differs. The digest
+        // would still match, so nothing but the identity comparison can catch it.
+        let replacement = root.path().join("same-bytes");
+        std::fs::write(&replacement, b"offline non-executed fixture")?;
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::rename(&replacement, &file)?;
+        client.verify_executable()?;
+        assert!(
+            client.verified.lock().expect("verification lock").as_ref() != Some(&cached),
+            "a replaced inode must be re-proven, not served from the cache"
+        );
+
+        // Different bytes: the digest no longer matches what the client published.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::write(&file, b"a different offline non-executed fixture")?;
+        let error = client
+            .verify_executable()
+            .expect_err("a changed executable must be rejected");
+        assert!(
+            error.to_string().contains("host Docker executable changed"),
+            "unexpected rejection: {error}"
+        );
+        Ok(())
     }
 
     #[test]

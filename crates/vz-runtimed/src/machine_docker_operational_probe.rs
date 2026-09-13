@@ -224,7 +224,16 @@ impl Run<'_> {
             "startup command budget exhausted"
         );
         self.store.validate_current()?;
-        self.context.verify(self.client).await?;
+        // Full context verification bounds the probe: once here on the first
+        // command, and again in `operations` after the last one, which readiness
+        // then repeats. In between, the claim check is the property that can
+        // actually change under us - the CLI round trip only re-reads a file we
+        // own at 0700, and cost more than most of the commands it guarded.
+        if self.journal.commands.is_empty() {
+            self.context.verify(self.client).await?;
+        } else {
+            self.context.verify_claim(self.client)?;
+        }
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         ensure!(
             !remaining.is_zero(),
@@ -403,7 +412,12 @@ impl Run<'_> {
             &compose_file,
             &serde_json::to_vec(&json!({"services":{"probe":{
             "image":rootfs_id,"pull_policy":"never","container_name":compose_name,"network_mode":"none",
-            "command":["/bin/sleep","300"],"labels":{(LABEL):self.journal.token}}}}))?,
+            // PID 1 receives only signals it has installed a handler for, so a
+            // bare `sleep` here ignored Compose's SIGTERM and was force-killed
+            // after the stop grace on every single Up. Trapping TERM makes the
+            // teardown the graceful one this probe is supposed to be proving.
+            "command":["/bin/sh","-c","trap 'exit 0' TERM; sleep 300 & wait"],
+            "labels":{(LABEL):self.journal.token}}}}))?,
         )?;
         self.compose(
             &compose_file,
