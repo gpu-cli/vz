@@ -17,11 +17,12 @@
 //! also means the edge binds nothing on the host: there is no host listener to
 //! find, on loopback or anywhere else.
 //!
-//! What this is not: it is not external egress. `EgressPolicy` still admits
-//! `Offline` alone, because reaching a host off the fabric needs a translation
-//! towards the host's own network and a policy that decides which hosts, and
-//! neither is here. The edge translates addresses only between an Environment's
-//! client and an Environment's own declared origin.
+//! What this is not: it is not external egress. The edge translates addresses
+//! only between an Environment's client and an Environment's own declared
+//! origin. A Machine's `egress: allowed` is a separate path that never crosses
+//! this edge: Apple's NAT attachment for a Linux Machine, and a private
+//! per-Machine link to a translator for a native macOS one
+//! (`native_macos::egress`).
 
 pub mod dns;
 pub mod edge;

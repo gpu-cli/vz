@@ -51,7 +51,7 @@ use vz_oci_macos::DeclaredAttachment;
 /// side would make this program silently correct for its one caller and wrong
 /// for anything else that reached for it, including the test below that feeds it
 /// an address in the case some other renderer might use.
-const MATCH_INTERFACE_BY_MAC_AWK: &str = r#"
+pub(crate) const MATCH_INTERFACE_BY_MAC_AWK: &str = r#"
 BEGIN { want = tolower(want) }
 /^[a-zA-Z]/ { name = $1; sub(/:$/, "", name); next }
 $1 == "ether" {

@@ -48,6 +48,7 @@ vz = { workspace = true }
 tempfile = { workspace = true }
 vz-oci-macos = { workspace = true }
 vz-linux = { workspace = true }
+nix = { version = "0.30", default-features = false, features = ["net"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 vz-linux-native = { workspace = true }
