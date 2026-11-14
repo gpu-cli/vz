@@ -340,7 +340,7 @@ fn spawn_reader(
 }
 
 /// Size a port's buffers for whole frames, on either end.
-fn size_buffers<Fd: rustix::fd::AsFd>(socket: &Fd) -> std::io::Result<()> {
+pub(crate) fn size_buffers<Fd: rustix::fd::AsFd>(socket: &Fd) -> std::io::Result<()> {
     sockopt::set_socket_send_buffer_size(socket, SEND_BUFFER_BYTES)?;
     sockopt::set_socket_recv_buffer_size(socket, RECEIVE_BUFFER_BYTES)?;
     Ok(())

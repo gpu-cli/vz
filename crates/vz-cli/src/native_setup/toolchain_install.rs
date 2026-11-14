@@ -300,6 +300,11 @@ pub async fn run(args: Args) -> Result<()> {
         let home = client.exec_stream("/bin/sh".into(), vec!["-c".into(), "set -eu; test \"$HOME\" = /Users/dev; test -w \"$HOME\"; directory=$(mktemp -d \"$HOME/vz-home-check.XXXXXX\"); rmdir \"$directory\"".into()], vz_linux::ExecOptions { user: Some("dev".into()), working_dir: Some("/Users/dev".into()), ..Default::default() }).await?.collect_checked().await?;
         ensure!(home.exit_code == 0, "native dev home is not usable: {home:?}");
         fs::write(args.output.join("dev-home.json"), serde_json::to_vec_pretty(&home)?)?;
+        // Machines boot into dev's desktop session. The preference written onto
+        // the unbooted disk does not survive this first boot, so the running
+        // guest sets it again and its own preferences daemon keeps it; the
+        // credential beside it was written with the account.
+        execute(&mut client, "set -eu; test -s /etc/kcpassword; /usr/bin/defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string dev; test \"$(/usr/bin/defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser)\" = dev", 30).await?;
         if let Some((payload, manifest, archive)) = &toolchain {
         if args.reuse_installed_toolchain {
             let receipt = execute(&mut client, "head -c 32769 /usr/local/share/vz/toolchain.json", 10).await?;

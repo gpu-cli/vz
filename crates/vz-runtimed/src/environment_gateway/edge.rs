@@ -56,10 +56,10 @@ const MAX_SESSIONS: usize = 8;
 /// body, and these are the only allocations that scale with concurrency.
 const SOCKET_BUFFER_BYTES: usize = 64 * 1024;
 /// The largest datagram a port will read; the switch's own bound.
-const MAX_FRAME_BYTES: usize = 65535;
+pub(crate) const MAX_FRAME_BYTES: usize = 65535;
 /// How many frames the stack may have queued in either direction before the
 /// loop stops reading and lets it drain.
-const QUEUE_DEPTH: usize = 256;
+pub(crate) const QUEUE_DEPTH: usize = 256;
 /// Where the edge's translated local ports start. The range runs from here to
 /// the last port there is, so wrapping back to it is the only bound needed.
 const FIRST_EPHEMERAL_PORT: u16 = 49152;
@@ -134,14 +134,24 @@ pub struct EdgeShutdown {
 /// from the socket, lets the stack drain it, and then writes whatever the stack
 /// produced. Both queues are bounded, so a stack that stops draining costs a
 /// counted drop rather than unbounded memory.
-struct FabricPort {
-    inbound: VecDeque<Vec<u8>>,
-    outbound: VecDeque<Vec<u8>>,
+pub(crate) struct FabricPort {
+    pub(crate) inbound: VecDeque<Vec<u8>>,
+    pub(crate) outbound: VecDeque<Vec<u8>>,
     mtu: usize,
 }
 
-struct Received(Vec<u8>);
-struct Sending<'queue>(&'queue mut VecDeque<Vec<u8>>);
+impl FabricPort {
+    pub(crate) fn new(mtu: u32) -> Self {
+        Self {
+            inbound: VecDeque::new(),
+            outbound: VecDeque::new(),
+            mtu: usize::try_from(mtu).unwrap_or(1500),
+        }
+    }
+}
+
+pub(crate) struct Received(Vec<u8>);
+pub(crate) struct Sending<'queue>(&'queue mut VecDeque<Vec<u8>>);
 
 impl smoltcp::phy::RxToken for Received {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
@@ -266,11 +276,7 @@ pub struct Edge {
 impl Edge {
     /// Build the stack for one network's edge.
     pub fn new(config: EdgeConfig, identity: Arc<EdgeIdentity>) -> Result<Self, EdgeError> {
-        let mut port = FabricPort {
-            inbound: VecDeque::new(),
-            outbound: VecDeque::new(),
-            mtu: usize::try_from(config.mtu).unwrap_or(1500),
-        };
+        let mut port = FabricPort::new(config.mtu);
         let started = std::time::Instant::now();
         let mut interface_config = Config::new(HardwareAddress::Ethernet(EthernetAddress(
             config.mac.bytes(),

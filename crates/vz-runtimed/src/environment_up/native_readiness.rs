@@ -46,9 +46,13 @@ pub(super) async fn verify(
         elapsed_seconds = started.elapsed().as_secs_f64(),
         "native OS and guest-agent identity verified"
     );
+    // Before any address: getting the desktop session may restart the guest,
+    // and a fabric address set with `ifconfig` does not survive a restart.
+    ensure_desktop_session(activation, lease, deadline, metadata).await?;
     // Only now: the address is applied by the agent, so it is applied to the
     // guest whose agent has just been proved to be the pinned one.
     configure_fabric_ports(activation, lease, metadata).await?;
+    configure_egress(activation, lease, metadata).await?;
     if !pin.release().toolchain_sha256.is_empty() {
         use vz_macos_provision::toolchain::{MAX_RECEIPT_BYTES, RECEIPT_PATH, ToolchainManifest};
         let receipt = activation
@@ -257,6 +261,161 @@ async fn configure_fabric_hosts(
         names,
         elapsed_seconds = started.elapsed().as_secs_f64(),
         "native Environment endpoint names resolved"
+    );
+    Ok(())
+}
+
+/// Make sure the Machine's user is logged in to its desktop before Ready.
+///
+/// See `native_macos::desktop`. A Machine whose template already enables
+/// auto-login is logged in by the time its agent answers, or within seconds of
+/// it; one cloned from an older template is configured and restarted once. A
+/// Machine that cannot reach a session fails Up rather than being published
+/// Ready without the desktop it is meant to have.
+async fn ensure_desktop_session(
+    activation: &Arc<MachineRuntimeActivation>,
+    lease: &crate::native_macos::runtime::NativeMacosLease,
+    deadline: tokio::time::Instant,
+    metadata: &RequestMetadata,
+) -> Result<(), MachineError> {
+    use crate::native_macos::desktop::{self, SessionState};
+    let bad = |e: String| failure(metadata, MachineErrorCode::BackendUnavailable, e);
+    let started = std::time::Instant::now();
+    let sh = |program: String| ("/bin/sh".to_string(), vec!["-c".to_string(), program]);
+    let (command, args) = sh(desktop::probe_program());
+    let probed = activation
+        .exec(command, args, Duration::from_secs(30))
+        .await
+        .map_err(|e| bad(format!("native desktop session probe: {e}")))?;
+    let state = (probed.exit_code == 0)
+        .then(|| SessionState::parse(&probed.stdout))
+        .flatten()
+        .ok_or_else(|| bad(format!("native desktop session probe failed: {probed:?}")))?;
+    if state == SessionState::Configured {
+        restart_guest(activation, lease, deadline, metadata).await?;
+    }
+    // Auto-login completes shortly after boot, which can be after the agent
+    // first answers, so the session is waited for rather than probed once.
+    let wait = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let (command, args) = sh(desktop::session_program());
+        let present = activation
+            .exec(command, args, Duration::from_secs(10))
+            .await
+            .is_ok_and(|output| output.exit_code == 0);
+        if present {
+            break;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline || now >= wait {
+            return Err(bad(format!(
+                "native Machine user {} (uid {}) has no desktop session: auto-login is configured but loginwindow did not log in",
+                desktop::USER,
+                desktop::UID
+            )));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    tracing::info!(
+        user = desktop::USER,
+        uid = desktop::UID,
+        restarted = state == SessionState::Configured,
+        elapsed_seconds = started.elapsed().as_secs_f64(),
+        "native desktop session ready"
+    );
+    Ok(())
+}
+
+/// Restart the guest from inside and wait for its agent to answer again from
+/// the new boot.
+///
+/// A macOS guest's restart stays inside the same VM object, so the Machine's
+/// lease, NICs and egress link are unchanged across it; only the guest's boot
+/// time tells a restarted agent apart from the old one answering late.
+async fn restart_guest(
+    activation: &Arc<MachineRuntimeActivation>,
+    lease: &crate::native_macos::runtime::NativeMacosLease,
+    deadline: tokio::time::Instant,
+    metadata: &RequestMetadata,
+) -> Result<(), MachineError> {
+    use crate::native_macos::desktop::BOOT_TIME_PROGRAM;
+    let bad = |e: String| failure(metadata, MachineErrorCode::BackendUnavailable, e);
+    let boot_time = || async {
+        activation
+            .exec(
+                "/bin/sh".into(),
+                vec!["-c".into(), BOOT_TIME_PROGRAM.into()],
+                Duration::from_secs(10),
+            )
+            .await
+            .ok()
+            .filter(|output| output.exit_code == 0)
+            .map(|output| output.stdout)
+    };
+    let before = boot_time()
+        .await
+        .ok_or_else(|| bad("native guest boot time is unreadable".into()))?;
+    tracing::info!("restarting native guest once so auto-login takes effect");
+    // The agent dies with the guest, so the exec's own result is meaningless.
+    let _ = activation
+        .exec(
+            "/sbin/shutdown".into(),
+            vec!["-r".into(), "now".into()],
+            Duration::from_secs(10),
+        )
+        .await;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(bad(
+                "native guest did not come back from its auto-login restart before the Up deadline; VM retained for Stop".into(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let Ok(mut client) = lease.client().await else {
+            continue;
+        };
+        if client.ping().await.is_err() {
+            continue;
+        }
+        if boot_time().await.is_some_and(|after| after != before) {
+            return Ok(());
+        }
+    }
+}
+
+/// Address the egress NIC, when this boot has one, and prove the guest uses it.
+///
+/// Reachability of any particular Internet host is deliberately not part of
+/// Ready: a host that is itself offline still has a correctly configured
+/// Machine, and Up must not depend on a third party answering.
+async fn configure_egress(
+    activation: &Arc<MachineRuntimeActivation>,
+    lease: &crate::native_macos::runtime::NativeMacosLease,
+    metadata: &RequestMetadata,
+) -> Result<(), MachineError> {
+    let Some(mac) = lease.egress_mac() else {
+        return Ok(());
+    };
+    let bad = |e: String| failure(metadata, MachineErrorCode::BackendUnavailable, e);
+    let (program, expected) = crate::native_macos::egress::configure_program(mac);
+    let started = std::time::Instant::now();
+    let applied = activation
+        .exec(
+            "/bin/sh".into(),
+            vec!["-c".into(), program],
+            Duration::from_secs(60),
+        )
+        .await
+        .map_err(|e| bad(format!("native egress link on {mac}: {e}")))?;
+    if applied.exit_code != 0 || applied.stdout != expected {
+        return Err(bad(format!(
+            "native egress link on {mac} did not come up: {applied:?}"
+        )));
+    }
+    tracing::info!(
+        mac,
+        elapsed_seconds = started.elapsed().as_secs_f64(),
+        "native egress link configured"
     );
     Ok(())
 }

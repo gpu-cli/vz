@@ -235,7 +235,10 @@ impl MachineRuntimeEntry<MacosRuntimeBackend> {
             ),
             MacosRuntimeBackend::Native(runtime) => {
                 use crate::native_macos::runtime::NativeMacosBootError;
-                match runtime.boot(&reservation.resource_id, attachments).await {
+                match runtime
+                    .boot(&reservation.resource_id, attachments, resources.egress)
+                    .await
+                {
                     Ok(lease) => MachineExecutionLease::Native(lease),
                     Err(NativeMacosBootError::BeforeStart(error)) => return Err(error.into()),
                     Err(NativeMacosBootError::Start { error, lease }) => {
